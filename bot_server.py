@@ -16,6 +16,9 @@ import sys
 import threading
 import sqlite3
 import socket
+import time
+import urllib.request
+from urllib.error import URLError, HTTPError
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
@@ -172,6 +175,86 @@ def write_env(data: dict[str, str]) -> None:
             lines.append(f"{k}={v}")
     ENV_FILE.write_text("\n".join(lines) + "\n")
 
+# ── CHANGE: Autonomous Insight Background Fetcher ─────────────────────────────
+class InsightBackgroundFetcher(threading.Thread):
+    """
+    Berjalan independen di background untuk melakukan polling API Publik Bybit.
+    Hanya menulis/membuat insight jika Bot (main.py) sedang TIDAK berjalan,
+    sehingga dashboard selalu memiliki data live (Server Active).
+    """
+    def __init__(self, bot_ref: BotProcess) -> None:
+        super().__init__(daemon=True)
+        self.bot = bot_ref
+        self.insight_file = Path("bot_insight.json")
+        self.interval = 30 # Detik
+        self.logger = logging.getLogger("InsightFetcher")
+
+    def _fetch_json(self, url: str) -> dict:
+        req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+        with urllib.request.urlopen(req, timeout=5) as response:
+            return json.loads(response.read().decode())
+
+    def run(self) -> None:
+        self.logger.info("Background Insight Fetcher started.")
+        while True:
+            time.sleep(self.interval)
+            
+            # Jika bot main.py jalan, biarkan main.py yang handle (hindari race condition)
+            if self.bot.running:
+                continue
+                
+            env_vars = read_env()
+            symbol = env_vars.get("SYMBOL", "BTCUSDT").replace("/", "").replace(":", "").replace("-", "")
+
+            try:
+                # 1. Fetch Ticker
+                url_ticker = f"https://api.bybit.com/v5/market/tickers?category=linear&symbol={symbol}"
+                ticker_data = self._fetch_json(url_ticker)
+                last_price = float(ticker_data["result"]["list"][0]["lastPrice"])
+                
+                # 2. Fetch LSR (Long/Short Ratio)
+                url_lsr = f"https://api.bybit.com/v5/market/account-ratio?category=linear&symbol={symbol}&period=5min&limit=1"
+                lsr_data = self._fetch_json(url_lsr)
+                list_lsr = lsr_data.get("result", {}).get("list", [])
+                
+                if list_lsr:
+                    buy_ratio = float(list_lsr[0]["buyRatio"])
+                    sell_ratio = float(list_lsr[0]["sellRatio"])
+                    lsr_val = buy_ratio / (sell_ratio if sell_ratio > 0 else 1.0)
+                else:
+                    lsr_val = 1.0
+                
+                # 3. Analisa Sederhana (Hanya saat Bot Offline)
+                if lsr_val > 1.05:
+                    whale_bias = "LONG_HEAVY"
+                    trend = "BULLISH_BIAS"
+                    advice = f"Whale cenderung akumulasi LONG. LSR: {lsr_val:.2f}. (Bot Offline, standby mode)."
+                elif lsr_val < 0.95:
+                    whale_bias = "SHORT_HEAVY"
+                    trend = "BEARISH_BIAS"
+                    advice = f"Whale cenderung akumulasi SHORT. LSR: {lsr_val:.2f}. (Bot Offline, standby mode)."
+                else:
+                    whale_bias = "NEUTRAL"
+                    trend = "RANGING"
+                    advice = f"Pasar seimbang. LSR: {lsr_val:.2f}. (Bot Offline, standby mode)."
+
+                insight_data = {
+                    "timestamp": datetime.now().strftime("%H:%M:%S"),
+                    "trend_state": trend,
+                    "whale_bias": whale_bias,
+                    "advice": advice,
+                    "signal_status": "LIVE (Server Active, Bot Offline)",
+                    "last_price": last_price
+                }
+
+                # Menulis secara atomic ke file (menimpa)
+                self.insight_file.write_text(json.dumps(insight_data, indent=2))
+                
+            except (URLError, HTTPError) as e:
+                self.logger.debug(f"Fetch gagal (Network): {e}")
+            except Exception as e:
+                self.logger.debug(f"Fetch gagal (Unexpected): {e}")
+
 # ── HTTP handler ──────────────────────────────────────────────────────────────
 
 class DashboardHandler(BaseHTTPRequestHandler):
@@ -256,7 +339,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                         "timestamp": "-",
                         "trend_state": "WAITING",
                         "whale_bias": "-",
-                        "advice": "Menunggu siklus analisis bot selesai (max 1 interval)...",
+                        "advice": "Menunggu siklus analisis pertama selesai...",
                         "signal_status": "-"
                     }).encode()
                 self.send_response(200)
@@ -321,6 +404,11 @@ def get_local_ip() -> str:
 if __name__ == "__main__":
     HOST, PORT = "0.0.0.0", 8765
     local_ip = get_local_ip()
+    
+    # Start insight fetcher daemon
+    insight_fetcher = InsightBackgroundFetcher(bot)
+    insight_fetcher.start()
+
     server = HTTPServer((HOST, PORT), DashboardHandler)
     print(f"\n  ⬡  BotTrade Dashboard")
     print(f"  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
