@@ -149,12 +149,15 @@ class TradeExecutor:
 
         params = {"timeInForce": "GTC"}
 
+        # ── CHANGE: Bybit strict v5 parameters (Layer 1 Defense) ──────────────
         if exchange_id == "bybit":
             params.update({
                 "stopLoss":    float(sl_price_str),
                 "takeProfit":  float(tp_price_str),
                 "slTriggerBy": "LastPrice",
                 "tpTriggerBy": "LastPrice",
+                "tpslMode":    "Full", # Wajib di v5 untuk meyakinkan whole position ditutup
+                "positionIdx": 0       # Wajib jika dalam mode One-Way
             })
         elif exchange_id == "mexc":
             params.update({
@@ -179,6 +182,18 @@ class TradeExecutor:
         sl_order_id = entry_order.get("info", {}).get("stopLossOrderId")
         tp_order_id = entry_order.get("info", {}).get("takeProfitOrderId")
 
+        # ── CHANGE: Bybit fallback verification (Layer 2 & 3 Defense) ─────────
+        if exchange_id == "bybit":
+            logger.info("[Executor] Melakukan verifikasi TP/SL pada Bybit pasca-order...")
+            await asyncio.sleep(2.0) # Memberi jeda ke Bybit match engine
+            await self._verify_and_fallback_bybit_tpsl(
+                symbol=ccxt_symbol,
+                is_long=is_long,
+                tp_price=float(tp_price_str),
+                sl_price=float(sl_price_str)
+            )
+
+        # ── MEXC fallback (Layer 4 Defense - Tetap ada) ───────────────────────
         if exchange_id == "mexc":
             logger.info("[Executor] MEXC mode: Menempatkan order TP & SL terpisah...")
             
@@ -197,6 +212,9 @@ class TradeExecutor:
             )
             if sl_order:
                 sl_order_id = str(sl_order.get("id"))
+                logger.info("[Executor] MEXC SL order ditempatkan: %s", sl_order_id)
+            else:
+                logger.error("[Executor] MEXC gagal menempatkan SL order!")
 
             tp_order = await self._place_order(
                 label      = "TP",
@@ -213,6 +231,9 @@ class TradeExecutor:
             )
             if tp_order:
                 tp_order_id = str(tp_order.get("id"))
+                logger.info("[Executor] MEXC TP order ditempatkan: %s", tp_order_id)
+            else:
+                logger.error("[Executor] MEXC gagal menempatkan TP order!")
 
         logger.info(
             "[Executor] ✓ Complete | %s %s %.6f @ %.4f | SL=%.4f | TP=%.4f",
@@ -229,6 +250,87 @@ class TradeExecutor:
             position_size  = position_size,
         )
 
+    # ── CHANGE: Metode Helper untuk Verifikasi Bybit TP/SL ────────────────────
+    async def _verify_and_fallback_bybit_tpsl(
+        self,
+        symbol: str,
+        is_long: bool,
+        tp_price: float,
+        sl_price: float
+    ) -> None:
+        """
+        Layer 2 & 3 Defense. Mengecek posisi aktif, jika TP/SL tidak ada
+        karena mapping CCXT gagal di Layer 1, langsung gunakan private API.
+        """
+        try:
+            positions = await self._exchange.fetch_positions([symbol])
+            open_pos = [
+                p for p in positions
+                if p.get("symbol") == symbol and abs(float(p.get("contracts") or 0)) > _PRICE_EPSILON
+            ]
+
+            if not open_pos:
+                logger.info("[Executor] Order kemungkinan belum terisi (Limit). Tidak dapat memverifikasi/fallback position stop.")
+                return
+
+            pos = open_pos[0]
+            info = pos.get("info", {})
+            
+            # Periksa raw data dari Bybit v5
+            raw_tp = float(info.get("takeProfit") or 0)
+            raw_sl = float(info.get("stopLoss") or 0)
+
+            if raw_tp > 0 and raw_sl > 0:
+                logger.info("[Executor] Layer 1 Berhasil. TP (%.4f) & SL (%.4f) terverifikasi pada posisi.", raw_tp, raw_sl)
+            else:
+                logger.warning("[Executor] Layer 1 Gagal/Naked Position terdeteksi. Mencoba Layer 3 (Fallback)...")
+                await self._set_tp_sl_via_position_stop(symbol, is_long, tp_price, sl_price)
+
+        except Exception as exc:
+            logger.warning("[Executor] Gagal memverifikasi posisi Bybit: %s", exc)
+
+    async def _set_tp_sl_via_position_stop(
+        self,
+        symbol: str,
+        is_long: bool,
+        tp: float,
+        sl: float
+    ) -> None:
+        """
+        Layer 3 Defense. Call /v5/position/trading-stop langsung via CCXT bridge.
+        """
+        try:
+            if not hasattr(self._exchange, "private_post_v5_position_trading_stop"):
+                logger.error("[Executor] Versi CCXT tidak mendukung private_post_v5_position_trading_stop")
+                return
+
+            # Bybit raw market id format ex: BTCUSDT
+            raw_symbol = symbol.replace("/", "").replace(":", "").replace("USDTUSDT", "USDT")
+            
+            tp_str = self._exchange.price_to_precision(symbol, tp)
+            sl_str = self._exchange.price_to_precision(symbol, sl)
+
+            payload = {
+                "category": "linear",
+                "symbol": raw_symbol,
+                "takeProfit": tp_str,
+                "stopLoss": sl_str,
+                "tpTriggerBy": "LastPrice",
+                "slTriggerBy": "LastPrice",
+                "tpslMode": "Full",
+                "positionIdx": 0
+            }
+
+            logger.info("[Executor] Mengirim Fallback Payload: %s", payload)
+            res = await self._exchange.private_post_v5_position_trading_stop(payload)
+            
+            if res and res.get("retCode") == 0:
+                logger.info("[Executor] Fallback TP/SL berhasil diamankan.")
+            else:
+                logger.warning("[Executor] API merespons tapi memberikan peringatan: %s", res)
+                
+        except Exception as exc:
+            logger.error("[Executor] Kesalahan kritis saat set_trading_stop fallback: %s", exc)
 
     async def _ensure_leverage(self, symbol: str, is_long: bool) -> None:
         try:
@@ -252,7 +354,6 @@ class TradeExecutor:
             logger.warning("[Executor] set_leverage warning (non-fatal): %s", exc)
         except Exception as exc:
             logger.warning("[Executor] set_leverage unexpected error (non-fatal): %s", exc)
-
 
     async def _place_order(
         self,
