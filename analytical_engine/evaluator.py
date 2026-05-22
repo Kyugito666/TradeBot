@@ -1,262 +1,138 @@
 """
-Phase 2 — Analytical Engine: Signal Evaluator
-==============================================
+[evaluator.py]
+=============
+Consensus Engine untuk mengevaluasi sinyal dari semua agen.
+Menghitung skor probabilitas gabungan dan menerapkan aturan VETO keras
+berdasarkan parameter fisika dan statistik pasar.
 
-Signal Generation Logic — The "Liquidity Magnet" Model
--------------------------------------------------------
-The central thesis is that dense liquidation clusters attract price. Two forces
-drive this empirically observed behaviour:
-
-  1. Institutional stop-hunting: large players push price toward known cluster
-     zones to trigger cascading forced liquidations, generating liquidity for
-     their own entries/exits.
-  2. Self-fulfilling cascade: once a cluster zone is breached, forced market-order
-     selling (LONG clusters) or buying (SHORT clusters) amplifies the move,
-     creating momentum that technical traders then follow.
-
-Therefore:
-  - SHORT liquidation clusters ABOVE current price → TP targets for BUY signals
-    (price pumps up, force-liquidates shorts, momentum carries it to the cluster).
-  - LONG  liquidation clusters BELOW current price → TP targets for SELL signals
-    (price dumps down, force-liquidates longs, momentum carries it to the cluster).
-
-Whale Positioning Gate
-----------------------
-LSR (Long/Short Ratio) from Phase 1 tells us which side currently dominates:
-  - LSR > 1.05 (LONG_HEAVY) → majority positioned long → short squeeze risk is
-    elevated; price has fuel to run UP into SHORT clusters → BUY bias.
-  - LSR < 0.95 (SHORT_HEAVY) → majority positioned short → long squeeze risk is
-    elevated; price has fuel to run DOWN into LONG clusters → SELL bias.
-  - NEUTRAL → no directional edge from positioning alone → WAIT.
-
-Entry Pricing
--------------
-We don't chase market price. Entry is set slightly BETTER than current to
-simulate a limit order:
-  - BUY  entry = current_price − (ATR × pullback)
-  - SELL entry = current_price + (ATR × pullback)
-
-Stop Loss Placement
--------------------
-SL anchors to the recent structural swing level (lowest-low / highest-high of
-the prior 20 candles), buffered by half an ATR:
-  - BUY  SL = swing_low  − (ATR × 0.5)
-  - SELL SL = swing_high + (ATR × 0.5)
+Agent: N/A (Core Engine)
+Role: Signal Aggregator & Veto Enforcer
+Dependencies: dataclasses, typing
 """
-from __future__ import annotations
 
 import logging
-from datetime import datetime, timezone
-from typing import Optional
+from dataclasses import dataclass, field
+from typing import Dict, Any, List, Optional
 
-import numpy as np
-import pandas as pd
-
-from .models import Action, AnalysisSignal, ClusterProfile, ClusterSide, LiquidationCluster
+from agents.agent_mathematician import MathSignal
+from agents.agent_physicist import PhysicsSignal
+# TODO: Import CryptoSignal dan SentimentSignal saat Fase 3 selesai
 
 logger = logging.getLogger(__name__)
 
-# Base constants (akan dioverride oleh trading_style)
-SL_ATR_BUFFER       : float = 0.5    
-SWING_LOOKBACK      : int   = 20     
-MAX_CLUSTER_DIST_PCT: float = 0.05   
-MIN_TP_DENSITY      : float = 0.30   
+@dataclass
+class AgentVote:
+    agent_name: str
+    direction: str  # "BUY" | "SELL" | "WAIT"
+    conviction: float  # 0.0 - 1.0
 
-_W_LSR     : float = 0.40
-_W_CLUSTER : float = 0.35
-_W_RR      : float = 0.25
+@dataclass(frozen=True, slots=True)
+class ConsensusResult:
+    final_action: str
+    weighted_score: float
+    confidence: float
+    agents_agree: int
+    veto_triggered: bool
+    veto_reason: str
+    agent_breakdown: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    reasoning: str = ""
 
+class ConsensusEngine:
+    """
+    Menggabungkan output 5 agent menjadi satu keputusan final.
+    """
+    # Bobot total = 1.0 (100%)
+    WEIGHTS = {
+        "mathematician": 0.30,
+        "physicist": 0.25,
+        "cryptographer": 0.25,
+        "linguist": 0.10,
+        "liquidation": 0.10,
+    }
 
-class SignalEvaluator:
-    def __init__(self):
-        # AI Insight Container
-        self.latest_insight = {
-            "timestamp": "-",
-            "trend_state": "WAITING",
-            "whale_bias": "-",
-            "advice": "Menunggu siklus analisa pertama...",
-            "signal_status": "WAIT"
-        }
+    def __init__(self, min_confidence: float = 0.55, min_agree: int = 3):
+        self.min_confidence = min_confidence
+        self.min_agree = min_agree
 
-    def evaluate(
-        self,
-        profile: ClusterProfile,
-        whale_lsr: float,
-        whale_bias: str,
-        candles: pd.DataFrame,
-        trading_style: str = "sniper"
-    ) -> AnalysisSignal:
-        current = profile.current_price
-        atr     = profile.atr
-
-        # Setup Risk & Aggressiveness Berdasarkan Style
-        if trading_style == "scalping":
-            min_rr = 1.2
-            entry_atr_pullback = 0.10
-        else: # sniper
-            min_rr = 1.5
-            entry_atr_pullback = 0.25
-
-        if atr < 1e-8:
-            return self._wait(profile.symbol, current, whale_bias, "ATR ≈ 0 — flat or illiquid market")
-        if whale_lsr <= 0:
-            return self._wait(profile.symbol, current, whale_bias, f"Invalid LSR={whale_lsr:.4f}")
-
-        # Analisa Price Action Dasar (Exhaustion & Whale Bait Guard)
-        last_candle = candles.iloc[-1]
-        body = abs(last_candle['close'] - last_candle['open'])
-        upper_wick = last_candle['high'] - max(last_candle['open'], last_candle['close'])
-        lower_wick = min(last_candle['open'], last_candle['close']) - last_candle['low']
+    def vote(self, votes: List[AgentVote], signals: Dict[str, Any]) -> ConsensusResult:
+        """
+        Kalkulasi hasil voting akhir.
+        `signals` berisi raw dataclass dari masing-masing agent untuk cek VETO.
+        """
+        # 1. Cek Veto Rules terlebih dahulu
+        veto_active, veto_reason = self._apply_veto_rules(signals)
         
-        try:
-            sma_10 = candles['close'].rolling(10).mean().iloc[-1]
-        except:
-            sma_10 = current
+        breakdown = {}
+        total_score = 0.0
+        buy_count = 0
+        sell_count = 0
 
-        # Deteksi pucuk (pump) atau dasar (dump) berdasarkan jarum penolakan
-        is_pump_exhausted = (current > sma_10 * 1.005) and (upper_wick > body * 1.2)
-        is_dump_exhausted = (current < sma_10 * 0.995) and (lower_wick > body * 1.2)
+        # 2. Tabulasi Vote
+        for v in votes:
+            if v.agent_name not in self.WEIGHTS:
+                continue
+                
+            weight = self.WEIGHTS[v.agent_name]
+            breakdown[v.agent_name] = {"vote": v.direction, "conviction": v.conviction}
 
-        # Default State
-        insight_state = "NEUTRAL (Sideways/No Edge)"
-        advice = "Sabar. Tidak ada dominasi arah yang jelas. Jangan paksakan entry."
-        action = Action.WAIT
-        signal_reason = "No Confluence"
+            if v.direction == "BUY":
+                total_score += (v.conviction * weight)
+                buy_count += 1
+            elif v.direction == "SELL":
+                total_score -= (v.conviction * weight)
+                sell_count += 1
 
-        # Cek Arah Dominasi
-        if whale_bias == "LONG_HEAVY":
-            insight_state = "BULLISH BIAS (Cari Long)"
-            advice = "Whale didominasi Long. Cari peluang BUY saat harga terkoreksi (pullback)."
-            
-            if is_pump_exhausted:
-                insight_state = "⚠️ WHALE BAIT DETECTED (FAKE PUMP)"
-                advice = f"BAHAYA! Harga nge-pump tapi ngebentuk jarum penolakan di pucuk ({current:.2f}). Market Maker sedang mancing retail. JANGAN LONG! Tunggu dump atau cari setup SHORT manual."
-                signal_reason = "Bait Guard: Long Rejection di Pucuk"
-            else:
-                short_above = [c for c in profile.short_clusters if c.price > current and (c.price - current) / current <= MAX_CLUSTER_DIST_PCT]
-                if short_above:
-                    return self._process_signal(
-                        Action.BUY, profile.symbol, current, atr, whale_lsr, whale_bias, 
-                        short_above, candles, min_rr, entry_atr_pullback, "up"
-                    )
+        # 3. Analisis Hasil Konsensus
+        final_action = "WAIT"
+        confidence = abs(total_score)
+        agents_agree = max(buy_count, sell_count)
+        reasoning = ""
 
-        elif whale_bias == "SHORT_HEAVY":
-            insight_state = "BEARISH BIAS (Cari Short)"
-            advice = "Whale didominasi Short. Cari peluang SELL saat harga pantul ke atas (bounce)."
-            
-            if is_dump_exhausted:
-                insight_state = "⚠️ WHALE BAIT DETECTED (FAKE DUMP)"
-                advice = f"BAHAYA! Harga nge-dump tapi ngebentuk jarum penolakan di dasar ({current:.2f}). Market Maker mancing retail buat nyusul Short. JANGAN SHORT! Tunggu pantulan."
-                signal_reason = "Bait Guard: Short Rejection di Dasar"
-            else:
-                long_below = [c for c in profile.long_clusters if c.price < current and (current - c.price) / current <= MAX_CLUSTER_DIST_PCT]
-                if long_below:
-                    return self._process_signal(
-                        Action.SELL, profile.symbol, current, atr, whale_lsr, whale_bias, 
-                        long_below, candles, min_rr, entry_atr_pullback, "down"
-                    )
-
-        # Update Live Insight sebelum me-return WAIT
-        self.latest_insight = {
-            "timestamp": datetime.now(tz=timezone.utc).strftime("%H:%M:%S") + " UTC",
-            "trend_state": insight_state,
-            "whale_bias": f"{whale_bias} (LSR: {whale_lsr:.2f})",
-            "advice": advice,
-            "signal_status": "WAIT (Skipped)"
-        }
-        return self._wait(profile.symbol, current, whale_bias, signal_reason)
-
-
-    def _process_signal(self, action, symbol, current, atr, lsr, bias, clusters, candles, min_rr, pullback, direction):
-        tp_cluster = self._select_tp(clusters, current, direction)
-        tp = tp_cluster.price
-
-        if action == Action.BUY:
-            entry = max(current - (atr * pullback), current * 0.9990)
-            swing = self._swing_low(candles)
-            sl = (swing - (atr * SL_ATR_BUFFER)) if swing is not None else entry - (atr * 2.0)
-            if sl >= entry: return self._wait(symbol, current, bias, "Invalid SL structure")
+        if veto_active:
+            final_action = "WAIT"
+            reasoning = f"VETO TRIGGERED: {veto_reason}"
         else:
-            entry = min(current + (atr * pullback), current * 1.0010)
-            swing = self._swing_high(candles)
-            sl = (swing + (atr * SL_ATR_BUFFER)) if swing is not None else entry + (atr * 2.0)
-            if sl <= entry: return self._wait(symbol, current, bias, "Invalid SL structure")
+            if total_score > 0 and buy_count >= self.min_agree and confidence >= self.min_confidence:
+                final_action = "BUY"
+                reasoning = f"Bulls win with {buy_count} votes. Confidence: {confidence:.2f}"
+            elif total_score < 0 and sell_count >= self.min_agree and confidence >= self.min_confidence:
+                final_action = "SELL"
+                reasoning = f"Bears win with {sell_count} votes. Confidence: {confidence:.2f}"
+            else:
+                reasoning = (f"No clear consensus. Agree: {agents_agree}/{len(votes)}, "
+                             f"Confidence: {confidence:.2f} (Min: {self.min_confidence})")
 
-        rr = self._calc_rr(entry, tp, sl, action)
-        if rr < min_rr:
-            self.latest_insight = {
-                "timestamp": datetime.now(tz=timezone.utc).strftime("%H:%M:%S") + " UTC",
-                "trend_state": f"VALID {action.value} SETUP",
-                "whale_bias": bias,
-                "advice": f"Ada sinyal {action.value}, tapi R:R ({rr:.2f}) kurang dari target minimum ({min_rr}). Bot skip. Boleh eksekusi manual jika yakin.",
-                "signal_status": "SKIPPED (R:R Rendah)"
-            }
-            return self._wait(symbol, current, bias, f"R:R {rr:.2f} < {min_rr}")
+        logger.info("[ConsensusEngine] Action: %s | Score: %.2f | Veto: %s", final_action, total_score, veto_active)
 
-        conf = self._confidence(lsr, tp_cluster.density_score, rr)
-        rationale = f"Signal {action.value} | Target: {tp:.2f} | Entry: {entry:.2f} | SL: {sl:.2f} | R:R: {rr:.2f}"
-        
-        self.latest_insight = {
-            "timestamp": datetime.now(tz=timezone.utc).strftime("%H:%M:%S") + " UTC",
-            "trend_state": f"🔥 {action.value} SIGNAL FIRED",
-            "whale_bias": bias,
-            "advice": f"Bot mengeksekusi {action.value} di sekitar harga {entry:.2f}. Support/Resist terdekat (SL) di {sl:.2f} dan target likuidasi (TP) di {tp:.2f}.",
-            "signal_status": f"{action.value} (Conf: {conf:.2f})"
-        }
-
-        logger.info("[SignalEvaluator] %s signal | %s", action.value, rationale)
-
-        return AnalysisSignal(
-            symbol=symbol, action=action, entry=round(entry, 2), take_profit=round(tp, 2),
-            stop_loss=round(sl, 2), risk_reward=round(rr, 3), confidence=round(conf, 3),
-            whale_bias=bias, rationale=rationale, timestamp=datetime.now(tz=timezone.utc)
+        return ConsensusResult(
+            final_action=final_action,
+            weighted_score=round(total_score, 4),
+            confidence=round(confidence, 4),
+            agents_agree=agents_agree,
+            veto_triggered=veto_active,
+            veto_reason=veto_reason,
+            agent_breakdown=breakdown,
+            reasoning=reasoning
         )
 
+    def _apply_veto_rules(self, signals: Dict[str, Any]) -> tuple[bool, str]:
+        """
+        Mengevaluasi sinyal mentah untuk mencegah entry di kondisi pasar berbahaya.
+        Returns: (is_vetoed, reason)
+        """
+        physics: Optional[PhysicsSignal] = signals.get("physicist")
+        math_sig: Optional[MathSignal] = signals.get("mathematician")
 
-    @staticmethod
-    def _select_tp(clusters: list[LiquidationCluster], current: float, direction: str) -> LiquidationCluster:
-        qualified = [c for c in clusters if c.density_score >= MIN_TP_DENSITY]
-        pool = qualified if qualified else clusters
-        if direction == "up": return min(pool, key=lambda c: c.price)
-        else: return max(pool, key=lambda c: c.price)
+        if physics:
+            if physics.is_false_breakout:
+                return True, "Physicist mendeteksi False Breakout (Wick panjang)."
+            if physics.noise_ratio > 0.7:
+                return True, f"Pasar terlalu noisy (Noise Ratio: {physics.noise_ratio:.2f} > 0.70)."
+            if physics.volatility_regime == "CRISIS":
+                return True, "Volatilitas level CRISIS (Risiko slippage fatal)."
 
+        if math_sig:
+            if math_sig.regime == "UNKNOWN" or (math_sig.anomaly_score > 0.95 and physics and physics.volatility_regime != "COMPRESSION"):
+                return True, "Anomali matematis ekstrem tanpa kompresi volatilitas."
 
-    @staticmethod
-    def _swing_low(candles: pd.DataFrame) -> Optional[float]:
-        subset = candles["low"].iloc[-(SWING_LOOKBACK + 1):-1]
-        return float(subset.min()) if len(subset) > 0 else None
-
-
-    @staticmethod
-    def _swing_high(candles: pd.DataFrame) -> Optional[float]:
-        subset = candles["high"].iloc[-(SWING_LOOKBACK + 1):-1]
-        return float(subset.max()) if len(subset) > 0 else None
-
-
-    @staticmethod
-    def _calc_rr(entry: float, tp: float, sl: float, action: Action) -> float:
-        if action == Action.BUY:
-            reward = tp - entry
-            risk   = entry - sl
-        else:
-            reward = entry - tp
-            risk   = sl - entry
-
-        if risk <= 0: return 0.0
-        return reward / risk
-
-
-    @staticmethod
-    def _confidence(lsr: float, cluster_density: float, rr: float) -> float:
-        lsr_score  = min(abs(lsr - 1.0) / 0.5, 1.0)
-        rr_score   = min(rr / 3.0, 1.0)
-        return _W_LSR * lsr_score + _W_CLUSTER * cluster_density + _W_RR * rr_score
-
-
-    def _wait(self, symbol: str, price: float, bias: str, reason: str) -> AnalysisSignal:
-        logger.debug("[SignalEvaluator] WAIT | %s | %s", symbol, reason)
-        return AnalysisSignal(
-            symbol=symbol, action=Action.WAIT, entry=price, take_profit=price,
-            stop_loss=price, risk_reward=0.0, confidence=0.0, whale_bias=bias,
-            rationale=f"WAIT — {reason}", timestamp=datetime.now(tz=timezone.utc)
-        )
+        return False, ""

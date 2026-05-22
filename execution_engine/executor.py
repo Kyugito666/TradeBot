@@ -193,9 +193,21 @@ class TradeExecutor:
                 sl_price=float(sl_price_str)
             )
 
-        # ── MEXC fallback (Layer 4 Defense - Tetap ada) ───────────────────────
+# ── MEXC fallback (Layer 4 Defense - Diperbaiki untuk Hedge Mode) ─────────
         if exchange_id == "mexc":
             logger.info("[Executor] MEXC mode: Menempatkan order TP & SL terpisah...")
+            
+            # WAJIB: Di MEXC Hedge Mode, nutup LONG = sell positionType 1. 
+            # Nutup SHORT = buy positionType 2.
+            mexc_exit_pos_type = 1 if is_long else 2
+            
+            # SL Order
+            sl_params = {
+                "triggerPrice": float(sl_price_str),
+                "openType": 1,                       # 1 = Isolated
+                "positionType": mexc_exit_pos_type,  # Identitas posisi yang mau ditutup
+                "reduceOnly": True
+            }
             
             sl_order = await self._place_order(
                 label      = "SL",
@@ -204,17 +216,21 @@ class TradeExecutor:
                 symbol     = ccxt_symbol,
                 amount     = position_size,
                 price      = None,
-                params     = {
-                    "triggerPrice": float(sl_price_str),
-                    "stopPrice": float(sl_price_str),
-                    "reduceOnly": True
-                }
+                params     = sl_params
             )
             if sl_order:
                 sl_order_id = str(sl_order.get("id"))
-                logger.info("[Executor] MEXC SL order ditempatkan: %s", sl_order_id)
+                logger.info("[Executor] MEXC SL order diregistrasi: %s", sl_order_id)
             else:
                 logger.error("[Executor] MEXC gagal menempatkan SL order!")
+
+            # TP Order
+            tp_params = {
+                "triggerPrice": float(tp_price_str),
+                "openType": 1,                       # 1 = Isolated
+                "positionType": mexc_exit_pos_type,  # Identitas posisi yang mau ditutup
+                "reduceOnly": True
+            }
 
             tp_order = await self._place_order(
                 label      = "TP",
@@ -223,15 +239,11 @@ class TradeExecutor:
                 symbol     = ccxt_symbol,
                 amount     = position_size,
                 price      = None,
-                params     = {
-                    "triggerPrice": float(tp_price_str),
-                    "takeProfitPrice": float(tp_price_str),
-                    "reduceOnly": True
-                }
+                params     = tp_params
             )
             if tp_order:
                 tp_order_id = str(tp_order.get("id"))
-                logger.info("[Executor] MEXC TP order ditempatkan: %s", tp_order_id)
+                logger.info("[Executor] MEXC TP order diregistrasi: %s", tp_order_id)
             else:
                 logger.error("[Executor] MEXC gagal menempatkan TP order!")
 
