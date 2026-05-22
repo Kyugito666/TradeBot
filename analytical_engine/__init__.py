@@ -6,9 +6,11 @@ from .models import (
     LiquidationCluster,
 )
 from .liquidation import LiquidationClusterEngine
-from .evaluator   import SignalEvaluator
+
+# --- INI YANG DIBENERIN: Import class yang baru ---
+from .evaluator import ConsensusEngine, AgentVote, ConsensusResult
+
 from .ohlcv_fetcher import MexcOHLCVFetcher, MockOHLCVFetcher
-# Tambahkan line ini:
 from .ws_stream import MexcFuturesTickerStream
 
 __all__ = [
@@ -18,8 +20,13 @@ __all__ = [
     "ClusterSide",
     "LiquidationCluster",
     "LiquidationClusterEngine",
-    "SignalEvaluator",
+    
+    # --- UPDATE EXPORT ---
+    "ConsensusEngine",
+    "AgentVote",
+    "ConsensusResult",
+    
     "MexcOHLCVFetcher",
     "MockOHLCVFetcher",
-    "MexcFuturesTickerStream", # Tambahkan ini juga
+    "MexcFuturesTickerStream",
 ]
