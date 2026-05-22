@@ -1,16 +1,25 @@
-# Python >= 3.10 required (dataclass slots=True)
+# ─── Core Exchange & Networking ───────────────────────────────────────────────
+ccxt>=4.3.0,<5.0.0           # Exchange API (Bybit, MEXC, dll) - async support
+websockets>=12.0,<14.0       # Raw WebSocket client untuk ticker stream
+aiohttp>=3.9.0,<4.0.0        # Async HTTP untuk REST fetcher & news scraper
 
-# Exchange & networking
-ccxt>=4.3.0,<5.0.0          # Unified exchange API; async_support subpackage
-websockets>=12.0,<13.0      # Raw WebSocket client
-aiohttp>=3.9.0,<4.0.0       # Async HTTP for REST fetchers
+# ─── Database ─────────────────────────────────────────────────────────────────
+aiosqlite>=0.19.0,<1.0.0     # Async SQLite untuk StateDB
 
-# Database
-aiosqlite>=0.19.0,<1.0.0    # Async SQLite for StateDB
+# ─── Data Processing ──────────────────────────────────────────────────────────
+pandas>=2.0.0,<3.0.0         # OHLCV dataframes, rolling calculations
+numpy>=1.24.0,<3.0.0         # Numerical ops, FFT, matrix operations
+scipy>=1.11.0,<2.0.0         # scipy.stats untuk distribusi statistik
 
-# Data processing
-pandas>=2.0.0,<3.0.0        # OHLCV dataframes
-numpy>=1.24.0,<3.0.0        # Numerical ops (MockOHLCVFetcher, ATR)
+# ─── Local Machine Learning (NO CLOUD AI) ────────────────────────────────────
+scikit-learn>=1.3.0,<2.0.0   # RandomForest, GridSearchCV, preprocessing
+xgboost>=2.0.0,<3.0.0        # Gradient Boosting (opsional, lebih cepat/akurat dari RF)
+joblib>=1.3.0                # Model serialization (save/load model ke disk)
 
-# Env & config
-python-dotenv>=1.0.0,<2.0.0 # .env loader
+# ─── NLP Lokal (NO AI API) ───────────────────────────────────────────────────
+vaderSentiment>=3.3.2        # VADER NLP, berjalan offline, 100% gratis
+feedparser>=6.0.8            # RSS feed parser untuk scraping berita
+lxml>=4.9.0                  # HTML/XML parser (engine di balik feedparser)
+
+# ─── Configuration & Utilities ───────────────────────────────────────────────
+python-dotenv>=1.0.0,<2.0.0  # .env loader

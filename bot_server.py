@@ -18,6 +18,8 @@ import sqlite3
 import socket
 import time
 import urllib.request
+import hmac
+import hashlib
 from urllib.error import URLError, HTTPError
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -175,18 +177,20 @@ def write_env(data: dict[str, str]) -> None:
             lines.append(f"{k}={v}")
     ENV_FILE.write_text("\n".join(lines) + "\n")
 
-# ── CHANGE: Autonomous Insight Background Fetcher ─────────────────────────────
+# ── AI Insight Background Fetcher (Adaptive Risk Engine) ─────────────────────
+
+def safe_float(val, default=0.0):
+    try:
+        return float(val) if val else default
+    except:
+        return default
+
 class InsightBackgroundFetcher(threading.Thread):
-    """
-    Berjalan independen di background untuk melakukan polling API Publik Bybit.
-    Hanya menulis/membuat insight jika Bot (main.py) sedang TIDAK berjalan,
-    sehingga dashboard selalu memiliki data live (Server Active).
-    """
     def __init__(self, bot_ref: BotProcess) -> None:
         super().__init__(daemon=True)
         self.bot = bot_ref
         self.insight_file = Path("bot_insight.json")
-        self.interval = 30 # Detik
+        self.interval = 10
         self.logger = logging.getLogger("InsightFetcher")
 
     def _fetch_json(self, url: str) -> dict:
@@ -195,65 +199,136 @@ class InsightBackgroundFetcher(threading.Thread):
             return json.loads(response.read().decode())
 
     def run(self) -> None:
-        self.logger.info("Background Insight Fetcher started.")
+        self.logger.info("Background Adaptive AI Fetcher started.")
         while True:
             time.sleep(self.interval)
             
-            # Jika bot main.py jalan, biarkan main.py yang handle (hindari race condition)
-            if self.bot.running:
-                continue
-                
             env_vars = read_env()
             symbol = env_vars.get("SYMBOL", "BTCUSDT").replace("/", "").replace(":", "").replace("-", "")
+            exchange = env_vars.get("EXCHANGE", "bybit")
+            trading_style = env_vars.get("TRADING_STYLE", "daytrade")
+            is_demo = env_vars.get("EXCHANGE_MODE", "demo") == "demo"
+            
+            api_key = env_vars.get("BYBIT_DEMO_API_KEY", "") if is_demo else env_vars.get("BYBIT_REAL_API_KEY", "")
+            api_sec = env_vars.get("BYBIT_DEMO_API_SECRET", "") if is_demo else env_vars.get("BYBIT_REAL_API_SECRET", "")
+
+            # Adaptasi Matrix berdasarkan Style
+            # tf = Timeframe kline, sl_mult = Jarak SL dari ATR, tp_mult = Jarak TP
+            if trading_style == "scalping":
+                tf = "5"
+                sl_mult = 1.0  # SL ketat
+                tp_mult = 1.5  # Quick in & out
+            elif trading_style == "sniper":
+                tf = "60"      # 1 Jam
+                sl_mult = 2.0  # SL lega, nahan ayunan
+                tp_mult = 4.0  # Ngincer swing gajah
+            else: # daytrade
+                tf = "15"
+                sl_mult = 1.5
+                tp_mult = 2.5
 
             try:
                 # 1. Fetch Ticker
                 url_ticker = f"https://api.bybit.com/v5/market/tickers?category=linear&symbol={symbol}"
                 ticker_data = self._fetch_json(url_ticker)
-                last_price = float(ticker_data["result"]["list"][0]["lastPrice"])
+                t_list = ticker_data.get("result", {}).get("list", [{}])
+                if not t_list: t_list = [{}]
                 
-                # 2. Fetch LSR (Long/Short Ratio)
+                last_price = safe_float(t_list[0].get("lastPrice"))
+                pct_24h = safe_float(t_list[0].get("price24hPcnt")) * 100
+                oi_val = safe_float(t_list[0].get("openInterest"))
+                
+                # 2. Fetch Klines (Timeframe ngikutin Style)
+                url_kline = f"https://api.bybit.com/v5/market/kline?category=linear&symbol={symbol}&interval={tf}&limit=14"
+                kline_data = self._fetch_json(url_kline)
+                klines = kline_data.get("result", {}).get("list", [])
+                
+                atr = last_price * 0.01 if last_price > 0 else 0.01
+                if klines:
+                    tr_list = []
+                    for i in range(len(klines)-1):
+                        h, l, pc = safe_float(klines[i][2]), safe_float(klines[i][3]), safe_float(klines[i+1][4])
+                        tr_list.append(max(h - l, abs(h - pc), abs(l - pc)))
+                    if tr_list: atr = sum(tr_list) / len(tr_list)
+                
+                # 3. Fetch LSR
                 url_lsr = f"https://api.bybit.com/v5/market/account-ratio?category=linear&symbol={symbol}&period=5min&limit=1"
                 lsr_data = self._fetch_json(url_lsr)
                 list_lsr = lsr_data.get("result", {}).get("list", [])
                 
+                lsr_val = 1.0
                 if list_lsr:
-                    buy_ratio = float(list_lsr[0]["buyRatio"])
-                    sell_ratio = float(list_lsr[0]["sellRatio"])
-                    lsr_val = buy_ratio / (sell_ratio if sell_ratio > 0 else 1.0)
-                else:
-                    lsr_val = 1.0
+                    buy = safe_float(list_lsr[0].get("buyRatio"))
+                    sell = safe_float(list_lsr[0].get("sellRatio"))
+                    lsr_val = buy / (sell if sell > 0 else 1.0)
+
+                # 4. Fetch Balance
+                balance_val = 0.0
+                if api_key and api_sec and exchange == "bybit":
+                    try:
+                        ts_msec = str(int(time.time() * 1000))
+                        query = "accountType=UNIFIED&coin=USDT"
+                        param_str = ts_msec + api_key + "5000" + query
+                        signature = hmac.new(bytes(api_sec, "utf-8"), param_str.encode("utf-8"), hashlib.sha256).hexdigest()
+                        
+                        base_url = "https://api-testnet.bybit.com" if is_demo else "https://api.bybit.com"
+                        req_bal = urllib.request.Request(f"{base_url}/v5/account/wallet-balance?{query}", headers={
+                            'X-BAPI-API-KEY': api_key, 'X-BAPI-TIMESTAMP': ts_msec,
+                            'X-BAPI-SIGN': signature, 'X-BAPI-RECV-WINDOW': "5000"
+                        })
+                        with urllib.request.urlopen(req_bal, timeout=3) as res:
+                            bal_data = json.loads(res.read().decode())
+                            list_acc = bal_data.get("result", {}).get("list", [])
+                            if list_acc:
+                                for c in list_acc[0].get("coin", []):
+                                    if c["coin"] == "USDT": balance_val = safe_float(c["walletBalance"])
+                    except Exception:
+                        pass 
+
+                # 5. Adaptive Strategy Logic
+                entry = last_price
+                action = "WAIT"
                 
-                # 3. Analisa Sederhana (Hanya saat Bot Offline)
-                if lsr_val > 1.05:
-                    whale_bias = "LONG_HEAVY"
-                    trend = "BULLISH_BIAS"
-                    advice = f"Whale cenderung akumulasi LONG. LSR: {lsr_val:.2f}. (Bot Offline, standby mode)."
-                elif lsr_val < 0.95:
-                    whale_bias = "SHORT_HEAVY"
-                    trend = "BEARISH_BIAS"
-                    advice = f"Whale cenderung akumulasi SHORT. LSR: {lsr_val:.2f}. (Bot Offline, standby mode)."
+                # Cek volatility regime untuk melebarkan SL jika badai
+                current_vol_risk = (atr / last_price) * 100
+                if current_vol_risk > 3.0: # Market super volatile (kayak anomali SOL kemaren)
+                    sl_mult *= 1.5 # Lebarkan SL biar ga gampang kesapu ekor / wick
+                
+                if lsr_val > 1.08:
+                    action = "SHORT"
+                    whale_bias = "SHORT_HUNTING"
+                    trend = "BEARISH_TRAP"
+                    sl, tp = entry + (atr * sl_mult), entry - (atr * tp_mult)
+                    advice = f"[{trading_style.upper()}] LSR Retail tinggi ({lsr_val:.2f}). Awas liquidity sweep ke bawah. Target: SL {sl_mult}x ATR, TP {tp_mult}x ATR. Menunggu Setup!"
+                elif lsr_val < 0.92 and lsr_val > 0.0:
+                    action = "LONG"
+                    whale_bias = "LONG_HUNTING"
+                    trend = "BULLISH_TRAP"
+                    sl, tp = entry - (atr * sl_mult), entry + (atr * tp_mult)
+                    advice = f"[{trading_style.upper()}] Retail dominan SHORT ({lsr_val:.2f}). Potensi short-squeeze. Target: SL {sl_mult}x ATR, TP {tp_mult}x ATR. Cari rejection support."
                 else:
-                    whale_bias = "NEUTRAL"
-                    trend = "RANGING"
-                    advice = f"Pasar seimbang. LSR: {lsr_val:.2f}. (Bot Offline, standby mode)."
+                    whale_bias = "NEUTRAL_ACCUMULATION"
+                    trend = "RANGING / CHOPPY"
+                    sl, tp = 0.0, 0.0
+                    advice = f"[{trading_style.upper()}] Pasar sideway/choppy (LSR {lsr_val:.2f}). ATR kompresi: {atr:.2f}. Style ini merekomendasikan WAIT."
+
+                bot_status_str = " (BOT ACTIVE)" if self.bot.running else " (STANDBY)"
 
                 insight_data = {
                     "timestamp": datetime.now().strftime("%H:%M:%S"),
-                    "trend_state": trend,
-                    "whale_bias": whale_bias,
-                    "advice": advice,
-                    "signal_status": "LIVE (Server Active, Bot Offline)",
-                    "last_price": last_price
+                    "trend_state": trend, "whale_bias": whale_bias, "advice": advice,
+                    "signal_status": action + bot_status_str,
+                    "last_price": last_price, "pct_24h": pct_24h, "open_interest": oi_val, "lsr_val": lsr_val,
+                    "balance": balance_val,
+                    "entry_target": round(entry, 4) if action != "WAIT" else 0,
+                    "tp_target": round(tp, 4) if action != "WAIT" else 0,
+                    "sl_target": round(sl, 4) if action != "WAIT" else 0
                 }
 
-                # Menulis secara atomic ke file (menimpa)
                 self.insight_file.write_text(json.dumps(insight_data, indent=2))
                 
-            except (URLError, HTTPError) as e:
-                self.logger.debug(f"Fetch gagal (Network): {e}")
             except Exception as e:
-                self.logger.debug(f"Fetch gagal (Unexpected): {e}")
+                self.logger.debug(f"Insight Fetch gagal: {e}")
 
 # ── HTTP handler ──────────────────────────────────────────────────────────────
 
@@ -269,7 +344,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
-        except (ConnectionAbortedError, ConnectionResetError, BrokenPipeError):
+        except:
             pass
 
     def do_GET(self) -> None:
@@ -307,26 +382,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
             return
 
         if parsed.path == "/api/trades":
-            try:
-                db_path = os.environ.get("DB_PATH", "bot_state.db")
-                if not os.path.exists(db_path):
-                    self._json({"ok": True, "trades": []})
-                    return
-
-                conn = sqlite3.connect(db_path)
-                conn.row_factory = sqlite3.Row
-                cursor = conn.cursor()
-                cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='active_trades'")
-                if cursor.fetchone():
-                    cursor.execute("SELECT * FROM active_trades ORDER BY id DESC LIMIT 50")
-                    rows = cursor.fetchall()
-                    trades = [dict(r) for r in rows]
-                else:
-                    trades = []
-                conn.close()
-                self._json({"ok": True, "trades": trades})
-            except Exception as exc:
-                self._json({"ok": False, "error": str(exc)})
+            self._json({"ok": True, "trades": []})
             return
 
         if parsed.path == "/api/insight":
@@ -336,11 +392,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     body = insight_path.read_bytes()
                 else:
                     body = json.dumps({
-                        "timestamp": "-",
-                        "trend_state": "WAITING",
-                        "whale_bias": "-",
-                        "advice": "Menunggu siklus analisis pertama selesai...",
-                        "signal_status": "-"
+                        "timestamp": "-", "trend_state": "WAITING", "whale_bias": "-", "advice": "Menunggu siklus analisis...",
+                        "signal_status": "-", "entry_target": 0, "tp_target": 0, "sl_target": 0
                     }).encode()
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
@@ -388,7 +441,6 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
         self.send_error(404)
 
-# ── Helper buat dapetin IP Local HP ───────────────────────────────────────────
 def get_local_ip() -> str:
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -396,16 +448,13 @@ def get_local_ip() -> str:
         ip = s.getsockname()[0]
         s.close()
         return ip
-    except Exception:
+    except:
         return "127.0.0.1"
-
-# ── Entry point ───────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     HOST, PORT = "0.0.0.0", 8765
     local_ip = get_local_ip()
     
-    # Start insight fetcher daemon
     insight_fetcher = InsightBackgroundFetcher(bot)
     insight_fetcher.start()
 
