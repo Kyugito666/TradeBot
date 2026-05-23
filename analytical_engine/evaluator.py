@@ -1,138 +1,105 @@
-"""
-[evaluator.py]
-=============
-Consensus Engine untuk mengevaluasi sinyal dari semua agen.
-Menghitung skor probabilitas gabungan dan menerapkan aturan VETO keras
-berdasarkan parameter fisika dan statistik pasar.
-
-Agent: N/A (Core Engine)
-Role: Signal Aggregator & Veto Enforcer
-Dependencies: dataclasses, typing
-"""
-
 import logging
-from dataclasses import dataclass, field
-from typing import Dict, Any, List, Optional
-
-from agents.agent_mathematician import MathSignal
-from agents.agent_physicist import PhysicsSignal
-# TODO: Import CryptoSignal dan SentimentSignal saat Fase 3 selesai
+from dataclasses import dataclass
+from typing import Dict, Any, List, Tuple
 
 logger = logging.getLogger(__name__)
 
-@dataclass
+@dataclass(frozen=True, slots=True)
 class AgentVote:
     agent_name: str
-    direction: str  # "BUY" | "SELL" | "WAIT"
-    conviction: float  # 0.0 - 1.0
+    direction: str
+    conviction: float
 
 @dataclass(frozen=True, slots=True)
 class ConsensusResult:
     final_action: str
-    weighted_score: float
     confidence: float
-    agents_agree: int
+    buy_count: int
+    sell_count: int
     veto_triggered: bool
     veto_reason: str
-    agent_breakdown: Dict[str, Dict[str, Any]] = field(default_factory=dict)
-    reasoning: str = ""
 
 class ConsensusEngine:
-    """
-    Menggabungkan output 5 agent menjadi satu keputusan final.
-    """
-    # Bobot total = 1.0 (100%)
+    # Bobot ditambahkan untuk agen liquidator sebagai persiapan Sesi 3
     WEIGHTS = {
         "mathematician": 0.30,
         "physicist": 0.25,
-        "cryptographer": 0.25,
-        "linguist": 0.10,
-        "liquidation": 0.10,
+        "cryptographer": 0.20,
+        "linguist": 0.15,
+        "liquidation": 0.10
     }
 
-    def __init__(self, min_confidence: float = 0.55, min_agree: int = 3):
+    def __init__(self, min_confidence: float = 0.52, min_agree: int = 2):
         self.min_confidence = min_confidence
         self.min_agree = min_agree
 
-    def vote(self, votes: List[AgentVote], signals: Dict[str, Any]) -> ConsensusResult:
-        """
-        Kalkulasi hasil voting akhir.
-        `signals` berisi raw dataclass dari masing-masing agent untuk cek VETO.
-        """
-        # 1. Cek Veto Rules terlebih dahulu
-        veto_active, veto_reason = self._apply_veto_rules(signals)
+    def evaluate(self, votes: List[AgentVote], signals: Dict[str, Any]) -> ConsensusResult:
+        # 1. Eksekusi VETO rules yang ketat
+        is_veto, reason = self._check_veto(signals)
+        if is_veto:
+            logger.warning(f"[ConsensusEngine] VETO Triggered: {reason}")
+            return ConsensusResult("WAIT", 0.0, 0, 0, True, reason)
+
+        buy_count = sum(1 for v in votes if v.direction == "BUY")
+        sell_count = sum(1 for v in votes if v.direction == "SELL")
         
-        breakdown = {}
         total_score = 0.0
-        buy_count = 0
-        sell_count = 0
+        total_weight = 0.0
 
-        # 2. Tabulasi Vote
-        for v in votes:
-            if v.agent_name not in self.WEIGHTS:
-                continue
-                
-            weight = self.WEIGHTS[v.agent_name]
-            breakdown[v.agent_name] = {"vote": v.direction, "conviction": v.conviction}
+        # 2. Kalkulasi bobot base
+        for vote in votes:
+            weight = self.WEIGHTS.get(vote.agent_name, 0.0)
+            if vote.direction == "BUY":
+                total_score += vote.conviction * weight
+            elif vote.direction == "SELL":
+                total_score -= vote.conviction * weight
+            total_weight += weight
 
-            if v.direction == "BUY":
-                total_score += (v.conviction * weight)
-                buy_count += 1
-            elif v.direction == "SELL":
-                total_score -= (v.conviction * weight)
-                sell_count += 1
+        if total_weight > 0:
+            total_score /= total_weight
 
-        # 3. Analisis Hasil Konsensus
+        # 3. Peningkatan #1: GBM Physicist Confidence Adjustment
+        physics = signals.get("physicist")
+        if physics and hasattr(physics, "gbm_upside_bias"):
+            if physics.gbm_upside_bias > 0.6 and total_score > 0:
+                # Distribusi condong ke atas -> boost BUY confidence
+                total_score *= (1.0 + (physics.gbm_upside_bias - 0.5) * 0.2)
+            elif physics.gbm_upside_bias < 0.4 and total_score < 0:
+                # Distribusi condong ke bawah -> boost SELL confidence
+                total_score *= (1.0 + (0.5 - physics.gbm_upside_bias) * 0.2)
+
         final_action = "WAIT"
-        confidence = abs(total_score)
-        agents_agree = max(buy_count, sell_count)
-        reasoning = ""
+        final_confidence = abs(total_score)
 
-        if veto_active:
-            final_action = "WAIT"
-            reasoning = f"VETO TRIGGERED: {veto_reason}"
-        else:
-            if total_score > 0 and buy_count >= self.min_agree and confidence >= self.min_confidence:
+        # 4. Validasi final dengan min_agree threshold
+        if final_confidence >= self.min_confidence:
+            if total_score > 0 and buy_count >= self.min_agree:
                 final_action = "BUY"
-                reasoning = f"Bulls win with {buy_count} votes. Confidence: {confidence:.2f}"
-            elif total_score < 0 and sell_count >= self.min_agree and confidence >= self.min_confidence:
+            elif total_score < 0 and sell_count >= self.min_agree:
                 final_action = "SELL"
-                reasoning = f"Bears win with {sell_count} votes. Confidence: {confidence:.2f}"
-            else:
-                reasoning = (f"No clear consensus. Agree: {agents_agree}/{len(votes)}, "
-                             f"Confidence: {confidence:.2f} (Min: {self.min_confidence})")
 
-        logger.info("[ConsensusEngine] Action: %s | Score: %.2f | Veto: %s", final_action, total_score, veto_active)
+        logger.info(f"[ConsensusEngine] Action: {final_action} | Confidence: {final_confidence:.3f} | Buy: {buy_count} | Sell: {sell_count}")
 
         return ConsensusResult(
             final_action=final_action,
-            weighted_score=round(total_score, 4),
-            confidence=round(confidence, 4),
-            agents_agree=agents_agree,
-            veto_triggered=veto_active,
-            veto_reason=veto_reason,
-            agent_breakdown=breakdown,
-            reasoning=reasoning
+            confidence=final_confidence,
+            buy_count=buy_count,
+            sell_count=sell_count,
+            veto_triggered=False,
+            veto_reason=""
         )
 
-    def _apply_veto_rules(self, signals: Dict[str, Any]) -> tuple[bool, str]:
-        """
-        Mengevaluasi sinyal mentah untuk mencegah entry di kondisi pasar berbahaya.
-        Returns: (is_vetoed, reason)
-        """
-        physics: Optional[PhysicsSignal] = signals.get("physicist")
-        math_sig: Optional[MathSignal] = signals.get("mathematician")
-
-        if physics:
-            if physics.is_false_breakout:
-                return True, "Physicist mendeteksi False Breakout (Wick panjang)."
-            if physics.noise_ratio > 0.7:
-                return True, f"Pasar terlalu noisy (Noise Ratio: {physics.noise_ratio:.2f} > 0.70)."
-            if physics.volatility_regime == "CRISIS":
-                return True, "Volatilitas level CRISIS (Risiko slippage fatal)."
-
+    def _check_veto(self, signals: Dict[str, Any]) -> Tuple[bool, str]:
+        """Validasi kondisi ekstrem yang memaksa bot untuk WAIT."""
+        math_sig = signals.get("mathematician")
         if math_sig:
-            if math_sig.regime == "UNKNOWN" or (math_sig.anomaly_score > 0.95 and physics and physics.volatility_regime != "COMPRESSION"):
-                return True, "Anomali matematis ekstrem tanpa kompresi volatilitas."
+            if getattr(math_sig, "noise_ratio", 0.0) > 0.65:
+                return True, "Market noise ratio melebihi batas aman"
+            if getattr(math_sig, "anomaly_detected", False):
+                return True, "Anomali matematis terdeteksi"
+
+        phys_sig = signals.get("physicist")
+        if phys_sig and getattr(phys_sig, "volatility_crisis", False):
+            return True, "Krisis volatilitas ekstrem"
 
         return False, ""

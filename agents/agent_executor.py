@@ -1,87 +1,124 @@
+import asyncio
 import logging
-from typing import Dict, Any
-from analytical_engine.consensus import ConsensusEngine, AgentVote, ConsensusResult
-from analytical_engine.models import Action, AnalysisSignal
-from datetime import datetime, timezone
+from typing import Dict, Any, List
+
+# Perbaikan Import: Selalu rujuk ke engine konsensus versi canggih
+from analytical_engine.evaluator import AgentVote
 
 logger = logging.getLogger(__name__)
 
-class ExecutorAgent:
-    def __init__(self, execution_client, consensus_engine: ConsensusEngine, symbol: str, leverage: int = 10):
-        self.executor = execution_client
-        self.consensus = consensus_engine
-        self.symbol = symbol
-        self.leverage = leverage
+class AgentExecutor:
+    def __init__(self, agents: Dict[str, Any]):
+        """
+        Orkestrator untuk mengeksekusi multiple agent dan memanen sinyal mereka.
+        agents: Dict berisi instansiasi masing-masing agent.
+        """
+        self.agents = agents
 
-    async def execute_consensus(self, signals: Dict[str, Any], current_price: float) -> dict:
-        logger.info("[ExecutorAgent] Menghitung konsensus final di harga %.2f...", current_price)
+    async def gather_signals(self, df: Any, current_price: float, symbol: str, **kwargs) -> Dict[str, Any]:
+        """
+        Menjalankan semua agen secara asinkron/konkuren untuk meminimalkan latensi.
+        """
+        tasks = {}
         
-        votes = self._extract_votes(signals)
-        consensus_result = self.consensus.vote(votes, signals)
-        
-        if consensus_result.final_action == "WAIT":
-            # --- LOGGING DIKEMBALIKAN ---
-            logger.info("[ExecutorAgent] Eksekusi di-skip. Konsensus bot menahan posisi (HOLD).")
-            return {"status": "skipped", "action": "WAIT", "reason": consensus_result.reasoning}
+        if "mathematician" in self.agents:
+            tasks["mathematician"] = asyncio.create_task(self.agents["mathematician"].analyze(df))
+            
+        if "physicist" in self.agents:
+            tasks["physicist"] = asyncio.create_task(self.agents["physicist"].analyze(df, current_price))
+            
+        if "cryptographer" in self.agents:
+            tasks["cryptographer"] = asyncio.create_task(self.agents["cryptographer"].analyze(df))
+            
+        if "linguist" in self.agents:
+            tasks["linguist"] = asyncio.create_task(self.agents["linguist"].analyze(symbol))
+            
+        if "liquidator" in self.agents:
+            oi = kwargs.get("oi", 0.0)
+            lsr = kwargs.get("lsr", 1.0)
+            tasks["liquidator"] = asyncio.create_task(self.agents["liquidator"].analyze(df, oi, lsr, symbol))
 
-        logger.warning("[ExecutorAgent] SIGNAL %s TRIGGERED! Mempersiapkan eksekusi...", consensus_result.final_action)
+        signals = {}
+        for agent_name, task in tasks.items():
+            try:
+                result = await task
+                if result:
+                    signals[agent_name] = result
+            except Exception as e:
+                logger.error(f"[AgentExecutor] Agen '{agent_name}' gagal: {e}")
+                
+        return signals
 
-        atr = self._extract_atr(signals, current_price)
-        tp_distance = atr * 2.0
-        sl_distance = atr * 1.0
+    def extract_votes(self, signals: Dict[str, Any]) -> List[AgentVote]:
+        return self._extract_votes(signals)
 
-        if consensus_result.final_action == "BUY":
-            tp_price = current_price + tp_distance
-            sl_price = current_price - sl_distance
-        else:
-            tp_price = current_price - tp_distance
-            sl_price = current_price + sl_distance
-
-        trade_signal = AnalysisSignal(
-            symbol=self.symbol,
-            action=Action(consensus_result.final_action),
-            entry=current_price,
-            take_profit=tp_price,
-            stop_loss=sl_price,
-            risk_reward=2.0,
-            confidence=consensus_result.confidence,
-            whale_bias="NEUTRAL",
-            rationale=consensus_result.reasoning,
-            timestamp=datetime.now(timezone.utc),
-        )
-        
-        try:
-            # Karena MockClient.execute_signal tidak async di versi lama, kita await jika perlu. 
-            order_result = await self.executor.execute_signal(trade_signal)
-            logger.info("[ExecutorAgent] Order %s berhasil diregistrasi!", consensus_result.final_action)
-            return {"status": "executed", "action": consensus_result.final_action, "order": order_result}
-        except Exception as e:
-            logger.error("[ExecutorAgent] Gagal mengeksekusi order: %s", e)
-            return {"status": "failed", "error": str(e)}
-
-    def _extract_atr(self, signals: Dict[str, Any], fallback_price: float) -> float:
-        if "mathematician" in signals and hasattr(signals["mathematician"], "atr"):
-            return float(signals["mathematician"].atr)
-        return fallback_price * 0.015
-
-    def _extract_votes(self, signals: Dict[str, Any]) -> list[AgentVote]:
+    def _extract_votes(self, signals: Dict[str, Any]) -> List[AgentVote]:
+        """
+        Mengubah sinyal mentah menjadi bentuk AgentVote terstandarisasi.
+        """
         votes = []
+        
+        # 1. Mathematician
         if "mathematician" in signals:
             math = signals["mathematician"]
-            if math.probability_up > 0.6:
-                votes.append(AgentVote("mathematician", "BUY", math.confidence))
-            elif math.probability_down > 0.6:
-                votes.append(AgentVote("mathematician", "SELL", math.confidence))
+            prob_up = getattr(math, "prob_up", 0.5)
+            prob_down = getattr(math, "prob_down", 0.5)
+            
+            if prob_up > 0.6:
+                votes.append(AgentVote(agent_name="mathematician", direction="BUY", conviction=prob_up))
+            elif prob_down > 0.6:
+                votes.append(AgentVote(agent_name="mathematician", direction="SELL", conviction=prob_down))
             else:
-                votes.append(AgentVote("mathematician", "WAIT", 1.0 - math.confidence))
+                votes.append(AgentVote(agent_name="mathematician", direction="WAIT", conviction=0.5))
 
+        # 2. Physicist
         if "physicist" in signals:
-            physics = signals["physicist"]
-            if physics.trend_direction == "UP" and physics.kalman_velocity > 0:
-                votes.append(AgentVote("physicist", "BUY", physics.trend_strength))
-            elif physics.trend_direction == "DOWN" and physics.kalman_velocity < 0:
-                votes.append(AgentVote("physicist", "SELL", physics.trend_strength))
+            phys = signals["physicist"]
+            direction = getattr(phys, "direction", "WAIT")
+            conviction = getattr(phys, "confidence", 0.5)
+            
+            if direction in ("BUY", "SELL"):
+                votes.append(AgentVote(agent_name="physicist", direction=direction, conviction=conviction))
             else:
-                votes.append(AgentVote("physicist", "WAIT", 0.5))
+                votes.append(AgentVote(agent_name="physicist", direction="WAIT", conviction=0.5))
+
+        # 3. Cryptographer (BUG #2 FIXED)
+        if "cryptographer" in signals:
+            crypto = signals["cryptographer"]
+            ml_up = getattr(crypto, "ml_prob_up", 0.0)
+            ml_down = getattr(crypto, "ml_prob_down", 0.0)
+            ml_conf = getattr(crypto, "ml_confidence", 0.0)
+            
+            if ml_up > 0.55 and ml_conf > 0.3:
+                votes.append(AgentVote(agent_name="cryptographer", direction="BUY", conviction=ml_conf))
+            elif ml_down > 0.55 and ml_conf > 0.3:
+                votes.append(AgentVote(agent_name="cryptographer", direction="SELL", conviction=ml_conf))
+            else:
+                votes.append(AgentVote(agent_name="cryptographer", direction="WAIT", conviction=0.5))
+
+        # 4. Linguist (BUG #2 FIXED)
+        if "linguist" in signals:
+            nlp = signals["linguist"]
+            sentiment = getattr(nlp, "sentiment_label", "NEUTRAL")
+            news_count = getattr(nlp, "news_count", 0)
+            confidence = getattr(nlp, "confidence", 0.0)
+            
+            if sentiment in ("BULLISH", "VERY_BULLISH") and news_count >= 3:
+                votes.append(AgentVote(agent_name="linguist", direction="BUY", conviction=confidence))
+            elif sentiment in ("BEARISH", "VERY_BEARISH") and news_count >= 3:
+                votes.append(AgentVote(agent_name="linguist", direction="SELL", conviction=confidence))
+            else:
+                votes.append(AgentVote(agent_name="linguist", direction="WAIT", conviction=confidence * 0.5))
+                
+        # 5. Liquidator (ENHANCEMENT #3 PREP)
+        if "liquidator" in signals:
+            liq = signals["liquidator"]
+            direction = getattr(liq, "direction", "NEUTRAL")
+            confidence = getattr(liq, "confidence", 0.0)
+            
+            if direction in ("BUY", "SELL"):
+                votes.append(AgentVote(agent_name="liquidator", direction=direction, conviction=confidence))
+            else:
+                votes.append(AgentVote(agent_name="liquidator", direction="WAIT", conviction=0.0))
 
         return votes
