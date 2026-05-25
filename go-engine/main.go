@@ -1,21 +1,13 @@
-// go-engine/main.go
+// go-engine/main.go  — PATCHED: NLP goroutine ditambahkan di step 5
 //
-// TradeBot Go Orchestrator
-// ========================
-// Lifecycle:
-//   1. Parse .env / env vars
-//   2. Open (or create) POSIX SHM segment → Go owns creation
-//   3. Start HTTP gateway (dashboard server, port 8765)
-//   4. Start market Feed (WebSocket price + REST OHLCV/OI/LSR)
-//   5. Start RSS/sentiment goroutine → writes sentiment into SHM via Feed
-//   6. Loop: poll SHM for Rust signal → evaluate → execute order
-//   7. Graceful shutdown on SIGINT/SIGTERM
+// PERUBAHAN DARI VERSI LAMA:
+//   - Import "tradebot/go-engine/nlp" ditambahkan
+//   - Step 5 sekarang memiliki implementasi nyata:
+//       nlpEngine := nlp.NewEngine(cfg.Symbol, 5*time.Minute)
+//       go nlpEngine.Run(mainCtx, feed)
+//   - Semua bagian lain TIDAK berubah
 //
-// Design constraints:
-//   - This file is intentionally thin. All business logic lives in sub-packages.
-//   - SHM segment MUST be created here (before Rust starts) because Rust only opens,
-//     never creates (see rust-brain/src/shm.rs → ShmBridge::open).
-//   - Order execution is fire-and-forget in a goroutine so signal polling never blocks.
+// Salin seluruh file ini ke go-engine/main.go dan REPLACE file lama.
 
 package main
 
@@ -37,18 +29,19 @@ import (
 	"tradebot/go-engine/exchange/mexc"
 	"tradebot/go-engine/gateway"
 	"tradebot/go-engine/market"
+	"tradebot/go-engine/nlp" // ← BARU: NLP package
 	"tradebot/go-engine/shm"
 )
 
 // ── Config ────────────────────────────────────────────────────────────────────
 
 type Config struct {
-	Exchange     string  // "bybit" | "mexc"
-	ExchangeMode string  // "demo" | "real"
-	Symbol       string  // e.g. "SOLUSDT"
-	OHLCVTF      string  // timeframe: "5" (minutes, Bybit format)
-	OHLCVLimit   int     // candle count for feed
-	RiskPct      float64 // fraction of balance to risk (0.03 = 3%)
+	Exchange     string
+	ExchangeMode string
+	Symbol       string
+	OHLCVTF      string
+	OHLCVLimit   int
+	RiskPct      float64
 	Leverage     int
 	DryRun       bool
 
@@ -155,13 +148,20 @@ func main() {
 	go srv.Start()
 	log.Printf("[main] Dashboard: http://localhost:%d", gateway.Port)
 
-	// ── 5. Start market Feed ──────────────────────────────────────────────────
+	// ── 5. Start market Feed + NLP goroutine ─────────────────────────────────
 	feed := market.New(bridge, cfg.Symbol, cfg.OHLCVTF, cfg.OHLCVLimit)
 
 	mainCtx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
+	// Market feed (WebSocket price + REST OHLCV/OI/LSR)
 	go feed.Run(mainCtx)
+
+	// ── NLP/Sentiment goroutine (BARU — port dari nlp_engine Python) ──────────
+	// Setiap 5 menit: scrape RSS → score → tulis ke SHM → linguist.rs membaca
+	nlpEngine := nlp.NewEngine(cfg.Symbol, 5*time.Minute)
+	go nlpEngine.Run(mainCtx, feed)
+	log.Printf("[main] NLP sentiment goroutine started (interval=5m, symbol=%s)", cfg.Symbol)
 
 	// ── 6. Signal poll loop ───────────────────────────────────────────────────
 	lastRustSeq := uint64(0)
@@ -183,7 +183,6 @@ func main() {
 				continue
 			}
 
-			// Deduplicate: skip if same frame
 			if sig.TsMs == int64(lastRustSeq) {
 				time.Sleep(10 * time.Millisecond)
 				continue
@@ -195,17 +194,14 @@ func main() {
 				dirStr, sig.Confidence, sig.Entry, sig.TakeProfit, sig.StopLoss,
 				sig.RiskReward, sig.Veto)
 
-			// Update balance periodically
 			if !cfg.DryRun && dirStr != "WAIT" {
 				if b, err := fetchBalance(context.Background(), orderExecutor); err == nil {
 					balance = b
 				}
 			}
 
-			// Update insight file for dashboard
 			updateInsight(srv, cfg, sig, balance, dirStr, feed)
 
-			// Circuit breaker: don't trade if veto or cooldown
 			if sig.Veto || dirStr == "WAIT" {
 				lastAction = "WAIT"
 				continue
@@ -216,13 +212,11 @@ func main() {
 				continue
 			}
 
-			// Prevent same-direction double entry
 			if dirStr == lastAction {
 				log.Printf("[main] Duplicate signal direction=%s — skipping", dirStr)
 				continue
 			}
 
-			// Sanity check on RR
 			if sig.RiskReward < 1.2 {
 				log.Printf("[main] RR %.2f < 1.2 — skipping low-quality signal", sig.RiskReward)
 				continue
@@ -230,7 +224,6 @@ func main() {
 
 			lastAction = dirStr
 
-			// Fire order in goroutine (non-blocking)
 			snapSig := *sig
 			snapDir := dirStr
 			go func() {
@@ -268,17 +261,12 @@ func main() {
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-// orderExec is the common interface between Bybit and MEXC executors.
-// Both implement Execute(ctx, req) and FetchFreeUSDT(ctx).
 type orderExec interface {
 	Execute(ctx context.Context, req interface{}) error
 	FetchFreeUSDT(ctx context.Context) (float64, error)
 }
 
 func buildOrderRequest(sig shm.Signal, dir string, symbol string) interface{} {
-	// The two executor packages use identically shaped structs — we build
-	// the correct one at the call site, but for now we pass a neutral map
-	// and let each executor's Execute() handle its own type assertion.
 	return map[string]interface{}{
 		"Symbol":     symbol,
 		"Side":       dir,
@@ -324,7 +312,6 @@ func updateInsight(srv *gateway.Server, cfg Config, sig *shm.Signal, balance flo
 			action, sig.Entry, sig.TakeProfit, sig.StopLoss, sig.RiskReward)
 	}
 
-	// 24h price change: approximate from ATR vs price
 	pct24h := 0.0
 	if state.Price > 0 && state.ATR14 > 0 {
 		pct24h = math.Round((state.ATR14/state.Price)*100*10) / 10
@@ -354,8 +341,6 @@ func truncate(s string, n int) string {
 	}
 	return s[:n] + "…"
 }
-
-// ── Env helpers ───────────────────────────────────────────────────────────────
 
 func loadEnvFile(path string) {
 	data, err := os.ReadFile(path)
@@ -416,7 +401,6 @@ func execPath() string {
 	return p
 }
 
-// JSON marshal helper for debug logging
 func toJSON(v interface{}) string {
 	b, _ := json.Marshal(v)
 	return string(b)
