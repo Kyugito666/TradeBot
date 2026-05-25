@@ -2,7 +2,11 @@
 //
 // Bybit V5 Order Executor — Production Grade
 // ==========================================
-// Layers of TP/SL defense (identical strategy to the Python TradeExecutor):
+// BUG FIX (v3.0.1): Renamed public Execute(ctx, OrderRequest) → execute(ctx, OrderRequest)
+// so that adapter.go can define the single public Execute(ctx, interface{}) method that
+// satisfies the main.go orderExec interface without a duplicate-method compile error.
+//
+// Layers of TP/SL defense:
 //   Layer 1 : Embed takeProfit/stopLoss directly in the order params
 //   Layer 2 : Post-fill verification via /v5/position/list
 //   Layer 3 : Fallback via /v5/position/trading-stop if Layer 1 missed
@@ -41,7 +45,7 @@ type Config struct {
 	Testnet   bool
 	DryRun    bool
 	Leverage  int
-	RiskPct   float64 // fraction of free USDT to risk per trade (e.g. 0.03)
+	RiskPct   float64
 }
 
 // OrderRequest is the structured input from ConsensusEngine → Executor
@@ -73,12 +77,12 @@ func New(cfg Config) *Executor {
 	}
 }
 
-// Execute is the top-level entry point called by the Go orchestrator.
+// execute is the internal entry point (lowercase — called by adapter.go's public Execute).
 // It: checks balance → sizes position → sets leverage → places order → verifies TP/SL.
-func (e *Executor) Execute(ctx context.Context, req OrderRequest) error {
+func (e *Executor) execute(ctx context.Context, req OrderRequest) error {
 	log.Printf("[Executor] ── %s %s ────────────────────────────", req.Side, req.Symbol)
-	log.Printf("[Executor] entry=%.4f TP=%.4f SL=%.4f RR=%.2f conf=%.3f",
-		req.Entry, req.TakeProfit, req.StopLoss, req.RiskReward, req.Confidence)
+	log.Printf("[Executor] entry=%.4f SL=%.4f TP=%.4f RR=%.2f conf=%.3f",
+		req.Entry, req.StopLoss, req.TakeProfit, req.RiskReward, req.Confidence)
 
 	if e.cfg.DryRun {
 		log.Printf("[Executor] DRY RUN — orders suppressed.")
@@ -200,7 +204,9 @@ func (e *Executor) verifyAndFallbackTPSL(ctx context.Context, req OrderRequest) 
 
 	for _, pos := range result.Result.List {
 		sz, _ := strconv.ParseFloat(pos.Size, 64)
-		if sz <= 0 { continue }
+		if sz <= 0 {
+			continue
+		}
 
 		tp, _ := strconv.ParseFloat(pos.TakeProfit, 64)
 		sl, _ := strconv.ParseFloat(pos.StopLoss, 64)
@@ -253,9 +259,9 @@ func (e *Executor) fetchFreeUSDT(ctx context.Context) (float64, error) {
 		Result struct {
 			List []struct {
 				Coin []struct {
-					Coin            string `json:"coin"`
+					Coin                string `json:"coin"`
 					AvailableToWithdraw string `json:"availableToWithdraw"`
-					WalletBalance   string `json:"walletBalance"`
+					WalletBalance       string `json:"walletBalance"`
 				} `json:"coin"`
 			} `json:"list"`
 		} `json:"result"`
@@ -265,9 +271,13 @@ func (e *Executor) fetchFreeUSDT(ctx context.Context) (float64, error) {
 	}
 	for _, acct := range result.Result.List {
 		for _, coin := range acct.Coin {
-			if coin.Coin != "USDT" { continue }
+			if coin.Coin != "USDT" {
+				continue
+			}
 			v, _ := strconv.ParseFloat(coin.AvailableToWithdraw, 64)
-			if v > 0 { return v, nil }
+			if v > 0 {
+				return v, nil
+			}
 			v, _ = strconv.ParseFloat(coin.WalletBalance, 64)
 			return v, nil
 		}
@@ -315,7 +325,9 @@ func (e *Executor) signedPost(ctx context.Context, path string, body map[string]
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
 		e.base+path, bytes.NewReader(payload))
-	if err != nil { return nil, err }
+	if err != nil {
+		return nil, err
+	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-BAPI-API-KEY", e.cfg.APIKey)
 	req.Header.Set("X-BAPI-TIMESTAMP", ts)
@@ -323,7 +335,9 @@ func (e *Executor) signedPost(ctx context.Context, path string, body map[string]
 	req.Header.Set("X-BAPI-RECV-WINDOW", recvWindow)
 
 	resp, err := e.client.Do(req)
-	if err != nil { return nil, err }
+	if err != nil {
+		return nil, err
+	}
 	defer resp.Body.Close()
 	return io.ReadAll(resp.Body)
 }
@@ -334,14 +348,18 @@ func (e *Executor) signedGet(ctx context.Context, path, queryStr string) ([]byte
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet,
 		e.base+path+"?"+queryStr, nil)
-	if err != nil { return nil, err }
+	if err != nil {
+		return nil, err
+	}
 	req.Header.Set("X-BAPI-API-KEY", e.cfg.APIKey)
 	req.Header.Set("X-BAPI-TIMESTAMP", ts)
 	req.Header.Set("X-BAPI-SIGN", sign)
 	req.Header.Set("X-BAPI-RECV-WINDOW", recvWindow)
 
 	resp, err := e.client.Do(req)
-	if err != nil { return nil, err }
+	if err != nil {
+		return nil, err
+	}
 	defer resp.Body.Close()
 	return io.ReadAll(resp.Body)
 }
@@ -364,6 +382,8 @@ func bybitSymbol(s string) string {
 
 // roundStep rounds v to the nearest multiple of step
 func roundStep(v, step float64) float64 {
-	if step <= 0 { return v }
+	if step <= 0 {
+		return v
+	}
 	return math.Round(v/step) * step
 }
