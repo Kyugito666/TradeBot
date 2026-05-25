@@ -1,17 +1,11 @@
-// rust-brain/src/main.rs
+// rust-brain/src/main.rs  (PRODUCTION-CORRECTED)
 //
-// TradeBot Brain v3.0 — Zero-Latency 6-Agent Ensemble
-// =====================================================
-// Process lifecycle:
-//   1. Connect to POSIX SHM /tradebot_v3 (created by Go engine on startup)
-//   2. Block on data_ready flag (seqlock protocol)
-//   3. Snapshot MarketData → run 6 agents in parallel via rayon
-//   4. ConsensusEngine evaluates all votes → single SignalResult
-//   5. Write SignalResult to SHM, set signal_ready=1, wake Go executor
-//   6. Goto 2 (sub-millisecond loop)
+// Module declarations:
+//   mod shm     → src/shm.rs          (POSIX SHM bridge)
+//   mod agents  → src/agents/mod.rs   (6 agent implementations)
+//   mod consensus → src/consensus/mod.rs
 
 use std::time::{Duration, Instant};
-
 use log::{error, info, warn};
 use rayon::prelude::*;
 
@@ -32,7 +26,6 @@ use consensus::ConsensusEngine;
 use shm::ShmBridge;
 
 fn main() -> anyhow::Result<()> {
-    // Initialise logger from RUST_LOG env var, default = info
     env_logger::Builder::from_env(
         env_logger::Env::default().default_filter_or("info"),
     )
@@ -41,18 +34,16 @@ fn main() -> anyhow::Result<()> {
 
     info!("═══════════════════════════════════════════════════════");
     info!("  TradeBot Brain v3.0 — 6-Agent Ensemble  (rayon)");
+    info!("  Agents: Mathematician · Physicist · Cryptographer");
+    info!("          Linguist · Liquidator · Absurdist ✦");
     info!("═══════════════════════════════════════════════════════");
 
-    // Tune rayon thread pool: 1 thread per agent (6) + 1 consensus = 7 max.
-    // Leaving OS scheduler headroom; exchange I/O runs in Go.
     rayon::ThreadPoolBuilder::new()
         .num_threads(6)
         .thread_name(|i| format!("agent-{i}"))
         .build_global()
-        .expect("Failed to configure rayon thread pool");
+        .expect("rayon pool init");
 
-    // Instantiate all 6 agents once — they are stateless pure functions.
-    // Boxed behind the Agent trait for uniform dispatch in the par_iter.
     let agents: Vec<Box<dyn Agent + Send + Sync>> = vec![
         Box::new(MathematicianAgent::default()),
         Box::new(PhysicistAgent::default()),
@@ -64,18 +55,15 @@ fn main() -> anyhow::Result<()> {
 
     let consensus = ConsensusEngine;
 
-    // ── Connect to SHM (Go must create it first) ──────────────────────────
+    // Wait for Go engine to create SHM
     let mut bridge = {
         let deadline = Instant::now() + Duration::from_secs(30);
         loop {
             match ShmBridge::open() {
-                Ok(b) => {
-                    info!("[SHM] Connected to /tradebot_v3");
-                    break b;
-                }
+                Ok(b)  => { info!("[SHM] Connected"); break b; }
                 Err(e) => {
                     if Instant::now() > deadline {
-                        error!("[SHM] Timeout waiting for Go gateway. Aborting.");
+                        error!("[SHM] Timeout waiting for Go engine. Is it running?");
                         return Err(e);
                     }
                     warn!("[SHM] Not ready: {e}. Retrying in 1s…");
@@ -87,11 +75,10 @@ fn main() -> anyhow::Result<()> {
 
     info!("[Brain] Ready. Waiting for market data…");
 
-    let mut iteration: u64 = 0;
     let mut last_ts: i64 = 0;
+    let mut iteration: u64 = 0;
 
     loop {
-        // ── Block until Go writes fresh MarketData ─────────────────────────
         let snap = match bridge.wait_for_market(Duration::from_secs(60)) {
             Some(s) => s,
             None => {
@@ -100,7 +87,6 @@ fn main() -> anyhow::Result<()> {
             }
         };
 
-        // Skip stale snapshots (Go may write same ts twice on reconnect)
         if snap.ts_ms == last_ts {
             std::hint::spin_loop();
             continue;
@@ -114,31 +100,28 @@ fn main() -> anyhow::Result<()> {
 
         let t_start = Instant::now();
 
-        // ── Run all 6 agents concurrently ─────────────────────────────────
         let votes: Vec<AgentVote> = agents
             .par_iter()
             .map(|agent| {
                 let t = Instant::now();
                 let vote = agent.analyze(&snap);
                 log::debug!(
-                    "[{:>12}] {:?} conviction={:.3}  ({:.2}ms)  {}",
+                    "[{:>13}] {:?} conv={:.3}  ({:.2}ms)  {}",
                     vote.agent,
                     vote.direction,
                     vote.conviction,
                     t.elapsed().as_secs_f64() * 1000.0,
-                    &vote.reasoning[..vote.reasoning.len().min(80)]
+                    &vote.reasoning[..vote.reasoning.len().min(90)]
                 );
                 vote
             })
             .collect();
 
-        // ── Consensus evaluation ───────────────────────────────────────────
         let signal = consensus.evaluate(&votes, &snap);
-
         let elapsed_us = t_start.elapsed().as_micros();
 
         info!(
-            "[Brain] iter={iteration} sym={sym} price={:.4} │ {:?} conf={:.3} RR={:.2} │ {elapsed_us}µs",
+            "[Brain] #{iteration} {sym} price={:.4} │ {:?} conf={:.3} RR={:.2} │ {elapsed_us}µs",
             snap.price, signal.action, signal.confidence, signal.risk_reward
         );
 
@@ -146,12 +129,11 @@ fn main() -> anyhow::Result<()> {
             warn!("[Brain] VETO: {}", signal.veto_reason);
         } else if matches!(signal.action, agents::Direction::Buy | agents::Direction::Sell) {
             info!(
-                "[Brain] ★ SIGNAL {:?} │ entry={:.4} TP={:.4} SL={:.4}",
-                signal.action, signal.entry, signal.take_profit, signal.stop_loss
+                "[Brain] ★ {:?} entry={:.4} TP={:.4} SL={:.4} conf={:.3}",
+                signal.action, signal.entry, signal.take_profit, signal.stop_loss, signal.confidence
             );
         }
 
-        // ── Write signal to SHM → Go executor will pick it up ─────────────
         bridge.write_signal(&signal);
     }
 }
