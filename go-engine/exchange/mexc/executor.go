@@ -2,9 +2,12 @@
 //
 // MEXC Futures Executor
 // =====================
+// BUG FIX (v3.0.1): Renamed public Execute(ctx, OrderRequest) → execute(ctx, OrderRequest)
+// so adapter.go can define the single public Execute(ctx, interface{}) that satisfies
+// main.go's orderExec interface without a duplicate-method compile error.
+//
 // MEXC uses Hedge Mode (two-sided position) and requires separate
-// TP/SL orders submitted AFTER the entry order fills (unlike Bybit which
-// accepts embedded TP/SL at order creation).
+// TP/SL orders submitted AFTER the entry order fills.
 //
 // positionType: 1 = Long,  2 = Short
 // openType:     1 = Isolated, 2 = Cross
@@ -59,7 +62,8 @@ func New(cfg Config) *Executor {
 	return &Executor{cfg: cfg, client: &http.Client{Timeout: 10 * time.Second}}
 }
 
-func (e *Executor) Execute(ctx context.Context, req OrderRequest) error {
+// execute is the internal typed entry point (lowercase — called by adapter.go).
+func (e *Executor) execute(ctx context.Context, req OrderRequest) error {
 	log.Printf("[MEXC] ── %s %s ────────────────────────", req.Side, req.Symbol)
 	log.Printf("[MEXC] entry=%.4f TP=%.4f SL=%.4f RR=%.2f", req.Entry, req.TakeProfit, req.StopLoss, req.RiskReward)
 
@@ -69,19 +73,27 @@ func (e *Executor) Execute(ctx context.Context, req OrderRequest) error {
 	}
 
 	freeUSDT, err := e.fetchBalance(ctx)
-	if err != nil { return fmt.Errorf("balance: %w", err) }
+	if err != nil {
+		return fmt.Errorf("balance: %w", err)
+	}
 
 	stopDist := math.Abs(req.Entry - req.StopLoss)
-	if stopDist < 1e-8 { return fmt.Errorf("degenerate SL") }
+	if stopDist < 1e-8 {
+		return fmt.Errorf("degenerate SL")
+	}
 	riskUSDT := freeUSDT * e.cfg.RiskPct
 	rawSize  := riskUSDT / stopDist
 	size     := math.Round(rawSize*1000) / 1000 // 3dp
 
-	isLong       := req.Side == "BUY"
-	posType      := 1
-	if !isLong { posType = 2 }
+	isLong  := req.Side == "BUY"
+	posType := 1
+	if !isLong {
+		posType = 2
+	}
 	exitSide := "SELL"
-	if !isLong { exitSide = "BUY" }
+	if !isLong {
+		exitSide = "BUY"
+	}
 
 	// Set leverage first
 	if err := e.setLeverage(ctx, req.Symbol, posType, e.cfg.Leverage); err != nil {
@@ -100,14 +112,20 @@ func (e *Executor) Execute(ctx context.Context, req OrderRequest) error {
 		"leverage":     e.cfg.Leverage,
 	}
 	entryResp, err := e.signedPost(ctx, "/api/v1/private/order/create", entryBody)
-	if err != nil { return fmt.Errorf("entry order: %w", err) }
+	if err != nil {
+		return fmt.Errorf("entry order: %w", err)
+	}
 	var entryResult struct {
 		Success bool   `json:"success"`
 		Message string `json:"message"`
 		Data    string `json:"data"` // orderId
 	}
-	if err := json.Unmarshal(entryResp, &entryResult); err != nil { return err }
-	if !entryResult.Success { return fmt.Errorf("MEXC entry: %s", entryResult.Message) }
+	if err := json.Unmarshal(entryResp, &entryResult); err != nil {
+		return err
+	}
+	if !entryResult.Success {
+		return fmt.Errorf("MEXC entry: %s", entryResult.Message)
+	}
 	log.Printf("[MEXC] Entry order id=%s", entryResult.Data)
 
 	// ── SL trigger order ─────────────────────────────────────────────────
@@ -158,19 +176,25 @@ func (e *Executor) setLeverage(ctx context.Context, symbol string, posType, leve
 		"openType":     1,
 	}
 	resp, err := e.signedPost(ctx, "/api/v1/private/position/change_leverage", body)
-	if err != nil { return err }
+	if err != nil {
+		return err
+	}
 	var r struct {
 		Success bool   `json:"success"`
 		Message string `json:"message"`
 	}
 	_ = json.Unmarshal(resp, &r)
-	if !r.Success { return fmt.Errorf("mexc leverage: %s", r.Message) }
+	if !r.Success {
+		return fmt.Errorf("mexc leverage: %s", r.Message)
+	}
 	return nil
 }
 
 func (e *Executor) fetchBalance(ctx context.Context) (float64, error) {
 	resp, err := e.signedGet(ctx, "/api/v1/private/account/assets", "")
-	if err != nil { return 0, err }
+	if err != nil {
+		return 0, err
+	}
 	var result struct {
 		Success bool `json:"success"`
 		Data    []struct {
@@ -178,7 +202,9 @@ func (e *Executor) fetchBalance(ctx context.Context) (float64, error) {
 			Available string `json:"availableBalance"`
 		} `json:"data"`
 	}
-	if err := json.Unmarshal(resp, &result); err != nil { return 0, err }
+	if err := json.Unmarshal(resp, &result); err != nil {
+		return 0, err
+	}
 	for _, a := range result.Data {
 		if a.Currency == "USDT" {
 			v, _ := strconv.ParseFloat(a.Available, 64)
@@ -207,7 +233,9 @@ func (e *Executor) signedPost(ctx context.Context, path string, body map[string]
 	req.Header.Set("Signature", sign)
 
 	resp, err := e.client.Do(req)
-	if err != nil { return nil, err }
+	if err != nil {
+		return nil, err
+	}
 	defer resp.Body.Close()
 	return io.ReadAll(resp.Body)
 }
@@ -217,14 +245,18 @@ func (e *Executor) signedGet(ctx context.Context, path, queryStr string) ([]byte
 	sign := signHMAC(e.cfg.APIKey+ts+queryStr, e.cfg.APISecret)
 
 	url := mexcBase + path
-	if queryStr != "" { url += "?" + queryStr }
+	if queryStr != "" {
+		url += "?" + queryStr
+	}
 	req, _ := http.NewRequestWithContext(ctx, "GET", url, nil)
 	req.Header.Set("ApiKey", e.cfg.APIKey)
 	req.Header.Set("Request-Time", ts)
 	req.Header.Set("Signature", sign)
 
 	resp, err := e.client.Do(req)
-	if err != nil { return nil, err }
+	if err != nil {
+		return nil, err
+	}
 	defer resp.Body.Close()
 	return io.ReadAll(resp.Body)
 }
