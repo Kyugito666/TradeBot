@@ -9,34 +9,20 @@ name = "tradebot-brain"
 path = "src/main.rs"
 
 [dependencies]
-# Shared memory IPC
-memmap2 = "0.9"
-libc    = "0.2"
-
-# Parallelism — 6 agents run concurrently on a thread pool
-rayon = "1.10"
-
-# Random number generation for GBM (PhysicistAgent)
-rand        = { version = "0.8", features = ["small_rng"] }
-rand_distr  = "0.4"
-
-# Logging
+memmap2    = "0.9"
+libc       = "0.2"
+rayon      = "1.10"
+rand       = { version = "0.8", features = ["small_rng"] }
+rand_distr = "0.4"
 log        = "0.4"
 env_logger = "0.11"
-
-# Time
-chrono = { version = "0.4", features = ["serde"] }
-
-# Serialisation (debug dumps + SHM signal encoding)
+chrono     = { version = "0.4", features = ["serde"] }
 serde      = { version = "1", features = ["derive"] }
 serde_json = "1"
-
-# Error handling
-anyhow = "1"
+anyhow     = "1"
 
 [profile.release]
 opt-level     = 3
 lto           = "fat"
 codegen-units = 1
 panic         = "abort"
-# Build with: RUSTFLAGS="-C target-cpu=native" cargo build --release
