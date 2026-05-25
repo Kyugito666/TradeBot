@@ -21,7 +21,6 @@ from ml_models.feature_engineer import (
     encode_candle_sequence, calculate_volume_profile, 
     estimate_order_flow, detect_whale_footprint
 )
-from agents.agent_mathematician import MathSignal
 
 logger = logging.getLogger(__name__)
 
@@ -52,11 +51,13 @@ class CryptographerAgent:
             logger.warning("[Cryptographer] Model ML tidak ditemukan di %s. Menggunakan rule-based fallback.", self.model_path)
         return None
 
-    async def analyze(self, candles: pd.DataFrame, math_signal: MathSignal) -> CryptoSignal:
+    # PERBAIKAN: Menghapus math_signal yang tidak dibutuhkan
+    async def analyze(self, candles: pd.DataFrame) -> CryptoSignal:
         """Eksekusi non-blocking untuk prediksi ML."""
-        return await asyncio.to_thread(self._run_analysis_sync, candles, math_signal)
+        return await asyncio.to_thread(self._run_analysis_sync, candles)
 
-    def _run_analysis_sync(self, df: pd.DataFrame, math_signal: MathSignal) -> CryptoSignal:
+    # PERBAIKAN: Menghapus math_signal yang tidak dibutuhkan
+    def _run_analysis_sync(self, df: pd.DataFrame) -> CryptoSignal:
         try:
             if df.empty or len(df) < 50:
                 raise ValueError("Data candle tidak cukup untuk Cryptographer.")
@@ -132,6 +133,5 @@ if __name__ == "__main__":
     dummy_data = pd.DataFrame({
         'open': [100]*200, 'high': [102]*200, 'low': [98]*200, 'close': [100]*200, 'volume': [1000]*200
     })
-    math_sig = MathSignal(0.5, 0.5, 0, 0, "RANGING", 0.5, 50, 0, "Test")
-    res = asyncio.run(agent.analyze(dummy_data, math_sig))
+    res = asyncio.run(agent.analyze(dummy_data))
     print(res)

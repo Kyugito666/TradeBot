@@ -1,4 +1,5 @@
 import logging
+import asyncio
 import aiohttp
 import pandas as pd
 from typing import Optional, Dict, Any
@@ -10,7 +11,8 @@ class GatewayClient:
     Antarmuka komunikasi antara Python Engine dan Go Data Gateway.
     Menggantikan koneksi langsung ke CEX dengan API HTTP lokal yang latensinya <1ms.
     """
-    def __init__(self, base_url: str = "http://localhost:7890"):
+    # PERBAIKAN: Gunakan 127.0.0.1 menggantikan localhost untuk menghindari isu IPv6 di Windows
+    def __init__(self, base_url: str = "http://127.0.0.1:7890"):
         self.base_url = base_url
         self.headers = {"Content-Type": "application/json"}
 

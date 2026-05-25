@@ -1,16 +1,15 @@
 import os
+import json
 import asyncio
 import logging
-from typing import Dict, Any
+from datetime import datetime, timezone
 from dotenv import load_dotenv
 import ccxt.async_support as ccxt
 
-# Architectural Alignment: Engine Consolidation
 from analytical_engine.evaluator import ConsensusEngine
 from analytical_engine.liquidation import LiquidationClusterEngine
 from analytical_engine.models import AnalysisSignal, Action
 
-# Agent Subsystem
 from agents.agent_mathematician import MathematicianAgent
 from agents.agent_physicist import PhysicistAgent
 from agents.agent_cryptographer import CryptographerAgent
@@ -18,104 +17,131 @@ from agents.agent_linguist import LinguistAgent
 from agents.agent_liquidator import LiquidatorAgent
 from agents.agent_executor import AgentExecutor
 
-# External Network Boundaries
 from data_ingestion.gateway_client import GatewayClient
 from execution_engine.executor import TradeExecutor
 
+# Logging ke file agar bisa dibaca dashboard
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s - %(message)s"
+    format="%(asctime)s [%(levelname)s] %(name)s - %(message)s",
+    handlers=[
+        logging.StreamHandler(),          # stdout (ditangkap bot_server)
+    ]
 )
-logger = logging.getLogger("TradeBot")
+logger = logging.getLogger("main")
+
 
 async def main():
     load_dotenv()
-    symbol = os.getenv("ACTIVE_SYMBOL", "BTCUSDT")
-    dry_run = os.getenv("DRY_RUN", "1") == "1"
+
+    symbol   = os.getenv("SYMBOL", os.getenv("ACTIVE_SYMBOL", "BTCUSDT"))
+    dry_run  = os.getenv("DRY_RUN", "1") == "1"
     exchange_name = os.getenv("EXCHANGE", "mexc").lower()
+    risk_pct = float(os.getenv("RISK_PCT", "0.03"))
+    leverage = int(os.getenv("LEVERAGE", "10"))
 
-    logger.info(f"Starting TradeBot v2.0 | Symbol: {symbol} | DRY_RUN: {dry_run} | Exchange: {exchange_name}")
+    logger.info("TradeBot v2.0 | symbol=%s dry_run=%s exchange=%s risk=%.0f%%",
+                symbol, dry_run, exchange_name, risk_pct * 100)
 
-    # Exchange Interface Instantiation (Required by Executor)
+    # Exchange init
     exchange_class = getattr(ccxt, exchange_name)
+    api_key    = os.getenv(f"{exchange_name.upper()}_API_KEY", "")
+    api_secret = os.getenv(f"{exchange_name.upper()}_API_SECRET", "")
+
     exchange = exchange_class({
-        'apiKey': os.getenv(f"{exchange_name.upper()}_API_KEY", ""),
-        'secret': os.getenv(f"{exchange_name.upper()}_API_SECRET", ""),
+        'apiKey': api_key,
+        'secret': api_secret,
         'enableRateLimit': True,
         'options': {'defaultType': 'swap'}
     })
 
-    # Fixed Quorum parameters logic
-    consensus_engine = ConsensusEngine(min_confidence=0.52, min_agree=2)
+    # PERBAIKAN: Menarik data saldo nyata dari bursa (tidak hardcoded 0 lagi)
+    balance = 0.0
+    try:
+        if api_key and api_secret:
+            bal_data = await exchange.fetch_balance()
+            balance = bal_data.get('USDT', {}).get('free', 0.0)
+    except Exception as e:
+        logger.warning(f"Gagal mengambil saldo: {e}")
+
+    logger.info("[main]   Exchange connected | exchange=%s mode=%s | free_USDT=%.2f",
+                exchange_name, os.getenv("EXCHANGE_MODE", "real"), balance)
+
+    consensus_engine   = ConsensusEngine(min_confidence=0.52, min_agree=2)
     liquidation_engine = LiquidationClusterEngine()
 
-    # Full Agent Roster
     agents = {
         "mathematician": MathematicianAgent(),
-        "physicist": PhysicistAgent(),
+        "physicist":     PhysicistAgent(),
         "cryptographer": CryptographerAgent(),
-        "linguist": LinguistAgent(),
-        "liquidator": LiquidatorAgent(liquidation_engine)
+        "linguist":      LinguistAgent(),
+        "liquidator":    LiquidatorAgent(liquidation_engine),
     }
 
     agent_executor = AgentExecutor(agents)
-    
-    # Priority 4: Drop-in CEX connection relay routing
-    data_fetcher = GatewayClient(base_url="http://localhost:7890")
-    trade_executor = TradeExecutor(exchange=exchange, dry_run=dry_run)
+    data_fetcher   = GatewayClient(base_url="http://127.0.0.1:7890")
+    trade_executor = TradeExecutor(exchange=exchange, dry_run=dry_run,
+                                   risk_pct=risk_pct, leverage=leverage)
 
-    logger.info("Bot initialization complete. Entering main loop...")
+    loop_interval = int(os.getenv("LOOP_INTERVAL", "60"))
+    logger.info("Bot ready. Loop interval=%ds", loop_interval)
 
     try:
         while True:
             try:
-                # 1. High-frequency Ingestion via Local Go Gateway
                 df = await data_fetcher.fetch_ohlcv(symbol, interval="5m", limit=100)
                 if df is None or df.empty:
-                    logger.warning("Failed to fetch OHLCV from Go Gateway. Awaiting node recovery...")
+                    logger.warning("OHLCV fetch gagal — tunggu Go Gateway...")
                     await asyncio.sleep(5)
                     continue
 
                 current_price = float(df['close'].iloc[-1])
-                oi = await data_fetcher.fetch_open_interest(symbol) or 0.0
-                lsr = await data_fetcher.fetch_whale_ratio(symbol) or 1.0
+                logger.info("Harga Real-Time %s: %.4f", symbol, current_price)
 
-                # 2. Parallel Agent Execution Tree
+                oi  = await data_fetcher.fetch_open_interest(symbol) or 0.0
+                lsr = await data_fetcher.fetch_whale_ratio(symbol)   or 1.0
+
+                logger.info("[OI] %s oi=%.2f", symbol, oi)
+                logger.info("[WHALE] %s LSR=%.4f bias=%s",
+                            symbol, lsr, "LONG_HEAVY" if lsr > 1.05 else
+                            "SHORT_HEAVY" if lsr < 0.95 else "NEUTRAL")
+
                 signals_dict = await agent_executor.gather_signals(
-                    df=df,
-                    current_price=current_price,
-                    symbol=symbol,
-                    oi=oi,
-                    lsr=lsr
+                    df=df, current_price=current_price, symbol=symbol,
+                    oi=oi, lsr=lsr
                 )
-
-                # 3. Vote Standardization
-                votes = agent_executor.extract_votes(signals_dict)
-
-                # 4. Consensus Matrix Evaluation
+                votes            = agent_executor.extract_votes(signals_dict)
                 consensus_result = consensus_engine.evaluate(votes, signals_dict)
 
-                # 5. Strictly Typed Signal Mapping & Order Execution
+                # PERBAIKAN: Menampilkan bukti bahwa seluruh tim agen bekerja memberikan suaranya
+                vote_details = [f"{v.agent_name}={v.direction}" for v in votes]
+                logger.info(f"[Team Agents] Suara terkumpul: {', '.join(vote_details)}")
+
+                # Menyiapkan variabel default untuk panel AI Insight
+                take_profit = 0.0
+                stop_loss = 0.0
+                ai_advice = f"Consensus: {consensus_result.buy_count} BUY vs {consensus_result.sell_count} SELL"
+
                 if consensus_result.final_action in ("BUY", "SELL"):
-                    logger.info(f"VALID SIGNAL EXECUTED: {consensus_result.final_action}")
-                    
                     action_enum = Action.BUY if consensus_result.final_action == "BUY" else Action.SELL
-                    
-                    # Compute structural invalidation dynamically 
+
                     recent_high = float(df['high'].iloc[-14:].max())
-                    recent_low = float(df['low'].iloc[-14:].min())
-                    atr = recent_high - recent_low 
-                    
-                    stop_loss = recent_low - (atr * 0.5) if action_enum == Action.BUY else recent_high + (atr * 0.5)
-                    
-                    # Attempt cluster targeting, fallback to arbitrary R:R if target unavailable
+                    recent_low  = float(df['low'].iloc[-14:].min())
+                    atr         = recent_high - recent_low
+
+                    stop_loss = (recent_low  - atr * 0.5 if action_enum == Action.BUY
+                                 else recent_high + atr * 0.5)
+
                     liq_sig = signals_dict.get("liquidator")
                     if liq_sig and liq_sig.profile and action_enum == Action.BUY and liq_sig.profile.short_clusters:
                         take_profit = liq_sig.profile.short_clusters[0].price
                     elif liq_sig and liq_sig.profile and action_enum == Action.SELL and liq_sig.profile.long_clusters:
                         take_profit = liq_sig.profile.long_clusters[-1].price
                     else:
-                        take_profit = current_price + (atr * 1.5) if action_enum == Action.BUY else current_price - (atr * 1.5)
+                        take_profit = (current_price + atr * 1.5 if action_enum == Action.BUY
+                                       else current_price - atr * 1.5)
+
+                    rr = round(abs(take_profit - current_price) / max(abs(current_price - stop_loss), 1e-8), 2)
 
                     signal = AnalysisSignal(
                         symbol=symbol,
@@ -123,26 +149,58 @@ async def main():
                         entry=current_price,
                         take_profit=take_profit,
                         stop_loss=stop_loss,
-                        risk_reward=round(abs(take_profit - current_price) / abs(current_price - stop_loss), 2),
+                        risk_reward=rr,
                         confidence=consensus_result.confidence,
-                        whale_bias="NEUTRAL",  # Derived analytically in full implementation
-                        rationale=f"Consensus quorum matched: {consensus_result.buy_count} BUY vs {consensus_result.sell_count} SELL"
+                        whale_bias="LONG_HEAVY" if lsr > 1.05 else "SHORT_HEAVY" if lsr < 0.95 else "NEUTRAL",
+                        rationale=ai_advice,
+                        timestamp=datetime.now(timezone.utc),
                     )
+
+                    logger.info("[Executor] entry=%.4f SL=%.4f TP=%.4f RR=%.2f conf=%.3f",
+                                signal.entry, signal.stop_loss, signal.take_profit,
+                                signal.risk_reward, signal.confidence)
+                    logger.info("[Executor]   %s %s", consensus_result.final_action, symbol)
                     
+                    ai_advice = f"Aksi {consensus_result.final_action} disetujui! Mengeksekusi order..."
                     await trade_executor.execute_signal(signal)
                 else:
-                    logger.debug("Consensus state: WAIT. No high-conviction edge identified.")
+                    logger.debug("Consensus: WAIT")
+
+                # PERBAIKAN: Menyimpan otak AI ke file JSON secara berkala agar bisa dirender visual oleh Dashboard
+                insight_data = {
+                    "symbol": symbol,
+                    "last_price": current_price,
+                    "open_interest": oi,
+                    "lsr_val": lsr,
+                    "trend_state": "BULLISH" if lsr > 1.05 else "BEARISH" if lsr < 0.95 else "RANGING",
+                    "whale_bias": "LONG_HEAVY" if lsr > 1.05 else "SHORT_HEAVY" if lsr < 0.95 else "NEUTRAL",
+                    "signal_status": consensus_result.final_action,
+                    "advice": ai_advice,
+                    "timestamp": datetime.now().strftime("%H:%M:%S"),
+                    "balance": balance,
+                    "entry_target": current_price if consensus_result.final_action != "WAIT" else 0,
+                    "tp_target": take_profit,
+                    "sl_target": stop_loss
+                }
+                
+                try:
+                    with open("bot_insight.json", "w", encoding="utf-8") as f:
+                        json.dump(insight_data, f)
+                except Exception as e:
+                    logger.error(f"Gagal menulis insight: {e}")
 
             except Exception as e:
-                logger.error(f"Critical invariant breach in main loop: {e}", exc_info=True)
+                logger.error("Error di main loop: %s", e, exc_info=True)
 
-            await asyncio.sleep(60)
-            
+            await asyncio.sleep(loop_interval)
+
     finally:
         await exchange.close()
+        logger.info("Bot shutdown.")
+
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        logger.info("Bot shutting down gracefully.")
+        pass

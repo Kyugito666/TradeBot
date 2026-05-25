@@ -1,167 +1,184 @@
 import json
 import os
+import re
 import sys
 import subprocess
 from http.server import SimpleHTTPRequestHandler, HTTPServer
-from urllib.parse import urlparse
+from urllib.parse import urlparse, parse_qs
 
 PORT = 8765
 
-# 1. Kunci semua file ke Absolute Path (Mencegah salah baca folder)
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 ENV_FILE = os.path.join(BASE_DIR, ".env")
 INSIGHT_FILE = os.path.join(BASE_DIR, "bot_insight.json")
 LOG_FILE = os.path.join(BASE_DIR, "bot.log")
 MAIN_SCRIPT = os.path.join(BASE_DIR, "main.py")
 
-# Global tracker untuk proses bot
 bot_process = None
 
+# Regex untuk parse log format: "2024-01-01 12:00:00,123 [INFO] module.name - message"
+LOG_RE = re.compile(
+    r'^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}),\d+ \[(\w+)\] (.+?) - (.+)$'
+)
+
+def parse_log_line(line):
+    m = LOG_RE.match(line.strip())
+    if m:
+        return {"ts": m.group(1)[11:16], "level": m.group(2), "name": m.group(3)[-14:], "msg": m.group(4)}
+    return {"ts": "--:--", "level": "INFO", "name": "bot", "msg": line.strip()}
+
+def is_bot_running():
+    global bot_process
+    return bot_process is not None and bot_process.poll() is None
+
 class BotServerHandler(SimpleHTTPRequestHandler):
+    def log_message(self, format, *args):
+        pass  # Suppress access logs
+
     def do_GET(self):
         if self.path == '/':
             self.path = '/dashboard.html'
-            
         if self.path == '/lw-charts.js':
             self.path = '/static/lw-charts.js'
 
-        parsed_path = urlparse(self.path)
+        parsed = urlparse(self.path)
+        qs = parse_qs(parsed.query)
 
-        # Handle API GET request for environment variables
-        if '/api/get-env' in parsed_path.path:
-            self.send_response(200)
-            self.send_header('Content-type', 'application/json')
-            self.send_header('Access-Control-Allow-Origin', '*') 
-            self.end_headers()
-
+        # ── GET /api/get-env ──────────────────────────────────────────────────
+        if '/api/get-env' in parsed.path:
             env_data = {}
             if os.path.exists(ENV_FILE):
                 with open(ENV_FILE, 'r', encoding='utf-8') as f:
                     for line in f:
                         line = line.strip()
-                        if line and not line.startswith('#') and '=' in line:
-                            key, val = line.split('=', 1)
-                            key = key.strip()
-                            val = val.strip()
-                            # Sanitasi tanda kutip agar aman dibaca frontend
-                            if val.startswith('"') and val.endswith('"'): val = val[1:-1]
-                            elif val.startswith("'") and val.endswith("'"): val = val[1:-1]
-                            env_data[key] = val
-
-            self.wfile.write(json.dumps(env_data).encode('utf-8'))
+                        if not line or line.startswith('#') or '=' not in line:
+                            continue
+                        key, val = line.split('=', 1)
+                        val = val.strip().strip('"').strip("'")
+                        env_data[key.strip()] = val
+            self._json({"env": env_data})  # FIX: wrapped in {env: ...}
             return
 
-        if '/favicon.ico' in parsed_path.path:
+        # ── GET /api/insight ──────────────────────────────────────────────────
+        if '/api/insight' in parsed.path:
+            payload = {}
+            if os.path.exists(INSIGHT_FILE):
+                try:
+                    with open(INSIGHT_FILE, 'r', encoding='utf-8') as f:
+                        payload = json.load(f)
+                except Exception:
+                    pass
+            self._json(payload)
+            return
+
+        # ── GET /api/logs ─────────────────────────────────────────────────────
+        if '/api/logs' in parsed.path:
+            since = int(qs.get('since', ['0'])[0])
+            all_lines = []
+            if os.path.exists(LOG_FILE):
+                with open(LOG_FILE, 'r', encoding='utf-8', errors='replace') as f:
+                    all_lines = f.readlines()
+            # Hanya kirim 500 baris terakhir supaya tidak overload
+            all_lines = all_lines[-500:]
+            new_lines = all_lines[since:]
+            parsed_logs = [parse_log_line(l) for l in new_lines if l.strip()]
+            self._json({
+                "logs": parsed_logs,
+                "total": len(all_lines),
+                "running": is_bot_running()
+            })
+            return
+
+        # ── GET /api/status ───────────────────────────────────────────────────
+        if '/api/status' in parsed.path:
+            self._json({"running": is_bot_running()})
+            return
+
+        if '/favicon.ico' in parsed.path:
             self.send_response(204)
             self.end_headers()
             return
 
-        # Handle API GET request for bot insights
-        if '/api/insight' in parsed_path.path:
-            self.send_response(200)
-            self.send_header('Content-type', 'application/json')
-            self.send_header('Access-Control-Allow-Origin', '*')
-            self.end_headers()
-            
-            if os.path.exists(INSIGHT_FILE):
-                with open(INSIGHT_FILE, 'r', encoding='utf-8') as f:
-                    self.wfile.write(f.read().encode('utf-8'))
-            else:
-                self.wfile.write(json.dumps({}).encode('utf-8'))
-            return
-
-        # Handle API GET request for logs
-        if '/api/logs' in parsed_path.path:
-            self.send_response(200)
-            self.send_header('Content-type', 'application/json')
-            self.send_header('Access-Control-Allow-Origin', '*')
-            self.end_headers()
-            
-            if os.path.exists(LOG_FILE):
-                with open(LOG_FILE, 'r', encoding='utf-8') as f:
-                    logs = [line.strip() for line in f.readlines()[-100:]]
-                self.wfile.write(json.dumps(logs).encode('utf-8'))
-            else:
-                self.wfile.write(json.dumps([]).encode('utf-8'))
-            return
-
-        if parsed_path.path.startswith('/api/'):
+        if parsed.path.startswith('/api/'):
             self.send_response(404)
-            self.send_header('Content-type', 'application/json')
-            self.send_header('Access-Control-Allow-Origin', '*')
-            self.end_headers()
-            self.wfile.write(json.dumps({"error": f"API route {parsed_path.path} not implemented"}).encode('utf-8'))
+            self._json({"error": f"Route {parsed.path} not found"})
             return
 
         return super().do_GET()
 
     def do_POST(self):
         global bot_process
-        parsed_path = urlparse(self.path)
+        parsed = urlparse(self.path)
 
-        # Handle API POST request to save environment variables
-        if '/api/save-env' in parsed_path.path:
+        # ── POST /api/save-env ────────────────────────────────────────────────
+        if '/api/save-env' in parsed.path:
             try:
-                content_length = int(self.headers.get('Content-Length', 0))
-                if content_length == 0:
-                    raise ValueError("Empty request body")
-
-                post_data = self.rfile.read(content_length)
-                env_data = json.loads(post_data.decode('utf-8'))
-
+                length = int(self.headers.get('Content-Length', 0))
+                if length == 0:
+                    raise ValueError("Empty body")
+                data = json.loads(self.rfile.read(length).decode('utf-8'))
                 with open(ENV_FILE, 'w', encoding='utf-8') as f:
-                    for key, value in env_data.items():
-                        # Simpan dengan aman menggunakan tanda kutip
-                        f.write(f'{key}="{value}"\n')
-
-                self.send_response(200)
-                self.send_header('Content-type', 'application/json')
-                self.send_header('Access-Control-Allow-Origin', '*')
-                self.end_headers()
-                self.wfile.write(json.dumps({"status": "success", "message": "Environment saved"}).encode('utf-8'))
-                
+                    for k, v in data.items():
+                        f.write(f'{k}="{v}"\n')
+                self._json({"ok": True, "message": "Config saved"})
             except Exception as e:
-                self.send_response(500)
-                self.send_header('Content-type', 'application/json')
-                self.send_header('Access-Control-Allow-Origin', '*')
-                self.end_headers()
-                self.wfile.write(json.dumps({"status": "error", "message": str(e)}).encode('utf-8'))
+                self._json({"ok": False, "message": str(e)}, 500)
             return
 
-        # 2. EKSEKUSI BOT START
-        if '/api/start' in parsed_path.path:
-            self.send_response(200)
-            self.send_header('Content-type', 'application/json')
-            self.send_header('Access-Control-Allow-Origin', '*')
-            self.end_headers()
-            
-            if bot_process is None or bot_process.poll() is not None:
-                try:
-                    # Jalankan main.py dengan interpreter yang sama, di folder yang sama
-                    bot_process = subprocess.Popen([sys.executable, MAIN_SCRIPT], cwd=BASE_DIR)
-                    self.wfile.write(json.dumps({"status": "success", "message": "Bot is starting..."}).encode('utf-8'))
-                except Exception as e:
-                    self.wfile.write(json.dumps({"status": "error", "message": f"Failed to start bot: {e}"}).encode('utf-8'))
-            else:
-                self.wfile.write(json.dumps({"status": "success", "message": "Bot is already running."}).encode('utf-8'))
+        # ── POST /api/start ───────────────────────────────────────────────────
+        if '/api/start' in parsed.path:
+            if is_bot_running():
+                self._json({"ok": True, "message": "Bot sudah berjalan."})
+                return
+            try:
+                # Baca .env dan injeksi ke environment anak proses
+                env = os.environ.copy()
+                if os.path.exists(ENV_FILE):
+                    with open(ENV_FILE, 'r', encoding='utf-8') as f:
+                        for line in f:
+                            line = line.strip()
+                            if not line or line.startswith('#') or '=' not in line:
+                                continue
+                            k, v = line.split('=', 1)
+                            env[k.strip()] = v.strip().strip('"').strip("'")
+
+                # Arahkan stdout/stderr ke log file agar bisa dibaca dashboard
+                log_fd = open(LOG_FILE, 'a', encoding='utf-8')
+                bot_process = subprocess.Popen(
+                    [sys.executable, MAIN_SCRIPT],
+                    cwd=BASE_DIR,
+                    env=env,
+                    stdout=log_fd,
+                    stderr=log_fd
+                )
+                self._json({"ok": True, "message": "Bot starting..."})
+            except Exception as e:
+                self._json({"ok": False, "message": str(e)}, 500)
             return
 
-        # 3. EKSEKUSI BOT STOP
-        if '/api/stop' in parsed_path.path:
-            self.send_response(200)
-            self.send_header('Content-type', 'application/json')
-            self.send_header('Access-Control-Allow-Origin', '*')
-            self.end_headers()
-            
+        # ── POST /api/stop ────────────────────────────────────────────────────
+        if '/api/stop' in parsed.path:
             if bot_process is not None and bot_process.poll() is None:
                 bot_process.terminate()
-                bot_process.wait()
-                self.wfile.write(json.dumps({"status": "success", "message": "Bot stopped."}).encode('utf-8'))
+                try:
+                    bot_process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    bot_process.kill()
+                self._json({"ok": True, "message": "Bot dihentikan."})
             else:
-                self.wfile.write(json.dumps({"status": "success", "message": "Bot is not running."}).encode('utf-8'))
+                self._json({"ok": True, "message": "Bot tidak berjalan."})
             return
 
-        self.send_error(501, "Unsupported method ('POST')")
+        # ── POST /api/clear-logs ──────────────────────────────────────────────
+        if '/api/clear-logs' in parsed.path:
+            try:
+                open(LOG_FILE, 'w').close()
+                self._json({"ok": True})
+            except Exception as e:
+                self._json({"ok": False, "message": str(e)}, 500)
+            return
+
+        self.send_error(501, "Not Implemented")
 
     def do_OPTIONS(self):
         self.send_response(200)
@@ -170,18 +187,26 @@ class BotServerHandler(SimpleHTTPRequestHandler):
         self.send_header('Access-Control-Allow-Headers', 'Content-Type')
         self.end_headers()
 
+    def _json(self, payload, code=200):
+        body = json.dumps(payload).encode('utf-8')
+        self.send_response(code)
+        self.send_header('Content-Type', 'application/json')
+        self.send_header('Access-Control-Allow-Origin', '*')
+        self.send_header('Content-Length', str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+
 def run_server():
-    server_address = ('', PORT)
-    httpd = HTTPServer(server_address, BotServerHandler)
-    print(f"[SYSTEM] Dashboard server running at http://localhost:{PORT}")
-    print(f"[SYSTEM] Absolute path tracking enabled in: {BASE_DIR}")
+    httpd = HTTPServer(('', PORT), BotServerHandler)
+    print(f"[SYSTEM] Dashboard: http://localhost:{PORT}")
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
-        print("\n[SYSTEM] Shutting down dashboard server...")
-        if bot_process is not None and bot_process.poll() is None:
+        if is_bot_running():
             bot_process.terminate()
         httpd.server_close()
+        print("\n[SYSTEM] Server stopped.")
 
 if __name__ == '__main__':
     run_server()
