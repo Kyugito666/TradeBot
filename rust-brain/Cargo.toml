@@ -1,0 +1,36 @@
+[package]
+name    = "tradebot-brain"
+version = "3.0.0"
+edition = "2021"
+authors = ["TradeBot Code-Architect"]
+
+[dependencies]
+# Shared memory
+memmap2 = "0.9"
+libc    = "0.2"
+
+# Parallelism — runs 6 agents concurrently on a thread pool
+rayon = "1.10"
+
+# Random number generation for GBM simulations (Physicist)
+rand = { version = "0.8", features = ["small_rng"] }
+
+# Logging
+log        = "0.4"
+env_logger = "0.11"
+
+# Time
+chrono = "0.4"
+
+# Serialisation (for debug dumps)
+serde      = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[profile.release]
+# Absolute maximum performance for trading loop
+opt-level     = 3
+lto           = "fat"
+codegen-units = 1
+panic         = "abort"
+# Target native CPU for SIMD auto-vectorisation
+# Build with: RUSTFLAGS="-C target-cpu=native" cargo build --release
