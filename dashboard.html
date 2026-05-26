@@ -8,7 +8,7 @@
 </head>
 <body>
 <header>
-  <div class="logo">⬡ BOTTRADE</div>
+  <div class="logo">&#x2B21; BOTTRADE</div>
   <div class="header-center">
     <span class="live-price" id="hdr-price">--</span>
     <span class="price-delta" id="hdr-delta" style="display:none"></span>
@@ -25,26 +25,26 @@
     <div>
       <div class="section-title">Control</div>
       <div class="btn-group">
-        <button class="btn btn-start" id="btn-start" onclick="startBot()">▶ START</button>
-        <button class="btn btn-stop" id="btn-stop" onclick="stopBot()" disabled>■ STOP</button>
+        <button class="btn btn-start" id="btn-start" onclick="startBot()">&#x25B6; START</button>
+        <button class="btn btn-stop" id="btn-stop" onclick="stopBot()" disabled>&#x25A0; STOP</button>
       </div>
     </div>
-    
+
     <div>
       <div class="section-title">Trading Config</div>
       <div class="card" id="config-form">
         <label style="display:flex;justify-content:space-between;align-items:center">
           Symbol (Futures)
-          <span id="pairs-status" style="font-size:9px;color:var(--text2);font-style:normal;letter-spacing:0;font-weight:400">⟳ loading…</span>
+          <span id="pairs-status" style="font-size:9px;color:var(--text2);font-style:normal;letter-spacing:0;font-weight:400">&#x27F3; loading&hellip;</span>
         </label>
         <select id="cfg-symbol" style="font-size:12px"><option value="BTCUSDT">BTCUSDT</option></select>
-        
+
         <label>Exchange</label>
         <select id="cfg-exchange" onchange="onExchangeChange(this.value)">
           <option value="bybit">Bybit</option>
           <option value="mexc">MEXC</option>
         </select>
-        
+
         <label>Mode</label>
         <select id="cfg-mode">
           <option value="demo">Demo (Testnet)</option>
@@ -57,7 +57,7 @@
           <option value="daytrade">Day Trader (Menengah / Harian)</option>
           <option value="sniper">Sniper Swing (Modal Tebel / Sabar)</option>
         </select>
-        
+
         <label>TP/SL Target Type</label>
         <select id="cfg-target-type">
           <option value="RR">Risk/Reward (ATR-based)</option>
@@ -73,15 +73,17 @@
           <input type="range" id="cfg-lev-slider" min="1" max="100" value="10" oninput="syncLev('slider')">
           <div style="display:flex;gap:6px;align-items:center">
             <input type="number" id="cfg-leverage" value="10" min="1" max="100" style="flex:1" oninput="syncLev('number')">
-            <span style="font-family:var(--mono);font-size:10px;color:var(--text2);white-space:nowrap">× isolated</span>
+            <span style="font-family:var(--mono);font-size:10px;color:var(--text2);white-space:nowrap">&#xD7; isolated</span>
           </div>
         </div>
-        
+
         <label style="display:flex; justify-content:space-between; align-items:center; margin-top:10px;">
           Margin Usage / Risk
           <span id="risk-val-display" style="color:var(--accent); font-size:12px; font-weight:600;">3%</span>
         </label>
-        <input type="range" id="cfg-risk" min="1" max="100" value="3" oninput="document.getElementById('risk-val-display').textContent = this.value + '%'" style="margin-top:6px; cursor:pointer; width:100%;">
+        <input type="range" id="cfg-risk" min="1" max="100" value="3"
+               oninput="document.getElementById('risk-val-display').textContent = this.value + '%'"
+               style="margin-top:6px; cursor:pointer; width:100%;">
 
         <div class="toggle-row" style="margin-top:12px">
           <span class="toggle-label">Mock OHLCV</span>
@@ -93,38 +95,38 @@
         </div>
       </div>
     </div>
-    
+
     <div>
       <div class="section-title">API Bybit (Demo)</div>
       <div class="card">
         <label>API Key</label>
-        <input type="password" id="key-bybit-demo-key" placeholder="••••••••••••">
+        <input type="password" id="key-bybit-demo-key" placeholder="&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;">
         <label>API Secret</label>
-        <input type="password" id="key-bybit-demo-secret" placeholder="••••••••••••">
+        <input type="password" id="key-bybit-demo-secret" placeholder="&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;">
       </div>
     </div>
-    
+
     <div>
       <div class="section-title">API Bybit (Real)</div>
       <div class="card">
         <label>API Key</label>
-        <input type="password" id="key-bybit-real-key" placeholder="••••••••••••">
+        <input type="password" id="key-bybit-real-key" placeholder="&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;">
         <label>API Secret</label>
-        <input type="password" id="key-bybit-real-secret" placeholder="••••••••••••">
+        <input type="password" id="key-bybit-real-secret" placeholder="&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;">
       </div>
     </div>
-    
+
     <div>
       <div class="section-title">API MEXC (Real)</div>
       <div class="card">
         <label>API Key</label>
-        <input type="password" id="key-mexc-key" placeholder="••••••••••••">
+        <input type="password" id="key-mexc-key" placeholder="&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;">
         <label>API Secret</label>
-        <input type="password" id="key-mexc-secret" placeholder="••••••••••••">
+        <input type="password" id="key-mexc-secret" placeholder="&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;">
       </div>
     </div>
-    
-    <button class="btn btn-save" onclick="saveConfig()" style="margin-top:auto" id="btn-save-cfg">💾 SAVE CONFIG</button>
+
+    <button class="btn btn-save" onclick="saveConfig()" style="margin-top:auto" id="btn-save-cfg">&#x1F4BE; SAVE CONFIG</button>
   </aside>
 
   <section class="main-panel">
@@ -147,7 +149,7 @@
       <div class="stat-card">
         <div class="stat-label">BALANCE</div>
         <div class="stat-value small" id="stat-balance">
-          -- USDT 
+          -- USDT
           <span id="stat-bal-pct" style="font-size:10px; opacity:0.7;"></span>
         </div>
         <div class="stat-sub" id="stat-risk">Risk --% / trade</div>
@@ -158,20 +160,20 @@
         <div class="stat-sub" id="stat-trades">0 trades</div>
       </div>
       <div class="stat-card">
-        <div class="stat-label">SIM P&L</div>
+        <div class="stat-label">SIM P&amp;L</div>
         <div class="stat-value" id="stat-pnl">+0.00%</div>
         <div class="stat-sub" id="stat-pnl-sub">0 signals fired</div>
       </div>
     </div>
 
     <div class="tab-bar">
-      <button class="tab active" onclick="switchTab('chart', this)">📈 CHART</button>
-      <button class="tab" onclick="switchTab('logs', this)">📋 LOGS</button>
-      <!-- FIX #6: AI INSIGHT → AI SIGNAL, independent dari bot, id dipakai JS buat update label -->
-      <button class="tab" id="tab-signal-btn" onclick="switchTab('insight', this)">🎯 AI SIGNAL</button>
+      <button class="tab active" onclick="switchTab('chart', this)">&#x1F4C8; CHART</button>
+      <button class="tab" onclick="switchTab('logs', this)">&#x1F4CB; LOGS</button>
+      <!-- id dipakai JS v3.0.4 untuk update label & ensureSignalPaneReady() -->
+      <button class="tab" id="tab-signal-btn" onclick="switchTab('insight', this)">&#x1F3AF; AI SIGNAL</button>
       <div class="tab-spacer"></div>
-      
-      <button class="icon-btn" id="btn-toggle-chart" onclick="toggleChart()" style="margin-right:8px; border-color:var(--border);">👁 Hide Chart</button>
+
+      <button class="icon-btn" id="btn-toggle-chart" onclick="toggleChart()" style="margin-right:8px; border-color:var(--border);">&#x1F441; Hide Chart</button>
 
       <div class="filter-btns" id="log-filter-btns" style="display:none">
         <button class="fbtn active" data-lvl="ALL" onclick="setFilter(this)">ALL</button>
@@ -180,12 +182,12 @@
         <button class="fbtn lvl-ERROR" data-lvl="ERROR" onclick="setFilter(this)">ERR</button>
       </div>
       <div class="log-actions">
-        <button class="icon-btn" id="btn-autoscroll" onclick="toggleAutoScroll()">⬇ Auto</button>
-        <button class="icon-btn" onclick="clearLogs()">🗑 Clear</button>
+        <button class="icon-btn" id="btn-autoscroll" onclick="toggleAutoScroll()">&#x2B07; Auto</button>
+        <button class="icon-btn" onclick="clearLogs()">&#x1F5D1; Clear</button>
         <button class="icon-btn" onclick="resetHistory()">Reset DB</button>
       </div>
     </div>
-    
+
     <div class="tab-pane active" id="pane-chart">
       <div class="chart-toolbar" id="chart-toolbar">
         <div class="tf-btns" id="tf-btns">
@@ -196,14 +198,18 @@
           <button class="tf-btn" data-tf="60" onclick="setTimeframe(this)">1h</button>
           <button class="tf-btn" data-tf="240" onclick="setTimeframe(this)">4h</button>
         </div>
-        <span class="chart-status" id="chart-status">⟳ loading…</span>
+        <span class="chart-status" id="chart-status">&#x27F3; loading&hellip;</span>
       </div>
+
       <div class="chart-wrap" id="chart-wrapper">
         <div id="chart-container"></div>
-        <div class="chart-empty" id="chart-empty"><div class="chart-empty-icon">◈</div><div>Memuat chart…</div></div>
+        <div class="chart-empty" id="chart-empty">
+          <div class="chart-empty-icon">&#x25C8;</div>
+          <div>Memuat chart&hellip;</div>
+        </div>
       </div>
-      <!-- FIX #7: legend hidden by default — _showChartLegend() di JS yang nyalain
-           hanya saat ada marker BUY/SELL atau ENTRY/TP/SL line aktif di chart -->
+
+      <!-- hidden by default — _showChartLegend() di JS yang nyalain saat ada marker/line aktif -->
       <div class="chart-legend" id="chart-legend" style="display:none">
         <div class="legend-item"><div class="legend-dot" style="background:#26a69a"></div>Bullish</div>
         <div class="legend-item"><div class="legend-dot" style="background:#ef5350"></div>Bearish</div>
@@ -211,31 +217,40 @@
         <div class="legend-item"><div class="legend-dot" style="background:var(--accent)"></div>BUY Signal</div>
         <div class="legend-item"><div class="legend-dot" style="background:var(--danger)"></div>SELL Signal</div>
       </div>
-      <div class="trades-panel" id="trades-panel" style="flex: 1; min-height: 120px; overflow: auto; border-top: 1px solid var(--border);">
-        <div class="trades-panel-title" style="position: sticky; top: 0; background: var(--bg2);">Trade History</div>
+
+      <div class="trades-panel" id="trades-panel" style="flex:1; min-height:120px; overflow:auto; border-top:1px solid var(--border);">
+        <div class="trades-panel-title" style="position:sticky; top:0; background:var(--bg2);">Trade History</div>
         <table class="trades-table">
-          <thead><tr><th>Time</th><th>Side</th><th>Entry</th><th>TP</th><th>SL</th><th>Result</th><th>P&L</th></tr></thead>
-          <tbody id="trades-tbody"><tr><td colspan="7" style="color:var(--text2); text-align:center; padding:10px">Belum ada trade</td></tr></tbody>
+          <thead>
+            <tr><th>Time</th><th>Side</th><th>Entry</th><th>TP</th><th>SL</th><th>Result</th><th>P&amp;L</th></tr>
+          </thead>
+          <tbody id="trades-tbody">
+            <tr><td colspan="7" style="color:var(--text2); text-align:center; padding:10px">Belum ada trade</td></tr>
+          </tbody>
         </table>
       </div>
-    </div>
+    </div><!-- end pane-chart -->
 
     <div class="tab-pane" id="pane-logs">
       <div id="log-container">
-        <div class="empty-state"><div class="empty-icon">◈</div><div>Belum ada log — start bot dulu</div></div>
+        <div class="empty-state">
+          <div class="empty-icon">&#x25C8;</div>
+          <div>Belum ada log &mdash; start bot dulu</div>
+        </div>
       </div>
     </div>
-    
-    <!-- FIX #6: pane insight dikosongkan — ensureSignalPaneReady() di dashboard.js
-         yang isi seluruh konten AI SIGNAL SCANNER secara independen.
-         Tidak ada lagi ketergantungan ke bot utama, langsung scrape Bybit publik API. -->
+
+    <!-- pane-insight dikosongkan — ensureSignalPaneReady() di dashboard.js yang isi seluruh konten
+         AI SIGNAL SCANNER. Jangan isi HTML statis di sini atau JS akan konflik. -->
     <div class="tab-pane" id="pane-insight" style="background:var(--bg); padding:0; overflow:hidden;">
       <div style="display:flex;align-items:center;justify-content:center;height:100%;color:var(--text2);font-family:var(--mono);font-size:12px;">
-        ⟳ Loading AI Signal Scanner…
+        &#x27F3; Loading AI Signal Scanner&hellip;
       </div>
     </div>
+
   </section>
 </main>
+
 <div class="toast" id="toast"></div>
 
 <script src="/dashboard.js"></script>
