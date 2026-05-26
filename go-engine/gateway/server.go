@@ -62,13 +62,13 @@ type Server struct {
 	mu         sync.RWMutex
 	insight    InsightData
 	running    atomic.Bool
-	botRunning atomic.Bool // Mengontrol status aktif trading via Dashboard
+	botRunning atomic.Bool
 	stop       chan struct{}
 	baseDir    string
 
 	// Storage in-memory untuk Paper Trading
-	activePos  *Position
-	history    []Position
+	activePos *Position
+	history   []Position
 }
 
 func New(baseDir string) *Server {
@@ -78,7 +78,7 @@ func New(baseDir string) *Server {
 		insight: InsightData{SignalStatus: "WAIT", TrendState: "RANGING"},
 		history: make([]Position, 0),
 	}
-	s.botRunning.Store(false) // Mula-mula diset FALSE agar tidak langsung trading saat start
+	s.botRunning.Store(false)
 	return s
 }
 
@@ -93,18 +93,17 @@ func (s *Server) UpdateInsight(d InsightData) {
 	}
 }
 
-// Fungsi untuk injeksi data posisi dari Main Engine ke HTTP
 func (s *Server) UpdatePositions(active *Position, hist []Position) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	
+
 	if active != nil {
 		p := *active
 		s.activePos = &p
 	} else {
 		s.activePos = nil
 	}
-	
+
 	s.history = make([]Position, len(hist))
 	copy(s.history, hist)
 }
@@ -118,8 +117,8 @@ func (s *Server) Start() {
 	mux := http.NewServeMux()
 
 	mux.Handle("/dashboard.css", s.staticFile("dashboard.css"))
-	mux.Handle("/dashboard.js",  s.staticFile("dashboard.js"))
-	mux.Handle("/lw-charts.js",  s.staticFile("static/lw-charts.js"))
+	mux.Handle("/dashboard.js", s.staticFile("dashboard.js"))
+	mux.Handle("/lw-charts.js", s.staticFile("static/lw-charts.js"))
 
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/" || r.URL.Path == "/dashboard.html" {
@@ -129,14 +128,14 @@ func (s *Server) Start() {
 		http.NotFound(w, r)
 	})
 
-	mux.HandleFunc("/api/insight",    s.handleInsight)
-	mux.HandleFunc("/api/positions",  s.handlePositions) // Endpoint baru buat visual chart
-	mux.HandleFunc("/api/logs",       s.handleLogs)
-	mux.HandleFunc("/api/status",     s.handleStatus)
-	mux.HandleFunc("/api/get-env",    s.handleGetEnv)
-	mux.HandleFunc("/api/save-env",   s.handleSaveEnv)
-	mux.HandleFunc("/api/start",      s.handleStart)
-	mux.HandleFunc("/api/stop",       s.handleStop)
+	mux.HandleFunc("/api/insight", s.handleInsight)
+	mux.HandleFunc("/api/positions", s.handlePositions)
+	mux.HandleFunc("/api/logs", s.handleLogs)
+	mux.HandleFunc("/api/status", s.handleStatus)
+	mux.HandleFunc("/api/get-env", s.handleGetEnv)
+	mux.HandleFunc("/api/save-env", s.handleSaveEnv)
+	mux.HandleFunc("/api/start", s.handleStart)
+	mux.HandleFunc("/api/stop", s.handleStop)
 	mux.HandleFunc("/api/clear-logs", s.handleClearLogs)
 
 	addr := fmt.Sprintf(":%d", Port)
@@ -171,7 +170,6 @@ func (s *Server) handleInsight(w http.ResponseWriter, r *http.Request) {
 	s.jsonOK(w, d)
 }
 
-// Handler baru agar web tau bot lagi open posisi paper di angka berapa
 func (s *Server) handlePositions(w http.ResponseWriter, r *http.Request) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -206,7 +204,9 @@ func (s *Server) handleLogs(w http.ResponseWriter, r *http.Request) {
 
 	parsed := make([]LogLine, 0, len(newLines))
 	for _, line := range newLines {
-		if line == "" { continue }
+		if line == "" {
+			continue
+		}
 		parsed = append(parsed, parseLogLine(line))
 	}
 
@@ -228,12 +228,19 @@ func (s *Server) handleGetEnv(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleSaveEnv(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", 405); return
+		http.Error(w, "method not allowed", 405)
+		return
 	}
 	body, err := io.ReadAll(r.Body)
-	if err != nil { s.jsonErr(w, err.Error()); return }
+	if err != nil {
+		s.jsonErr(w, err.Error())
+		return
+	}
 	var data map[string]string
-	if err := json.Unmarshal(body, &data); err != nil { s.jsonErr(w, err.Error()); return }
+	if err := json.Unmarshal(body, &data); err != nil {
+		s.jsonErr(w, err.Error())
+		return
+	}
 
 	path := filepath.Join(s.baseDir, EnvFile)
 	var sb strings.Builder
@@ -241,7 +248,8 @@ func (s *Server) handleSaveEnv(w http.ResponseWriter, r *http.Request) {
 		sb.WriteString(fmt.Sprintf("%s=\"%s\"\n", k, v))
 	}
 	if err := os.WriteFile(path, []byte(sb.String()), 0o600); err != nil {
-		s.jsonErr(w, err.Error()); return
+		s.jsonErr(w, err.Error())
+		return
 	}
 	s.jsonOK(w, map[string]interface{}{"ok": true, "message": "Config saved"})
 }
@@ -260,11 +268,13 @@ func (s *Server) handleStop(w http.ResponseWriter, _ *http.Request) {
 
 func (s *Server) handleClearLogs(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", 405); return
+		http.Error(w, "method not allowed", 405)
+		return
 	}
 	path := filepath.Join(s.baseDir, LogFile)
 	if err := os.WriteFile(path, nil, 0o644); err != nil {
-		s.jsonErr(w, err.Error()); return
+		s.jsonErr(w, err.Error())
+		return
 	}
 	s.jsonOK(w, map[string]bool{"ok": true})
 }
@@ -289,38 +299,107 @@ func (s *Server) jsonErr(w http.ResponseWriter, msg string) {
 	w.Write(b)
 }
 
+// parseLogLine normalises both Go and Rust log lines to a consistent LogLine.
+//
+// Go  log format : 2026/05/26 13:14:07.123456 [module] message   (already local time)
+// Rust log format: [2026-05-26T06:14:07.123Z INFO module::path] message (UTC → convert to local)
 func parseLogLine(line string) LogLine {
 	if strings.HasPrefix(line, "[MONITOR]") {
 		return LogLine{Ts: time.Now().Format("15:04:05"), Level: "WARN", Name: "monitor", Msg: line}
 	}
+
+	// ── Rust env_logger ───────────────────────────────────────────────────────
+	// [2026-05-26T06:14:07.123456Z INFO tradebot_brain::consensus::mod] message
 	if strings.HasPrefix(line, "[202") {
-		parts := strings.SplitN(line, "]", 2)
-		if len(parts) == 2 {
-			meta := strings.Fields(strings.TrimPrefix(parts[0], "["))
-			if len(meta) >= 3 {
+		end := strings.IndexByte(line, ']')
+		if end > 1 {
+			meta := strings.Fields(line[1:end])
+			msg := ""
+			if end+1 < len(line) {
+				msg = strings.TrimSpace(line[end+1:])
+			}
+			if len(meta) >= 2 {
+				// UTC timestamp → local (WIB / device timezone)
 				ts := meta[0]
-				if len(ts) >= 19 { ts = ts[11:19] }
-				return LogLine{Ts: ts, Level: meta[1], Name: "rust", Msg: strings.TrimSpace(parts[1])}
+				if t, err := time.Parse(time.RFC3339Nano, ts); err == nil {
+					ts = t.Local().Format("15:04:05")
+				} else if len(ts) >= 19 {
+					ts = ts[11:19] // fallback: raw HH:MM:SS from UTC string
+				}
+
+				level := "INFO"
+				switch strings.ToUpper(meta[1]) {
+				case "WARN", "WARNING":
+					level = "WARNING"
+				case "ERROR":
+					level = "ERROR"
+				case "DEBUG":
+					level = "DEBUG"
+				}
+
+				// "tradebot_brain::consensus::mod" → "consensus"
+				name := "rust"
+				if len(meta) >= 3 {
+					mod := meta[2]
+					if idx := strings.LastIndex(mod, "::"); idx >= 0 {
+						name = mod[idx+2:]
+					} else {
+						name = mod
+					}
+					name = strings.TrimSuffix(name, "_brain")
+					name = strings.TrimSuffix(name, "_engine")
+				}
+
+				return LogLine{Ts: ts, Level: level, Name: name, Msg: msg}
 			}
 		}
 	}
+
+	// ── Go log package ────────────────────────────────────────────────────────
+	// 2026/05/26 13:14:07.123456 [module] message
 	if strings.HasPrefix(line, "202") {
 		parts := strings.Fields(line)
 		if len(parts) >= 4 {
 			ts := parts[1]
-			if len(ts) >= 8 { ts = ts[:8] }
+			if len(ts) >= 8 {
+				ts = ts[:8] // HH:MM:SS — already local time
+			}
 			name := strings.Trim(parts[2], "[]")
 			msg := strings.Join(parts[3:], " ")
-			return LogLine{Ts: ts, Level: "INFO", Name: name, Msg: msg}
+			return LogLine{Ts: ts, Level: detectLogLevel(msg), Name: name, Msg: msg}
 		}
 	}
-	return LogLine{Ts: "--:--", Level: "INFO", Name: "sys", Msg: line}
+
+	return LogLine{Ts: time.Now().Format("15:04:05"), Level: "INFO", Name: "sys", Msg: line}
+}
+
+// detectLogLevel infers level from Go log message content.
+func detectLogLevel(msg string) string {
+	upper := strings.ToUpper(msg)
+	switch {
+	case strings.Contains(upper, "ERROR") ||
+		strings.Contains(upper, "FAILED") ||
+		strings.Contains(upper, "FATAL") ||
+		strings.Contains(upper, "PANIC"):
+		return "ERROR"
+	case strings.Contains(upper, "WARN") ||
+		strings.Contains(upper, "CIRCUIT BREAKER") ||
+		strings.Contains(upper, "[VETO]") ||
+		strings.Contains(upper, "COOLDOWN"):
+		return "WARNING"
+	case strings.Contains(upper, "DEBUG"):
+		return "DEBUG"
+	default:
+		return "INFO"
+	}
 }
 
 func parseEnvFile(path string) map[string]string {
 	m := map[string]string{}
 	data, err := os.ReadFile(path)
-	if err != nil { return m }
+	if err != nil {
+		return m
+	}
 	for _, line := range strings.Split(string(data), "\n") {
 		line = strings.TrimSpace(line)
 		if line == "" || strings.HasPrefix(line, "#") || !strings.Contains(line, "=") {
