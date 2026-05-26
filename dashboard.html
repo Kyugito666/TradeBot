@@ -5,8 +5,14 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>TradeBot Quantum Control</title>
     
+    <!-- Fix 404 Favicon Error -->
+    <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🤖</text></svg>">
+    
+    <!-- Using CDN for simplicity in this single-file demo, in production use Tailwind CLI -->
     <script src="https://cdn.tailwindcss.com"></script>
-    <script src="https://unpkg.com/lightweight-charts/dist/lightweight-charts.standalone.production.js"></script>
+    
+    <!-- Update Lightweight Charts to a stable v4 -->
+    <script src="https://unpkg.com/lightweight-charts@4.1.1/dist/lightweight-charts.standalone.production.js"></script>
     <!-- Phosphor Icons -->
     <script src="https://unpkg.com/@phosphor-icons/web"></script>
     
@@ -159,7 +165,17 @@
                     <i class="ph ph-list text-2xl"></i>
                 </button>
                 <h1 class="text-xl font-semibold">System Overview</h1>
-                <div class="hidden sm:flex items-center gap-2 px-3 py-1 rounded-full bg-emerald-500/10 text-emerald-400 text-xs font-medium border border-emerald-500/20">
+                
+                <!-- AUTO TRADING CONTROL -->
+                <div class="ml-4 flex items-center gap-2 bg-slate-800/80 p-1 rounded-lg border border-slate-700">
+                    <span class="text-xs font-semibold text-slate-400 pl-2 pr-1">AUTO TRADING</span>
+                    <button id="btn-toggle-bot" class="flex items-center gap-2 px-4 py-1.5 rounded-md bg-rose-500/20 text-rose-400 border border-rose-500/30 hover:bg-rose-500/30 transition-all font-medium text-sm" onclick="toggleBot()">
+                        <i class="ph-fill ph-stop-circle text-lg" id="icon-bot-state"></i>
+                        <span id="text-bot-state">STOPPED</span>
+                    </button>
+                </div>
+
+                <div class="hidden sm:flex items-center gap-2 px-3 py-1 rounded-full bg-emerald-500/10 text-emerald-400 text-xs font-medium border border-emerald-500/20 ml-2" id="gateway-status">
                     <span class="w-2 h-2 rounded-full bg-emerald-500 pulse-ring"></span>
                     Gateway: Online
                 </div>
@@ -181,21 +197,22 @@
             
             <!-- KPI Cards -->
             <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
-                <!-- Total Equity -->
-                <div class="glass-panel p-5 rounded-2xl">
+                
+                <!-- NEW: AI Signal Status (Replaced Total Equity for Trading Focus) -->
+                <div class="glass-panel p-5 rounded-2xl relative overflow-hidden">
+                    <div class="absolute -right-4 -top-4 w-24 h-24 bg-brand-500/10 rounded-full blur-2xl"></div>
                     <div class="flex justify-between items-start mb-4">
                         <div>
-                            <p class="text-sm font-medium text-slate-400 mb-1">Total Equity</p>
-                            <h3 class="text-2xl font-bold text-white">$124,532.89</h3>
+                            <p class="text-sm font-medium text-slate-400 mb-1">Current AI Signal</p>
+                            <h3 class="text-2xl font-bold text-brand-400" id="ai-signal-text">STRONG LONG</h3>
                         </div>
-                        <div class="p-2 rounded-lg bg-brand-500/20 text-brand-400">
-                            <i class="ph ph-wallet text-xl"></i>
+                        <div class="p-2 rounded-lg bg-slate-800 text-white">
+                            <i class="ph ph-lightning text-xl text-brand-400"></i>
                         </div>
                     </div>
-                    <div class="flex items-center text-sm">
-                        <i class="ph ph-trend-up text-profit mr-1"></i>
-                        <span class="text-profit font-medium">+2.4%</span>
-                        <span class="text-slate-500 ml-2">vs yesterday</span>
+                    <div class="flex items-center text-sm gap-2">
+                        <span class="px-2 py-0.5 rounded text-xs font-bold bg-brand-500/20 text-brand-400 border border-brand-500/20">CONFIDENCE: 89%</span>
+                        <span class="text-slate-500 text-xs">BTC/USDT</span>
                     </div>
                 </div>
 
@@ -429,6 +446,7 @@
         function initChart() {
             const chartContainer = document.getElementById('chart-container');
             
+            // Fix: LightweightCharts v4 syntax
             const chartOptions = { 
                 layout: { 
                     textColor: '#94a3b8', 
@@ -439,7 +457,7 @@
                     horzLines: { color: 'rgba(51, 65, 85, 0.4)' }
                 },
                 crosshair: {
-                    mode: LightweightCharts.CrosshairMode.Normal,
+                    mode: 1, // Normal mode in v4
                 },
                 rightPriceScale: {
                     borderColor: 'rgba(51, 65, 85, 0.8)',
@@ -452,6 +470,8 @@
             };
             
             const chart = LightweightCharts.createChart(chartContainer, chartOptions);
+            
+            // Fix: In v4, use addCandlestickSeries explicitly if available, or just addSeries
             const candlestickSeries = chart.addCandlestickSeries({
                 upColor: '#10b981', 
                 downColor: '#f43f5e', 
@@ -539,6 +559,52 @@
                 `;
             });
             tbody.innerHTML = html;
+        }
+
+        // --- Bot Control Logic ---
+        let botRunning = false;
+        function toggleBot() {
+            botRunning = !botRunning;
+            const btn = document.getElementById('btn-toggle-bot');
+            const icon = document.getElementById('icon-bot-state');
+            const text = document.getElementById('text-bot-state');
+            
+            if (botRunning) {
+                // Set to ACTIVE
+                btn.className = "flex items-center gap-2 px-4 py-1.5 rounded-md bg-emerald-500/20 text-emerald-400 border border-emerald-500/30 hover:bg-emerald-500/30 transition-all font-medium text-sm";
+                icon.className = "ph-fill ph-play-circle text-lg";
+                text.textContent = "ACTIVE";
+                showToast('Auto Trading Engine Started', 'success');
+                
+                // Simulate signal updates when running
+                simulateSignals();
+            } else {
+                // Set to STOPPED
+                btn.className = "flex items-center gap-2 px-4 py-1.5 rounded-md bg-rose-500/20 text-rose-400 border border-rose-500/30 hover:bg-rose-500/30 transition-all font-medium text-sm";
+                icon.className = "ph-fill ph-stop-circle text-lg";
+                text.textContent = "STOPPED";
+                showToast('Auto Trading Engine Halted', 'error');
+                clearInterval(window.signalInterval);
+            }
+        }
+
+        function simulateSignals() {
+            const signals = ['STRONG LONG', 'WEAK LONG', 'NEUTRAL', 'WEAK SHORT', 'STRONG SHORT'];
+            const colors = ['text-emerald-400', 'text-emerald-300', 'text-slate-400', 'text-rose-300', 'text-rose-400'];
+            
+            window.signalInterval = setInterval(() => {
+                const signalEl = document.getElementById('ai-signal-text');
+                const randIdx = Math.floor(Math.random() * signals.length);
+                
+                // Update text and color
+                signalEl.textContent = signals[randIdx];
+                signalEl.className = `text-2xl font-bold ${colors[randIdx]} transition-colors duration-300`;
+                
+                // Randomize confidence
+                const conf = document.querySelector('#ai-signal-text').parentElement.nextElementSibling.querySelector('span');
+                conf.textContent = `CONFIDENCE: ${Math.floor(Math.random() * 30 + 70)}%`;
+                
+            }, 5000); // Change signal every 5s for demo
         }
 
         // Initialize everything
