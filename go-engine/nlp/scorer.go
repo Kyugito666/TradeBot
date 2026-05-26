@@ -124,7 +124,7 @@ var negators = map[string]bool{
 	"nothing": true, "neither": true, "nor": true,
 	"cannot": true, "can't": true, "won't": true, "doesn't": true,
 	"didn't": true, "isn't": true, "aren't": true, "wasn't": true,
-	"weren't": true, "don't": true, "doesn't": true, "haven't": true,
+	"weren't": true, "don't": true, "haven't": true,
 	"hasn't": true, "without": true,
 }
 
