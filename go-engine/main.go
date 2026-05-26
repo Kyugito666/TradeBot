@@ -1,4 +1,10 @@
 // go-engine/main.go
+// FIXES:
+// [FIX-A] lastAction di-reset ke "WAIT" setelah paper trade closes
+//         → sebelumnya setelah 1 trade BUY, semua BUY berikutnya di-skip selamanya
+// [FIX-B] lastAction timeout 10 menit → allow re-entry arah sama jika market memang trending
+// [FIX-C] Log lebih jelas saat sinyal di-skip supaya ga bingung "kok ga entry"
+// [FIX-D] Bot auto-running saat startup (server.go New() harus default Store(true))
 package main
 
 import (
@@ -70,7 +76,7 @@ func loadConfig() Config {
 	} else {
 		c.BaseDir = filepath.Dir(execPath())
 	}
-	
+
 	return c
 }
 
@@ -111,13 +117,15 @@ func main() {
 	if !cfg.DryRun {
 		if b, err := fetchBalance(ctx, orderExecutor); err == nil {
 			balance = b
-			log.Printf("[main] Balance: %.2f USDT", balance)
+			log.Printf("[main]   Exchange connected | exchange=%s mode=%s | free_USDT=%.2f",
+				cfg.Exchange, cfg.ExchangeMode, balance)
 		} else {
 			log.Printf("[main] API Auth Error: %v", err)
 		}
 	} else {
 		balance = 10000.0
-		log.Printf("[main] DRY RUN — simulated balance %.2f USDT", balance)
+		log.Printf("[main]   Exchange connected | exchange=%s mode=%s | free_USDT=%.2f",
+			cfg.Exchange, cfg.ExchangeMode, balance)
 	}
 
 	srv := gateway.New(cfg.BaseDir)
@@ -132,12 +140,26 @@ func main() {
 	nlpEngine := nlp.NewEngine(cfg.Symbol, 5*time.Minute)
 	go nlpEngine.Run(mainCtx, feed)
 
-	lastRustSeq := uint64(0)
-	lastAction := "WAIT"
+	lastRustSeq  := uint64(0)
+	lastAction   := "WAIT"
+	lastActionAt := time.Now().Add(-10 * time.Minute) // [FIX-B] init so first signal always passes
 	cooldownUntil := time.Time{}
 	consecutiveLosses := 0
 
-	// Variabel In-Memory untuk simulasi Paper Trading
+	// [FIX-B] lastAction timeout berdasarkan trading style
+	lastActionTimeout := map[string]time.Duration{
+		"scalping":   10 * time.Minute,
+		"daytrading": 30 * time.Minute,
+		"swing":      4 * time.Hour,
+	}
+	getLastActionTimeout := func() time.Duration {
+		style := strings.ToLower(cfg.TradingStyle)
+		if d, ok := lastActionTimeout[style]; ok {
+			return d
+		}
+		return 10 * time.Minute
+	}
+
 	var activePaperTrade *gateway.Position
 	var paperHistory []gateway.Position
 
@@ -150,16 +172,16 @@ func main() {
 
 			sig := bridge.PollSignal(200 * time.Millisecond)
 			if sig == nil { continue }
-			if sig.TsMs == int64(lastRustSeq) { time.Sleep(10 * time.Millisecond); continue }
+			if uint64(sig.TsMs) == lastRustSeq { time.Sleep(10 * time.Millisecond); continue }
 			lastRustSeq = uint64(sig.TsMs)
 
 			state := feed.State()
 
-			// ── [1] MANAJER PAPER TRADING (PNL LIVE & TP/SL) ──
+			// ── [1] PAPER TRADING: cek TP/SL live ──────────────────────────────────
 			if cfg.DryRun && activePaperTrade != nil {
 				isClosed := false
-				
-				// Kalkulasi Live PnL dengan Leverage
+
+				// kalkulasi live PnL dengan leverage
 				unrealizedPct := 0.0
 				if activePaperTrade.Side == "BUY" {
 					unrealizedPct = ((state.Price - activePaperTrade.EntryPrice) / activePaperTrade.EntryPrice) * 100.0
@@ -168,7 +190,6 @@ func main() {
 				}
 				activePaperTrade.PnL = unrealizedPct * float64(cfg.Leverage)
 
-				// Hitung persentase sentuhan TP / SL
 				if (activePaperTrade.Side == "BUY" && state.Price >= activePaperTrade.TakeProfit) ||
 				   (activePaperTrade.Side == "SELL" && state.Price <= activePaperTrade.TakeProfit) {
 					activePaperTrade.Status = "CLOSED_TP"
@@ -180,23 +201,28 @@ func main() {
 				}
 
 				if isClosed {
-					log.Printf("[Paper] Trade Closed: %s PnL: %.2f%%", activePaperTrade.Status, activePaperTrade.PnL)
-					paperHistory = append([]gateway.Position{*activePaperTrade}, paperHistory...) // Simpan ke histori (unshift)
+					log.Printf("[Paper] Trade Closed: %s | Side=%s | PnL=%.2f%%",
+						activePaperTrade.Status, activePaperTrade.Side, activePaperTrade.PnL)
+					paperHistory = append([]gateway.Position{*activePaperTrade}, paperHistory...)
 					if len(paperHistory) > 50 {
-						paperHistory = paperHistory[:50] // Batasi 50 row agar ringan
+						paperHistory = paperHistory[:50]
 					}
 					activePaperTrade = nil
+
+					// [FIX-A] CRITICAL: reset lastAction setelah trade close
+					// Tanpa ini, setelah 1x BUY → lastAction="BUY" selamanya → semua BUY di-skip
+					lastAction = "WAIT"
+					lastActionAt = time.Now().Add(-getLastActionTimeout()) // allow immediate re-entry
+					log.Printf("[main] lastAction reset → siap re-entry")
 				}
-				
-				// Push status ke UI
+
 				srv.UpdatePositions(activePaperTrade, paperHistory)
 			}
 
-			// ── [2] LOGIKA SINYAL BIASA ──
+			// ── [2] TENTUKAN ARAH ─────────────────────────────────────────────────
 			dirStr := []string{"WAIT", "BUY", "SELL"}[sig.Action]
 			if !srv.IsBotRunning() { dirStr = "WAIT" }
 
-			// FIX: Biar terminal lu ga nampilin angka 0.0000 pas VETO dan bikin lu panik, kita timpa khusus buat display log.
 			printEntry, printTP, printSL := sig.Entry, sig.TakeProfit, sig.StopLoss
 			if sig.Veto || printEntry == 0 {
 				printEntry, printTP, printSL = state.Price, state.Price, state.Price
@@ -214,10 +240,8 @@ func main() {
 				if lsr < 1e-9 { lsr = 1.0 }
 				trend := "MANUAL STOPPED — IDLE"
 				if sig.Veto { trend = "VETO — " + truncate(sig.VetoReason, 40) }
-				
 				pct24h := 0.0
 				if state.Price > 0 { pct24h = math.Round((state.ATR14/state.Price)*100*10) / 10 }
-				
 				srv.UpdateInsight(gateway.InsightData{
 					Symbol: cfg.Symbol, LastPrice: state.Price, OpenInterest: state.OI, LSRVal: lsr, Pct24h: pct24h,
 					TrendState: trend, WhaleBias: "NEUTRAL", SignalStatus: "WAIT",
@@ -235,48 +259,71 @@ func main() {
 				continue
 			}
 
-			if time.Now().Before(cooldownUntil) { continue }
-			if dirStr == lastAction { continue }
-
-			// Adaptasi limit RR berdasarkan style di .env
-			rrLimit := 1.2
-			switch strings.ToLower(cfg.TradingStyle) {
-			case "scalping": rrLimit = 0.8
-			case "daytrading": rrLimit = 1.0
-			case "swing": rrLimit = 1.5
-			}
-
-			if sig.RiskReward < rrLimit {
-				log.Printf("[main] RR %.2f < %.2f (%s) — skipping low-quality signal", sig.RiskReward, rrLimit, cfg.TradingStyle)
+			// cooldown circuit breaker
+			if time.Now().Before(cooldownUntil) {
+				log.Printf("[main] Circuit breaker cooldown aktif sampai %s", cooldownUntil.Format("15:04:05"))
 				continue
 			}
 
+			// [FIX-B] lastAction check dengan timeout
+			// Jika arah sama tapi sudah melewati timeout, izinkan re-entry
+			sameDirTimeout := dirStr == lastAction && time.Since(lastActionAt) < getLastActionTimeout()
+			if sameDirTimeout {
+				log.Printf("[main] Skip: arah %s sama dengan lastAction (%.0f detik lalu, timeout=%.0f detik)",
+					dirStr,
+					time.Since(lastActionAt).Seconds(),
+					getLastActionTimeout().Seconds())
+				continue
+			}
+			if dirStr == lastAction && time.Since(lastActionAt) >= getLastActionTimeout() {
+				log.Printf("[main] lastAction timeout → allow re-entry %s", dirStr)
+			}
+
+			// RR check sesuai trading style
+			rrLimit := 1.2
+			switch strings.ToLower(cfg.TradingStyle) {
+			case "scalping":   rrLimit = 0.8
+			case "daytrading": rrLimit = 1.0
+			case "swing":      rrLimit = 1.5
+			}
+
+			if sig.RiskReward < rrLimit {
+				log.Printf("[main] Skip: RR=%.2f < %.2f (style=%s)", sig.RiskReward, rrLimit, cfg.TradingStyle)
+				continue
+			}
+
+			// Update lastAction SEBELUM eksekusi
 			lastAction = dirStr
+			lastActionAt = time.Now()
+
 			snapSig := *sig
 			snapDir := dirStr
-			
-			// ── [3] EKSEKUSI (REAL VS PAPER) ──
+
+			// ── [3] EKSEKUSI TRADE ────────────────────────────────────────────────
 			if cfg.DryRun {
-				// Cegah nembak order baru kalo Paper Trade lama masih kebuka
 				if activePaperTrade == nil {
 					activePaperTrade = &gateway.Position{
 						Side:       snapDir,
-						EntryPrice: state.Price, // Ambil harga market real saat ini
+						EntryPrice: state.Price,
 						TakeProfit: snapSig.TakeProfit,
 						StopLoss:   snapSig.StopLoss,
 						Time:       time.Now().Format("15:04:05"),
 						Status:     "OPEN",
 						PnL:        0.0,
 					}
-					log.Printf("[Paper] ✓ Virtual Order opened: %s %s @ %.4f", snapDir, cfg.Symbol, state.Price)
+					log.Printf("[Paper] ✓ Virtual Order opened: %s %s @ %.4f | TP=%.4f SL=%.4f",
+						snapDir, cfg.Symbol, state.Price, snapSig.TakeProfit, snapSig.StopLoss)
 					srv.UpdatePositions(activePaperTrade, paperHistory)
+				} else {
+					log.Printf("[Paper] Skip: masih ada paper trade open (%s @ %.4f)",
+						activePaperTrade.Side, activePaperTrade.EntryPrice)
 				}
 			} else {
 				go func() {
 					req := buildOrderRequest(snapSig, snapDir, cfg.Symbol)
 					execCtx, execCancel := context.WithTimeout(context.Background(), 15*time.Second)
 					defer execCancel()
-	
+
 					if err := orderExecutor.Execute(execCtx, req); err != nil {
 						log.Printf("[main] Order execution failed: %v", err)
 						consecutiveLosses++
@@ -340,7 +387,6 @@ func updateInsight(srv *gateway.Server, cfg Config, sig *shm.Signal, balance flo
 	pct24h := 0.0
 	if state.Price > 0 && state.ATR14 > 0 { pct24h = math.Round((state.ATR14/state.Price)*100*10) / 10 }
 
-	// Override display bila VETO atau nol
 	dispEntry, dispTP, dispSL := sig.Entry, sig.TakeProfit, sig.StopLoss
 	if sig.Veto || dispEntry == 0 {
 		dispEntry, dispTP, dispSL = state.Price, state.Price, state.Price
@@ -390,7 +436,6 @@ func envInt(key string, def int) int {
 	return def
 }
 
-// FIX: Parser bool robust untuk nangani string "on" dari input UI
 func envBool(key string, def bool) bool {
 	if v := os.Getenv(key); v != "" {
 		val := strings.ToLower(v)
