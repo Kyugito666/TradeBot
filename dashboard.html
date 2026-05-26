@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width,initial-scale=1">
-    <title>BotTrade Dashboard</title>
+    <title>TradeBot Dashboard v3.0.4</title>
     <link rel="stylesheet" href="/dashboard.css">
 </head>
 <body>
@@ -51,7 +51,7 @@
           <option value="real">Real (Mainnet)</option>
         </select>
 
-        <label>Trading Style (Auto-Interval)</label>
+        <label>Trading Style</label>
         <select id="cfg-style">
           <option value="scalping">Scalping (Modal Tipis / Cepat)</option>
           <option value="daytrade">Day Trader (Menengah / Harian)</option>
@@ -167,7 +167,7 @@
     <div class="tab-bar">
       <button class="tab active" onclick="switchTab('chart', this)">📈 CHART</button>
       <button class="tab" onclick="switchTab('logs', this)">📋 LOGS</button>
-      <button class="tab" onclick="switchTab('insight', this)">🧠 AI INSIGHT</button>
+      <button class="tab" onclick="switchTab('insight', this)">🎯 AI SIGNAL</button>
       <div class="tab-spacer"></div>
       
       <button class="icon-btn" id="btn-toggle-chart" onclick="toggleChart()" style="margin-right:8px; border-color:var(--border);">👁️ Hide Chart</button>
@@ -201,12 +201,12 @@
         <div id="chart-container"></div>
         <div class="chart-empty" id="chart-empty"><div class="chart-empty-icon">◈</div><div>Memuat chart…</div></div>
       </div>
-      <div class="chart-legend" id="chart-legend">
+      <div class="chart-legend" id="chart-legend" style="display:none;">
         <div class="legend-item"><div class="legend-dot" style="background:#26a69a"></div>Bullish</div>
         <div class="legend-item"><div class="legend-dot" style="background:#ef5350"></div>Bearish</div>
         <div class="legend-item"><div class="legend-dot" style="background:#3b82f6"></div>ENTRY Line</div>
-        <div class="legend-item"><div class="legend-dot" style="background:var(--accent)"></div>BUY Signal</div>
-        <div class="legend-item"><div class="legend-dot" style="background:var(--danger)"></div>SELL Signal</div>
+        <div class="legend-item"><div class="legend-dot" style="background:#00e5a0"></div>BUY Signal</div>
+        <div class="legend-item"><div class="legend-dot" style="background:#ef4444"></div>SELL Signal</div>
       </div>
       <div class="trades-panel" id="trades-panel" style="flex: 1; min-height: 120px; overflow: auto; border-top: 1px solid var(--border);">
         <div class="trades-panel-title" style="position: sticky; top: 0; background: var(--bg2);">Trade History</div>
@@ -223,38 +223,30 @@
       </div>
     </div>
     
-    <div class="tab-pane" id="pane-insight" style="background:var(--bg2); padding:20px; overflow-y:auto;">
-      <div style="max-width: 600px; margin: 0 auto; border: 1px solid var(--border); border-radius: var(--r); padding: 20px; background: var(--panel);">
-        <h3 style="font-family:var(--mono); color:var(--accent); font-size:14px; margin-bottom:15px; border-bottom:1px solid var(--border); padding-bottom:10px;">
-          🤖 LIVE MARKET AI ANALYSIS
-        </h3>
-        <div class="ai-box">
-          <div class="ai-row"><span style="color:var(--text2)">Status Trend:</span><strong id="ai-trend" style="font-family:var(--mono);">-</strong></div>
-          <div class="ai-row"><span style="color:var(--text2)">Whale Dominance:</span><strong id="ai-whale" style="font-family:var(--mono);">-</strong></div>
-          <div class="ai-row"><span style="color:var(--text2)">Sinyal Aktif:</span><strong id="ai-signal" style="font-family:var(--mono);">-</strong></div>
-          
-          <div style="display:grid; grid-template-columns:1fr 1fr 1fr; gap:10px; margin-top:5px;">
-            <div style="background:var(--bg); border:1px solid var(--border2); padding:8px; border-radius:4px; text-align:center;">
-              <div style="font-size:9px; color:var(--text2); text-transform:uppercase;">Entry Target</div>
-              <div id="ai-entry" style="font-family:var(--mono); color:var(--blue); font-size:14px; font-weight:600;">0.0</div>
-            </div>
-            <div style="background:var(--bg); border:1px solid var(--border2); padding:8px; border-radius:4px; text-align:center;">
-              <div style="font-size:9px; color:var(--text2); text-transform:uppercase;">Take Profit</div>
-              <div id="ai-tp" style="font-family:var(--mono); color:var(--accent); font-size:14px; font-weight:600;">0.0</div>
-            </div>
-            <div style="background:var(--bg); border:1px solid var(--border2); padding:8px; border-radius:4px; text-align:center;">
-              <div style="font-size:9px; color:var(--text2); text-transform:uppercase;">Stop Loss</div>
-              <div id="ai-sl" style="font-family:var(--mono); color:var(--danger); font-size:14px; font-weight:600;">0.0</div>
-            </div>
+    <div class="tab-pane" id="pane-insight" style="background:var(--bg); padding:0; overflow-y:auto;">
+      <div style="padding:16px;height:100%;overflow-y:auto;box-sizing:border-box;">
+        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px;flex-wrap:wrap;gap:8px;border-bottom:1px solid var(--border);padding-bottom:12px;">
+          <div>
+            <div style="font-family:var(--mono);color:var(--accent);font-size:13px;font-weight:600;letter-spacing:2px;">🎯 AI SIGNAL SCANNER</div>
+            <div style="font-family:var(--mono);font-size:9px;color:var(--text2);margin-top:3px;">Independent · Langsung ke Bybit · Tanpa bot · Klik signal → tampil di chart</div>
           </div>
-          
-          <div style="margin-top:10px; padding:12px; border-radius:4px; background:#1d4ed815; border:1px solid var(--blue);">
-            <strong style="display:block; margin-bottom:5px; color:var(--blue); font-size:11px; text-transform:uppercase; letter-spacing:1px;">Deep Reasoning AI:</strong>
-            <span id="ai-advice" style="line-height:1.5;">Menunggu fetcher engine...</span>
+          <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
+            <span id="ai-scan-status" style="font-family:var(--mono);font-size:10px;color:var(--text2);">⟳ idle</span>
+            <select id="ai-signal-tf" style="width:auto;padding:4px 8px;font-size:11px;background:var(--panel);border:1px solid var(--border2);color:var(--text);border-radius:4px;">
+              <option value="5" selected>5m</option>
+              <option value="15">15m</option>
+              <option value="60">1h</option>
+              <option value="240">4h</option>
+            </select>
+            <button onclick="runAISignalScan()" style="padding:6px 14px;background:var(--accent);color:#000;border:none;border-radius:4px;font-family:var(--mono);font-size:11px;font-weight:700;cursor:pointer;">⚡ SCAN</button>
+            <button onclick="toggleAutoScan()" id="btn-auto-scan" style="padding:6px 10px;background:var(--panel);border:1px solid var(--border2);color:var(--text2);border-radius:4px;font-family:var(--mono);font-size:10px;cursor:pointer;">AUTO: OFF</button>
           </div>
-          
-          <div style="text-align:right; font-size:10px; color:var(--text2);">
-            Terakhir update: <span id="ai-ts">-</span>
+        </div>
+        <div id="ai-signal-stats" style="display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin-bottom:14px;"></div>
+        <div id="ai-signal-grid" style="display:grid;gap:8px;grid-template-columns:repeat(auto-fill,minmax(290px,1fr));">
+          <div style="color:var(--text2);font-family:var(--mono);font-size:12px;padding:30px;text-align:center;grid-column:1/-1;border:1px dashed var(--border);border-radius:6px;">
+            Klik <strong style="color:var(--accent)">⚡ SCAN</strong> untuk analisa 15 pair sekaligus<br>
+            <span style="font-size:10px;opacity:0.6;margin-top:6px;display:block;">Klik kartu signal → tampil di chart + entry/TP/SL lines</span>
           </div>
         </div>
       </div>
