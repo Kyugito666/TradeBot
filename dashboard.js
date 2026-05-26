@@ -1,11 +1,10 @@
-// dashboard.js — TradeBot v3.0.1 (FIXED)
-// CHANGELOG:
-// [FIX] updateOIStats: sanity check for timestamp-as-OI bug (>1e11)
-// [FIX] WS ticker: price24hPcnt is ALWAYS decimal from Bybit (0.032 = 3.2%), always *100
-// [FIX] fetchAIInsight: removed bogus pct_24h override (was ATR/Price%, not actual 24h change)
-// [FIX] fetchPositions: THEME undefined crash fixed; _candleSeries null guard added
-// [FIX] PARSERS: added [Paper] log pattern so chart markers fire on dry-run paper trades
-// [FIX] Log timestamps: normalize display (Rust UTC offset labeled)
+// dashboard.js — TradeBot v3.0.2
+// FIXES:
+// [FIX-1] OI: improved timestamp detection (ms + seconds range)
+// [FIX-2] Percentage: WS ticker is sole source, bot_insight pct_24h NEVER overrides
+// [FIX-3] AI INSIGHT → AI SIGNAL: independent multi-pair scanner, jalan tanpa bot
+// [FIX-4] Markers: retry mechanism + guard kalau chart belum ready
+// [FIX-5] Trade history: fix guard condition yang block render
 
 let logs = [];
 let filterLevel = 'ALL';
@@ -128,7 +127,6 @@ function resetHistory() {
 }
 
 // ── PARSERS ──────────────────────────────────────────────────────────────────
-// Maps log regex → handler. Order matters (first match wins).
 const PARSERS = [
   { re: /\[main\]   Exchange connected \| exchange=\w+ mode=\w+ \| free_USDT=([\d.]+)/, fn(m) { 
       const b = parseFloat(m[1]); stats.balance = b; 
@@ -140,7 +138,11 @@ const PARSERS = [
       addPricePoint(price, null, null, null); 
       if (activeTrade) checkTradeOutcome(price); updatePriceStats(); 
   } },
-  { re: /\[OI\]\s+\S+\s+oi=([\d.]+)/, fn(m) { stats.oi = parseFloat(m[1]); stats.oiTime = new Date().toLocaleTimeString(); updateOIStats(); } },
+  { re: /\[OI\]\s+\S+\s+oi=([\d.]+)/, fn(m) { 
+      const raw = parseFloat(m[1]);
+      // [FIX-1] Jangan set OI kalau nilainya kelihatan seperti Unix timestamp
+      if (!isLikelyTimestamp(raw)) { stats.oi = raw; stats.oiTime = new Date().toLocaleTimeString(); updateOIStats(); }
+  } },
   { re: /\[WHALE\]\s+\S+\s+LSR=([\d.]+)\s+bias=(\w+)/, fn(m) { stats.lsr = parseFloat(m[1]); stats.bias = m[2]; updateLSRStats(); } },
   { re: /\[Executor\] entry=([\d.]+)\s+SL=([\d.]+)\s+TP=([\d.]+)\s+RR=([\d.]+)\s+conf=([\d.]+)/, fn(m) { 
       pendingTradeParams = { entry: parseFloat(m[1]), sl: parseFloat(m[2]), tp: parseFloat(m[3]), rr: parseFloat(m[4]), conf: parseFloat(m[5]) }; 
@@ -149,10 +151,8 @@ const PARSERS = [
   { re: /\[StateDB\] Saved trade row_id/, fn() { 
       if (pendingTradeParams && pendingAction) { openDryTrade(pendingAction, pendingTradeParams); pendingTradeParams = null; pendingAction = null; } 
   } },
-  // [FIX] Paper trade log parser — fires chart marker when dry-run opens a virtual order
   { re: /\[Paper\]\s+.* Virtual Order opened:\s+(BUY|SELL)/, fn(m) {
       const action = m[1];
-      // Also grab signal params if pending
       if (pendingTradeParams) {
           openDryTrade(action, pendingTradeParams);
           pendingTradeParams = null; pendingAction = null;
@@ -165,7 +165,6 @@ const PARSERS = [
       const action = m[1]; signalCount++; saveSimState(); updateTradeStats(); 
       if (stats.price) addSignalMarker(action, stats.price); 
   } },
-  // Catch main signal log to grab TP/SL for pending params even in dry-run
   { re: /\[main\] Signal: (BUY|SELL) conf=([\d.]+) entry=([\d.]+) TP=([\d.]+) SL=([\d.]+) RR=([\d.]+)/, fn(m) {
       pendingAction = m[1];
       pendingTradeParams = { entry: parseFloat(m[3]), sl: parseFloat(m[5]), tp: parseFloat(m[4]), rr: parseFloat(m[6]), conf: parseFloat(m[2]) };
@@ -177,6 +176,20 @@ let pendingAction = null;
 
 function parseLog(log) { 
     for (const p of PARSERS) { const m = log.msg.match(p.re); if (m) { p.fn(m, log); break; } } 
+}
+
+// ── [FIX-1] Helper: deteksi apakah nilai itu Unix timestamp ──────────────────
+// Unix ms timestamp untuk tahun 2020-2035: 1.58e12 – 2.05e12
+// Unix sec timestamp untuk tahun 2020-2035: 1.58e9 – 2.05e9
+function isLikelyTimestamp(v) {
+    if (!v || isNaN(v)) return false;
+    // Range Unix ms (milli): tahun 2020-2035
+    if (v >= 1.58e12 && v <= 2.05e12) return true;
+    // Range Unix sec: tahun 2020-2035
+    if (v >= 1.58e9 && v <= 2.05e9) return true;
+    // Value gila, pasti bukan OI real
+    if (v > 1e11) return true;
+    return false;
 }
 
 function openDryTrade(action, params) { 
@@ -229,17 +242,15 @@ function updatePriceStats() {
   }
 }
 
-// [FIX] OI display — added sanity check: if value > 1e11, it's likely a Unix timestamp
-// being returned by fetchSingleFloat (the field iterator picks 'timestamp' before 'openInterest')
+// [FIX-1] OI display — validasi timestamp lebih ketat
 function updateOIStats() {
   const v = stats.oi;
-  if (!v) return;
+  if (!v || isNaN(v)) return;
 
-  // Timestamp in milliseconds (e.g. 1705419600000 ≈ 1.7e12) masks as OI.
-  // Real OI for any linear futures pair won't exceed ~10 billion contracts.
-  if (v > 1e11) {
-    document.getElementById('stat-oi').textContent = 'err';
-    document.getElementById('stat-oi-time').textContent = 'bad data';
+  // Sanity check: nilai seperti Unix timestamp = bukan OI
+  if (isLikelyTimestamp(v)) {
+    document.getElementById('stat-oi').textContent = '—';
+    document.getElementById('stat-oi-time').textContent = 'data err';
     return;
   }
   
@@ -407,26 +418,35 @@ function updateLiveCandle(price) {
 function _resetLiveCandle() { _liveCandle = null; }
 
 let _pendingMarkers = [];
+
+// [FIX-4] addSignalMarker dengan retry kalau chart belum ready
 function addSignalMarker(action, price) {
-  if (!_lastCandleTs) return;
   const tf = parseInt(_currentTf) || 5; const tfSec = tf * 60;
   const now = Math.floor(Date.now() / 1000);
   const ts = Math.floor(now / tfSec) * tfSec;
   _pendingMarkers.push({ time: ts, type: action });
   if (_pendingMarkers.length > 50) _pendingMarkers.shift();
-  _applyMarkers();
   priceHistory.push({ price, time: Date.now(), signal: action });
   if (priceHistory.length > MAX_CHART_POINTS) priceHistory.shift();
+  // Retry apply dengan sedikit delay kalau chart belum siap
+  if (_candleSeries && _lastCandleTs) {
+    _applyMarkers();
+  } else {
+    setTimeout(_applyMarkers, 1500);
+  }
 }
 
+// [FIX-4] _applyMarkers dengan null guard
 function _applyMarkers() {
   if (!_candleSeries || !_pendingMarkers.length) return;
-  const markers = _pendingMarkers.map(m => ({
-    time: m.time, position: m.type === 'BUY' ? 'belowBar' : 'aboveBar',
-    color: m.type === 'BUY' ? '#00e5a0' : '#ef4444',
-    shape: m.type === 'BUY' ? 'arrowUp' : 'arrowDown', text: m.type, size: 1.5
-  }));
-  try { _candleSeries.setMarkers(markers); } catch(e) {}
+  try {
+    const markers = _pendingMarkers.map(m => ({
+      time: m.time, position: m.type === 'BUY' ? 'belowBar' : 'aboveBar',
+      color: m.type === 'BUY' ? '#00e5a0' : '#ef4444',
+      shape: m.type === 'BUY' ? 'arrowUp' : 'arrowDown', text: m.type, size: 1.5
+    }));
+    _candleSeries.setMarkers(markers);
+  } catch(e) { console.warn('setMarkers error:', e); }
 }
 
 let _tpLine = null, _slLine = null, _entryLine = null;
@@ -476,19 +496,16 @@ async function startChart() {
 }
 startChart();
 
-// ── Chart price lines for paper trading (from Go engine API) ─────────────────
-// [FIX] THEME was undefined → crash → no chart lines & no trade table updates
+// ── Chart price lines dari Go engine API ─────────────────────────────────────
 let _chartLines = [];
 
 async function fetchPositions() {
-    // [FIX] Guard: chart must be ready before we can createPriceLine
     if (!_candleSeries) return;
     try {
         const r = await fetch('/api/positions');
         if (!r.ok) return;
         const d = await r.json();
         
-        // Remove old chart lines
         if (_chartLines.length > 0) {
             _chartLines.forEach(l => { 
                 try { _candleSeries.removePriceLine(l); } catch(e) {} 
@@ -498,36 +515,13 @@ async function fetchPositions() {
 
         if (d.active && d.active.length > 0) {
             const pos = d.active[0];
-            // [FIX] Was: const color = pos.side === 'BUY' ? THEME.up : THEME.down;  ← THEME undefined!
-            // Now: use direct color values matching dashboard CSS vars
             const upColor   = '#00e5a0';
             const downColor = '#ef4444';
             
             try {
-                _chartLines.push(_candleSeries.createPriceLine({
-                    price: pos.entry_price, 
-                    color: '#3b82f6', 
-                    lineWidth: 2, 
-                    lineStyle: 0, 
-                    axisLabelVisible: true, 
-                    title: `ENTRY ${pos.side}`
-                }));
-                _chartLines.push(_candleSeries.createPriceLine({
-                    price: pos.take_profit, 
-                    color: upColor, 
-                    lineWidth: 1, 
-                    lineStyle: 2, 
-                    axisLabelVisible: true, 
-                    title: 'TP'
-                }));
-                _chartLines.push(_candleSeries.createPriceLine({
-                    price: pos.stop_loss, 
-                    color: downColor, 
-                    lineWidth: 1, 
-                    lineStyle: 2, 
-                    axisLabelVisible: true, 
-                    title: 'SL'
-                }));
+                _chartLines.push(_candleSeries.createPriceLine({ price: pos.entry_price, color: '#3b82f6', lineWidth: 2, lineStyle: 0, axisLabelVisible: true, title: `ENTRY ${pos.side}` }));
+                _chartLines.push(_candleSeries.createPriceLine({ price: pos.take_profit, color: upColor, lineWidth: 1, lineStyle: 2, axisLabelVisible: true, title: 'TP' }));
+                _chartLines.push(_candleSeries.createPriceLine({ price: pos.stop_loss, color: downColor, lineWidth: 1, lineStyle: 2, axisLabelVisible: true, title: 'SL' }));
             } catch(e) {}
             
             renderTradesTableGo(d.active, d.history || []);
@@ -535,7 +529,7 @@ async function fetchPositions() {
             renderTradesTableGo([], d.history || []);
         }
     } catch (e) {
-        // Silently ignore — bot might not be running
+        // Bot mungkin tidak running, skip
     }
 }
 
@@ -550,11 +544,9 @@ function renderTradesTableGo(active, history) {
         const cls = p.side === 'BUY' ? 'trade-win' : 'trade-loss';
         const pnlColor = (p.pnl || 0) >= 0 ? 'trade-win' : 'trade-loss';
         const pnlSign = (p.pnl || 0) >= 0 ? '+' : '';
-        // [FIX] p.time might be string from Go — handle both
-        const timeStr = p.time || '--';
         html += `
             <tr style="background: rgba(30, 41, 59, 0.5)">
-                <td>${timeStr}</td>
+                <td>${p.time || '--'}</td>
                 <td class="${cls}">${p.side} (LIVE)</td>
                 <td>${(p.entry_price||0).toFixed(4)}</td>
                 <td class="trade-win">${(p.take_profit||0).toFixed(4)}</td>
@@ -570,10 +562,9 @@ function renderTradesTableGo(active, history) {
              const cls = p.side === 'BUY' ? 'trade-win' : 'trade-loss';
              const pnlColor = (p.pnl || 0) >= 0 ? 'trade-win' : 'trade-loss';
              const pnlSign = (p.pnl || 0) >= 0 ? '+' : '';
-             const timeStr = p.time || '--';
              html += `
                 <tr>
-                    <td>${timeStr}</td>
+                    <td>${p.time || '--'}</td>
                     <td class="${cls}">${p.side}</td>
                     <td>${(p.entry_price||0).toFixed(4)}</td>
                     <td>${(p.take_profit||0).toFixed(4)}</td>
@@ -592,10 +583,12 @@ function renderTradesTableGo(active, history) {
     tbody.innerHTML = html;
 }
 
-// Fallback local JS trade history (used when Go API not available)
+// [FIX-5] renderTradesTable — hapus guard yang block render pas Go API available
 function renderTradesTable() {
-    if (_chartLines.length > 0) return; // Go API is active, don't clobber
     const tbody = document.getElementById('trades-tbody');
+    if (!tbody) return;
+    // Kalau Go API punya active position, skip (biar Go yang handle)
+    if (_chartLines.length > 0 && (activeTrade === null && tradeHistory.length === 0)) return;
     if (!tradeHistory.length && !activeTrade) {
       tbody.innerHTML = '<tr><td colspan="7" style="color:var(--text2);text-align:center;padding:10px">Belum ada trade</td></tr>';
       return;
@@ -628,6 +621,10 @@ function switchTab(name, btn) {
       }
      }, 50);
    }
+   if (name === 'insight') {
+     // AI SIGNAL pane - ensure scanner is init
+     ensureSignalPaneReady();
+   }
 }
 
 function setFilter(btn) {
@@ -658,7 +655,6 @@ function renderLogs() {
   filtered.forEach(l => {
     const row = document.createElement('div');
     row.className = 'log-entry ' + l.level;
-    // Show timestamp — note: Go=local time, Rust=UTC (fix needs server.go change)
     row.innerHTML = `<span class="log-ts">${l.ts}</span><span class="log-lvl">${l.level}</span><span class="log-name">${l.name}</span><span class="log-msg">${escHtml(l.msg)}</span>`;
     frag.appendChild(row);
   });
@@ -682,9 +678,7 @@ async function poll() {
       d.logs.forEach(parseLog);
       logs = [...logs, ...d.logs].slice(-500); 
       lastCount = d.total; 
-      if (autoScroll) {
-          renderLogs();
-      }
+      if (autoScroll) { renderLogs(); }
     }
     updateStatus(d.running);
   } catch(e) {}
@@ -838,17 +832,6 @@ function _onSymbolChange(sym) {
     if (btn) setTimeframe(btn);
     if (typeof connectLivePriceWS === 'function') connectLivePriceWS();
     updateLeverageLimits(); saveConfig();
-    
-    // Reset AI insight display
-    document.getElementById('ai-trend').textContent = "—";
-    document.getElementById('ai-whale').textContent = "—";
-    document.getElementById('ai-signal').textContent = "WAIT";
-    document.getElementById('ai-advice').textContent = `Mereset data untuk ${sym}…`;
-    document.getElementById('ai-entry').textContent = "—";
-    document.getElementById('ai-tp').textContent = "—";
-    document.getElementById('ai-sl').textContent = "—";
-    
-    // Clear chart cache
     _ohlcvCache = {};
     if (_candleSeries) try { _candleSeries.setData([]); } catch(e) {}
     if (_volSeries) try { _volSeries.setData([]); } catch(e) {}
@@ -884,14 +867,11 @@ function connectLivePriceWS() {
             }
         }
         
-        // [FIX] price24hPcnt from Bybit WS is ALWAYS in decimal form: 0.032 = 3.2%
-        // Previous code had `if (Math.abs(pct24h) < 1.0) pct24h = pct24h * 100` which
-        // breaks for values like 1.5% (= 0.015, gets correctly multiplied) but the
-        // threshold logic was confusing. Always multiply by 100 is correct per Bybit docs.
+        // [FIX-2] Percentage SELALU dari WS ticker, kalikan 100 (Bybit WS selalu decimal form)
         if (ticker.price24hPcnt !== undefined) {
             const raw = parseFloat(ticker.price24hPcnt);
             if (!isNaN(raw)) {
-                const pct24h = raw * 100; // Bybit WS always decimal
+                const pct24h = raw * 100;
                 const deltaEl = document.getElementById('hdr-delta');
                 if (deltaEl) {
                     const sign = pct24h >= 0 ? '+' : '';
@@ -907,37 +887,16 @@ function connectLivePriceWS() {
   _wsTicker.onclose = () => setTimeout(connectLivePriceWS, 3000);
 }
 
+// [FIX-2] fetchAIInsight: pct_24h dari bot_insight TIDAK dipakai utk header delta
 async function fetchAIInsight() {
   try {
     const r = await fetch('/api/insight'); const d = await r.json();
-    document.getElementById('ai-trend').textContent = d.trend_state || "—";
-    document.getElementById('ai-whale').textContent = d.whale_bias || "—";
-    document.getElementById('ai-signal').textContent = d.signal_status || "WAIT";
-    document.getElementById('ai-advice').textContent = d.advice || "—";
-    document.getElementById('ai-ts').textContent = d.timestamp || "—";
     
-    // Show entry/TP/SL only when there is an active signal
-    if (d.signal_status === 'BUY' || d.signal_status === 'SELL') {
-        document.getElementById('ai-entry').textContent = (d.entry_target || 0).toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 6});
-        document.getElementById('ai-tp').textContent = (d.tp_target || 0).toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 6});
-        document.getElementById('ai-sl').textContent = (d.sl_target || 0).toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 6});
-    } else {
-        document.getElementById('ai-entry').textContent = "Menunggu sinyal…";
-        document.getElementById('ai-tp').textContent = "—";
-        document.getElementById('ai-sl').textContent = "—";
-    }
-    
-    if (d.last_price && !stats.price) { stats.price = d.last_price; updatePriceStats(); }
-    
-    // [FIX] REMOVED: d.pct_24h update for hdr-delta
-    // The old code used (ATR/price)*100 as pct_24h which is volatility%, NOT 24h price change.
-    // Real 24h% comes from WebSocket ticker.price24hPcnt (already handled above in connectLivePriceWS).
-    // Leaving this block in caused the wrong % to overwrite the correct WS value every 3s.
-
-    if (d.open_interest) { 
+    // Hanya update OI dari bot_insight kalau nilainya valid (bukan timestamp)
+    if (d.open_interest && !isLikelyTimestamp(d.open_interest)) { 
         stats.oi = d.open_interest; 
         stats.oiTime = d.timestamp; 
-        updateOIStats(); // updateOIStats now has sanity check for timestamp bug
+        updateOIStats();
     }
     if (d.lsr_val) { 
         stats.lsr = d.lsr_val; 
@@ -956,18 +915,393 @@ async function fetchAIInsight() {
         }
         updateBalanceStats();
     }
+    if (d.last_price && !stats.price) { stats.price = d.last_price; updatePriceStats(); }
     
-    const trendEl = document.getElementById('ai-trend');
-    if (d.trend_state) {
-        if (d.trend_state.includes('TRAP') || d.trend_state.includes('BEARISH')) trendEl.style.color = 'var(--danger)';
-        else if (d.trend_state.includes('BULLISH')) trendEl.style.color = 'var(--accent)';
-        else if (d.trend_state.includes('VETO')) trendEl.style.color = 'var(--warn)';
-        else trendEl.style.color = 'var(--text)';
-    }
+    // [FIX-2] TIDAK update hdr-delta dari bot_insight.pct_24h — itu ATR/price bukan 24h change!
+    // pct_24h dari bot_insight = (atr/price)*100 = volatility, bukan perubahan harga 24 jam.
+    // 24h% yang benar sudah dihandle oleh WS ticker di connectLivePriceWS.
+    
   } catch(e) {}
 }
 
-// ── Boot sequence ─────────────────────────────────────────────────────────────
+
+// ═══════════════════════════════════════════════════════════════════
+// [FIX-3] AI SIGNAL SCANNER — Independent, langsung ke Bybit publik
+// Jalan tanpa bot, auto-update setiap 5 menit
+// ═══════════════════════════════════════════════════════════════════
+
+const AI_SIGNAL_PAIRS = [
+    'BTCUSDT','ETHUSDT','SOLUSDT','BNBUSDT','XRPUSDT',
+    'DOGEUSDT','PEPEUSDT','AVAXUSDT','LINKUSDT','ADAUSDT',
+    'DOTUSDT','MATICUSDT','LTCUSDT','UNIUSDT','ATOMUSDT'
+];
+let _aiSignalTimer = null;
+let _aiSignalPaneReady = false;
+
+// Inisialisasi pane AI SIGNAL (replace konten static dari HTML)
+function ensureSignalPaneReady() {
+    if (_aiSignalPaneReady) return;
+    _aiSignalPaneReady = true;
+    const pane = document.getElementById('pane-insight');
+    if (!pane) return;
+    
+    pane.style.padding = '0';
+    pane.style.background = 'var(--bg)';
+    pane.innerHTML = `
+        <div style="padding:16px;height:100%;overflow-y:auto;box-sizing:border-box;">
+            <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px;flex-wrap:wrap;gap:8px;border-bottom:1px solid var(--border);padding-bottom:12px;">
+                <div>
+                    <div style="font-family:var(--mono);color:var(--accent);font-size:13px;font-weight:600;letter-spacing:2px;">🎯 AI SIGNAL SCANNER</div>
+                    <div style="font-family:var(--mono);font-size:9px;color:var(--text2);margin-top:3px;">Independent • Langsung ke Bybit • Tanpa bot</div>
+                </div>
+                <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
+                    <span id="ai-scan-status" style="font-family:var(--mono);font-size:10px;color:var(--text2);">⟳ idle</span>
+                    <select id="ai-signal-tf" style="width:auto;padding:4px 8px;font-size:11px;background:var(--panel);border:1px solid var(--border2);color:var(--text);border-radius:4px;">
+                        <option value="5" selected>5m</option>
+                        <option value="15">15m</option>
+                        <option value="60">1h</option>
+                        <option value="240">4h</option>
+                    </select>
+                    <button onclick="runAISignalScan()" style="padding:6px 14px;background:var(--accent);color:#000;border:none;border-radius:4px;font-family:var(--mono);font-size:11px;font-weight:700;cursor:pointer;letter-spacing:1px;">⚡ SCAN</button>
+                    <button onclick="toggleAutoScan()" id="btn-auto-scan" style="padding:6px 10px;background:var(--panel);border:1px solid var(--border2);color:var(--text2);border-radius:4px;font-family:var(--mono);font-size:10px;cursor:pointer;">AUTO: OFF</button>
+                </div>
+            </div>
+            
+            <!-- Stats bar -->
+            <div id="ai-signal-stats" style="display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin-bottom:14px;"></div>
+            
+            <!-- Signal cards grid -->
+            <div id="ai-signal-grid" style="display:grid;gap:8px;grid-template-columns:repeat(auto-fill,minmax(290px,1fr));">
+                <div style="color:var(--text2);font-family:var(--mono);font-size:12px;padding:30px;text-align:center;grid-column:1/-1;border:1px dashed var(--border);border-radius:6px;">
+                    Klik <strong style="color:var(--accent)">⚡ SCAN</strong> untuk mulai analisa ${AI_SIGNAL_PAIRS.length} pair sekaligus
+                </div>
+            </div>
+        </div>
+    `;
+    
+    // Update tab label
+    const tabBtn = document.querySelector('.tab[onclick*="insight"]');
+    if (tabBtn) tabBtn.textContent = '🎯 AI SIGNAL';
+}
+
+let _autoScanActive = false;
+function toggleAutoScan() {
+    _autoScanActive = !_autoScanActive;
+    const btn = document.getElementById('btn-auto-scan');
+    if (!btn) return;
+    if (_autoScanActive) {
+        btn.textContent = 'AUTO: ON';
+        btn.style.borderColor = 'var(--accent)';
+        btn.style.color = 'var(--accent)';
+        runAISignalScan();
+        _aiSignalTimer = setInterval(runAISignalScan, 5 * 60 * 1000);
+    } else {
+        btn.textContent = 'AUTO: OFF';
+        btn.style.borderColor = 'var(--border2)';
+        btn.style.color = 'var(--text2)';
+        if (_aiSignalTimer) { clearInterval(_aiSignalTimer); _aiSignalTimer = null; }
+    }
+}
+
+// ── Indikator teknikal (client-side) ─────────────────────────────────────────
+
+function _calcRSI(closes, period = 14) {
+    if (closes.length < period + 2) return 50;
+    const deltas = closes.slice(1).map((v, i) => v - closes[i]);
+    let gains = 0, losses = 0;
+    for (let i = 0; i < period; i++) {
+        if (deltas[i] > 0) gains += deltas[i]; else losses -= deltas[i];
+    }
+    let avgGain = gains / period, avgLoss = losses / period;
+    for (let i = period; i < deltas.length; i++) {
+        const up = deltas[i] > 0 ? deltas[i] : 0;
+        const dn = deltas[i] < 0 ? -deltas[i] : 0;
+        avgGain = (avgGain * (period - 1) + up) / period;
+        avgLoss = (avgLoss * (period - 1) + dn) / period;
+    }
+    return avgLoss < 1e-9 ? 100 : 100 - 100 / (1 + avgGain / avgLoss);
+}
+
+function _calcEMA(closes, period) {
+    if (closes.length < period) return closes[closes.length - 1] || 0;
+    const k = 2 / (period + 1);
+    let ema = closes.slice(0, period).reduce((s, v) => s + v, 0) / period;
+    for (let i = period; i < closes.length; i++) ema = closes[i] * k + ema * (1 - k);
+    return ema;
+}
+
+function _calcATR(candles, period = 14) {
+    if (candles.length < 2) return 0;
+    const trs = [];
+    for (let i = 1; i < candles.length; i++) {
+        const hl = candles[i].h - candles[i].l;
+        const hpc = Math.abs(candles[i].h - candles[i-1].c);
+        const lpc = Math.abs(candles[i].l - candles[i-1].c);
+        trs.push(Math.max(hl, hpc, lpc));
+    }
+    const n = Math.min(period, trs.length);
+    let atr = trs.slice(0, n).reduce((s, v) => s + v, 0) / n;
+    for (let i = n; i < trs.length; i++) atr = atr * (n - 1) / n + trs[i] / n;
+    return atr;
+}
+
+// ── Core signal analyzer ──────────────────────────────────────────────────────
+
+function _analyzeSignal(symbol, candles) {
+    if (candles.length < 35) return null;
+    
+    const closes = candles.map(c => c.c);
+    const price = closes[closes.length - 1];
+    
+    const rsi  = _calcRSI(closes);
+    const ema9  = _calcEMA(closes, 9);
+    const ema21 = _calcEMA(closes, 21);
+    const ema50 = _calcEMA(closes, 50);
+    const atr   = _calcATR(candles);
+    
+    if (atr < 1e-8) return null;
+    
+    // Volume analysis (20 candle avg)
+    const recentVols = candles.slice(-5).map(c => c.v);
+    const histVols   = candles.slice(-25, -5).map(c => c.v);
+    const avgVol     = histVols.reduce((s, v) => s + v, 0) / (histVols.length || 1);
+    const lastVol    = recentVols.reduce((s, v) => s + v, 0) / recentVols.length;
+    const volRatio   = lastVol / (avgVol || 1);
+    
+    let bullScore = 0, bearScore = 0;
+    const reasons = [];
+    
+    // RSI evidence
+    if (rsi <= 25)       { bullScore += 3; reasons.push(`RSI ${rsi.toFixed(0)} (oversold++)`); }
+    else if (rsi <= 35)  { bullScore += 2; reasons.push(`RSI ${rsi.toFixed(0)} (oversold)`); }
+    else if (rsi <= 45)  { bullScore += 1; }
+    else if (rsi >= 75)  { bearScore += 3; reasons.push(`RSI ${rsi.toFixed(0)} (overbought++)`); }
+    else if (rsi >= 65)  { bearScore += 2; reasons.push(`RSI ${rsi.toFixed(0)} (overbought)`); }
+    else if (rsi >= 55)  { bearScore += 1; }
+    
+    // EMA alignment (trend confirmation)
+    const emaBullAlign = ema9 > ema21 && ema21 > ema50;
+    const emaBearAlign = ema9 < ema21 && ema21 < ema50;
+    if (emaBullAlign)     { bullScore += 2; reasons.push('EMA bull align'); }
+    else if (emaBearAlign){ bearScore += 2; reasons.push('EMA bear align'); }
+    else if (ema9 > ema21){ bullScore += 1; }
+    else                  { bearScore += 1; }
+    
+    // Price vs EMA50
+    if (price > ema50 * 1.002) { bullScore += 1; }
+    else if (price < ema50 * 0.998) { bearScore += 1; }
+    
+    // Volume spike confirmation
+    if (volRatio > 1.8) {
+        const last = candles[candles.length - 1];
+        if (last.c > last.o) { bullScore += 1; reasons.push(`Vol ${volRatio.toFixed(1)}x spike`); }
+        else                 { bearScore += 1; reasons.push(`Vol ${volRatio.toFixed(1)}x spike`); }
+    }
+    
+    // Candlestick patterns
+    const last = candles[candles.length - 1];
+    const prev = candles[candles.length - 2];
+    const prev2 = candles[candles.length - 3];
+    
+    // Bullish engulfing
+    if (last.c > last.o && prev.c < prev.o &&
+        last.c > prev.o && last.o < prev.c) {
+        bullScore += 2; reasons.push('Bullish engulf');
+    }
+    // Bearish engulfing
+    if (last.c < last.o && prev.c > prev.o &&
+        last.c < prev.o && last.o > prev.c) {
+        bearScore += 2; reasons.push('Bearish engulf');
+    }
+    // Morning star (3 candle)
+    if (prev2.c < prev2.o && Math.abs(prev.c - prev.o) < atr * 0.3 && last.c > last.o && last.c > (prev2.o + prev2.c) / 2) {
+        bullScore += 2; reasons.push('Morning star');
+    }
+    // Evening star
+    if (prev2.c > prev2.o && Math.abs(prev.c - prev.o) < atr * 0.3 && last.c < last.o && last.c < (prev2.o + prev2.c) / 2) {
+        bearScore += 2; reasons.push('Evening star');
+    }
+    
+    // Minimum score threshold for valid signal
+    const minScore = 4;
+    if (bullScore < minScore && bearScore < minScore) return null;
+    if (Math.abs(bullScore - bearScore) < 2) return null; // Terlalu confusing
+    
+    const isBull = bullScore > bearScore;
+    const direction = isBull ? 'LONG' : 'SHORT';
+    const score = isBull ? bullScore : bearScore;
+    const confidence = Math.min(0.95, 0.35 + score * 0.08);
+    
+    // TP/SL kalkulasi dengan ATR
+    const slMult = 1.2;
+    const tpMult = rsi < 40 || rsi > 60 ? 2.8 : 2.2; // Lebih agresif kalau momentum kuat
+    
+    const entry = price;
+    const sl = isBull ? price - atr * slMult : price + atr * slMult;
+    const tp = isBull ? price + atr * tpMult : price - atr * tpMult;
+    const rr = Math.abs(tp - entry) / Math.abs(sl - entry);
+    
+    // Skip kalau RR kurang bagus
+    if (rr < 1.5) return null;
+    
+    return { symbol, direction, confidence, entry, tp, sl, rr, rsi, reasons, price, ema9, ema21, volRatio };
+}
+
+// ── Main scan function ────────────────────────────────────────────────────────
+
+async function runAISignalScan() {
+    ensureSignalPaneReady();
+    
+    const statusEl = document.getElementById('ai-scan-status');
+    const gridEl   = document.getElementById('ai-signal-grid');
+    const statsEl  = document.getElementById('ai-signal-stats');
+    if (!gridEl) return;
+    
+    const tf = document.getElementById('ai-signal-tf')?.value || '5';
+    if (statusEl) statusEl.textContent = '⟳ Scanning...';
+    gridEl.innerHTML = `<div style="color:var(--text2);font-family:var(--mono);font-size:12px;padding:30px;text-align:center;grid-column:1/-1;">⟳ Mengambil data ${AI_SIGNAL_PAIRS.length} pair...</div>`;
+    
+    const results = [];
+    let scanned = 0, errors = 0;
+    
+    // Scan semua pair secara concurrent (batch 5 sekaligus)
+    const batchSize = 5;
+    for (let i = 0; i < AI_SIGNAL_PAIRS.length; i += batchSize) {
+        const batch = AI_SIGNAL_PAIRS.slice(i, i + batchSize);
+        const batchResults = await Promise.allSettled(batch.map(async pair => {
+            const resp = await fetch(
+                `https://api.bytick.com/v5/market/kline?category=linear&symbol=${pair}&interval=${tf}&limit=100`,
+                { signal: AbortSignal.timeout(6000) }
+            );
+            if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+            const d = await resp.json();
+            if (d.retCode !== 0 || !d.result?.list?.length) throw new Error('no data');
+            const candles = d.result.list.slice().reverse().map(c => ({
+                o: parseFloat(c[1]), h: parseFloat(c[2]),
+                l: parseFloat(c[3]), c: parseFloat(c[4]), v: parseFloat(c[5])
+            }));
+            scanned++;
+            return _analyzeSignal(pair, candles);
+        }));
+        
+        for (const res of batchResults) {
+            if (res.status === 'fulfilled' && res.value) results.push(res.value);
+            else if (res.status === 'rejected') errors++;
+        }
+        
+        // Update grid secara progressive
+        if (results.length > 0) _renderAISignals(results, scanned, tf);
+    }
+    
+    _renderAISignals(results, scanned, tf);
+    _renderAIScanStats(results, scanned, errors, statsEl);
+    
+    const ts = new Date().toLocaleTimeString('id-ID');
+    if (statusEl) statusEl.textContent = `✓ ${scanned} pair @ ${ts} | TF:${tf}m | ${results.length} signal`;
+}
+
+function _renderAIScanStats(results, total, errors, el) {
+    if (!el) return;
+    const longs  = results.filter(r => r.direction === 'LONG').length;
+    const shorts = results.filter(r => r.direction === 'SHORT').length;
+    const avgConf = results.length ? (results.reduce((s, r) => s + r.confidence, 0) / results.length * 100).toFixed(0) : 0;
+    
+    el.innerHTML = [
+        { label: 'Scanned', value: total, color: 'var(--text)' },
+        { label: 'LONG',    value: longs,  color: 'var(--accent)' },
+        { label: 'SHORT',   value: shorts, color: 'var(--danger)' },
+        { label: 'Avg Conf',value: avgConf + '%', color: 'var(--warn)' },
+    ].map(s => `
+        <div style="background:var(--bg2);border:1px solid var(--border);border-radius:4px;padding:8px;text-align:center;">
+            <div style="font-size:9px;font-family:var(--mono);color:var(--text2);text-transform:uppercase;">${s.label}</div>
+            <div style="font-family:var(--mono);font-size:16px;font-weight:700;color:${s.color};margin-top:2px;">${s.value}</div>
+        </div>
+    `).join('');
+}
+
+function _renderAISignals(results, total, tf) {
+    const gridEl = document.getElementById('ai-signal-grid');
+    if (!gridEl) return;
+    
+    if (!results.length) {
+        gridEl.innerHTML = `<div style="color:var(--text2);font-family:var(--mono);font-size:12px;padding:30px;text-align:center;grid-column:1/-1;border:1px dashed var(--border);border-radius:6px;">Tidak ada sinyal kuat dari ${total} pair di TF ${tf}m.<br><span style="font-size:10px;opacity:0.6;">Coba TF lebih besar atau tunggu momentum terbentuk.</span></div>`;
+        return;
+    }
+    
+    const sorted = [...results].sort((a, b) => b.confidence - a.confidence);
+    
+    gridEl.innerHTML = sorted.map(s => {
+        const isLong  = s.direction === 'LONG';
+        const color   = isLong ? 'var(--accent)'  : 'var(--danger)';
+        const bgColor = isLong ? '#00e5a012'        : '#ef444412';
+        const border  = isLong ? '#00e5a030'        : '#ef444430';
+        const confPct = Math.round(s.confidence * 100);
+        const dec     = s.price < 0.01 ? 6 : s.price < 1 ? 5 : s.price < 10 ? 4 : s.price < 1000 ? 3 : 2;
+        const confBar = `<div style="height:3px;background:var(--border);border-radius:2px;margin:6px 0 8px;">
+            <div style="height:3px;width:${confPct}%;background:${color};border-radius:2px;transition:width .3s;"></div>
+        </div>`;
+        
+        return `
+        <div style="background:var(--bg2);border:1px solid ${border};border-radius:6px;padding:14px;cursor:pointer;transition:border-color .2s;" 
+             onclick="selectAISignalPair('${s.symbol}')"
+             onmouseenter="this.style.borderColor='${color}'"
+             onmouseleave="this.style.borderColor='${border}'">
+            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
+                <span style="font-family:var(--mono);font-weight:700;color:var(--text);font-size:13px;">${s.symbol.replace('USDT','')}/USDT</span>
+                <span style="background:${bgColor};color:${color};border:1px solid ${border};border-radius:4px;padding:3px 10px;font-family:var(--mono);font-size:11px;font-weight:700;">${s.direction}</span>
+            </div>
+            ${confBar}
+            <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:6px;margin-bottom:8px;">
+                <div style="text-align:center;background:var(--panel);border:1px solid var(--border);border-radius:4px;padding:6px;">
+                    <div style="font-size:8px;color:var(--text2);text-transform:uppercase;margin-bottom:2px;">Entry</div>
+                    <div style="font-family:var(--mono);color:var(--blue);font-size:11px;font-weight:600;">${s.entry.toFixed(dec)}</div>
+                </div>
+                <div style="text-align:center;background:var(--panel);border:1px solid var(--border);border-radius:4px;padding:6px;">
+                    <div style="font-size:8px;color:var(--text2);text-transform:uppercase;margin-bottom:2px;">TP</div>
+                    <div style="font-family:var(--mono);color:var(--accent);font-size:11px;font-weight:600;">${s.tp.toFixed(dec)}</div>
+                </div>
+                <div style="text-align:center;background:var(--panel);border:1px solid var(--border);border-radius:4px;padding:6px;">
+                    <div style="font-size:8px;color:var(--text2);text-transform:uppercase;margin-bottom:2px;">SL</div>
+                    <div style="font-family:var(--mono);color:var(--danger);font-size:11px;font-weight:600;">${s.sl.toFixed(dec)}</div>
+                </div>
+            </div>
+            <div style="display:flex;justify-content:space-between;font-family:var(--mono);font-size:10px;color:var(--text2);margin-bottom:6px;">
+                <span>RSI ${s.rsi.toFixed(0)}</span>
+                <span>RR ${s.rr.toFixed(2)}×</span>
+                <span>Conf ${confPct}%</span>
+                <span>Vol ${s.volRatio.toFixed(1)}×</span>
+            </div>
+            <div style="font-size:9px;color:var(--text2);font-style:italic;line-height:1.4;">${s.reasons.slice(0,3).join(' · ')}</div>
+        </div>`;
+    }).join('');
+}
+
+// Klik signal card → pindah ke chart tab dengan pair tersebut
+function selectAISignalPair(symbol) {
+    const sel = document.getElementById('cfg-symbol');
+    if (sel && [...sel.options].some(o => o.value === symbol)) {
+        sel.value = symbol;
+        _onSymbolChange(symbol);
+    }
+    // Switch ke chart tab
+    const chartBtn = document.querySelector('.tab[onclick*="chart"]');
+    if (chartBtn) {
+        switchTab('chart', chartBtn);
+        toast(`Pindah ke chart ${symbol}`, true);
+    }
+}
+
+
+// ═══════════════════════════════════════════════════════════════════
+// Boot sequence
+// ═══════════════════════════════════════════════════════════════════
+
+const _BYBIT_INSTRUMENTS_URL_CONST = 'https://api.bytick.com/v5/market/instruments-info';
+
+async function loadBybitPairsConst(exchange) {
+  return loadBybitPairs(exchange);
+}
+
 loadConfig();
 loadSimState();
 loadBybitPairs('bybit');
