@@ -5,10 +5,10 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>TradeBot Quantum Control</title>
     
-    <!-- Favicon -->
+    <!-- Favicon Dummy -->
     <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🤖</text></svg>">
     
-    <!-- Mute Tailwind CDN Warning -->
+    <!-- Tailwind CSS (CDN for Dev) -->
     <script>
         const _warn = console.warn;
         console.warn = (...args) => {
@@ -17,14 +17,6 @@
         };
     </script>
     <script src="https://cdn.tailwindcss.com"></script>
-    
-    <!-- Load Local Lightweight Charts (Bypass CDN Tracking Prevention) -->
-    <script src="static/lw-charts.js"></script>
-    
-    <!-- Load static CSS Phosphor Icons (Tetap CDN karena ga ada lokalnya, tapi pakai crossorigin) -->
-    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@phosphor-icons/web@2.1.2/src/regular/style.css" crossorigin="anonymous">
-    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@phosphor-icons/web@2.1.2/src/fill/style.css" crossorigin="anonymous">
-    
     <script>
         tailwind.config = {
             darkMode: 'class',
@@ -40,31 +32,15 @@
         }
     </script>
     
-    <style>
-        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap');
-        body { font-family: 'Inter', sans-serif; background-color: #0f172a; color: #f8fafc; overflow-x: hidden; }
-        
-        .glass-panel { background: rgba(30, 41, 59, 0.7); backdrop-filter: blur(12px); border: 1px solid rgba(51, 65, 85, 0.5); }
-        .glass-panel:hover { border-color: rgba(56, 189, 248, 0.3); }
-        
-        .pulse-ring { animation: pulse-ring 2s cubic-bezier(0.215, 0.61, 0.355, 1) infinite; }
-        @keyframes pulse-ring { 
-            0% { box-shadow: 0 0 0 0 rgba(16, 185, 129, 0.7); } 
-            70% { box-shadow: 0 0 0 6px rgba(16, 185, 129, 0); } 
-            100% { box-shadow: 0 0 0 0 rgba(16, 185, 129, 0); } 
-        }
-
-        /* Custom Scrollbar */
-        ::-webkit-scrollbar { width: 6px; height: 6px; }
-        ::-webkit-scrollbar-track { background: transparent; }
-        ::-webkit-scrollbar-thumb { background: #334155; border-radius: 3px; }
-        ::-webkit-scrollbar-thumb:hover { background: #475569; }
-
-        .toast-enter { transform: translateY(100%); opacity: 0; }
-        .toast-enter-active { transform: translateY(0); opacity: 1; transition: all 300ms ease-out; }
-        .toast-exit { transform: translateY(0); opacity: 1; }
-        .toast-exit-active { transform: translateY(100%); opacity: 0; transition: all 300ms ease-in; }
-    </style>
+    <!-- Phosphor Icons -->
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@phosphor-icons/web@2.1.2/src/regular/style.css" crossorigin="anonymous">
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@phosphor-icons/web@2.1.2/src/fill/style.css" crossorigin="anonymous">
+    
+    <!-- Custom CSS -->
+    <link rel="stylesheet" href="dashboard.css">
+    
+    <!-- Local Lightweight Charts (Ensure your Go server serves /static/ correctly with JS MIME type) -->
+    <script src="/static/lw-charts.js"></script>
 </head>
 <body class="flex h-screen w-full selection:bg-brand-500/30 selection:text-brand-200">
 
@@ -218,7 +194,7 @@
             </div>
 
             <div class="grid grid-cols-1 lg:grid-cols-3 gap-6 mt-6">
-                <!-- Chart Section (Spans 2 cols on lg) -->
+                <!-- Chart Section -->
                 <div class="lg:col-span-2 glass-panel rounded-2xl flex flex-col h-[400px]">
                     <div class="p-4 border-b border-slate-800 flex justify-between items-center">
                         <h2 class="font-semibold text-white flex items-center gap-2">
@@ -268,217 +244,7 @@
     <!-- Toast Container -->
     <div id="toast-container" class="fixed bottom-4 right-4 flex flex-col gap-2 z-50"></div>
 
-    <script>
-        // --- Clock Logic ---
-        function updateClock() {
-            const now = new Date();
-            document.getElementById('clock').textContent = now.toISOString().substr(11, 8) + ' UTC';
-        }
-        setInterval(updateClock, 1000);
-        updateClock();
-
-        // --- Toast Notification ---
-        function showToast(message, type = 'info') {
-            const container = document.getElementById('toast-container');
-            const toast = document.createElement('div');
-            
-            let icon = 'ph-info';
-            let color = 'text-brand-400';
-            let bg = 'bg-slate-800';
-            let border = 'border-slate-700';
-
-            if(type === 'success') { icon = 'ph-check-circle'; color = 'text-emerald-400'; border = 'border-emerald-500/30'; }
-            if(type === 'error') { icon = 'ph-warning-circle'; color = 'text-rose-400'; border = 'border-rose-500/30'; }
-
-            toast.className = `flex items-center gap-3 p-4 rounded-lg shadow-xl shadow-black/50 border ${border} ${bg} text-sm font-medium text-white toast-enter`;
-            toast.innerHTML = `<i class="ph-fill ${icon} ${color} text-xl"></i><span>${message}</span>`;
-            
-            container.appendChild(toast);
-            
-            // Trigger animation
-            requestAnimationFrame(() => {
-                toast.classList.remove('toast-enter');
-                toast.classList.add('toast-enter-active');
-            });
-
-            setTimeout(() => {
-                toast.classList.remove('toast-enter-active');
-                toast.classList.add('toast-exit');
-                requestAnimationFrame(() => toast.classList.add('toast-exit-active'));
-                setTimeout(() => toast.remove(), 300);
-            }, 3000);
-        }
-
-        // --- Lightweight Chart Initialization ---
-        function initChart() {
-            const chartContainer = document.getElementById('chart-container');
-            
-            // Mencegah duplikasi inisialisasi
-            if (chartContainer.innerHTML.trim() !== '') return;
-            
-            // Perbaikan Error: Fallback dinamis jika static/lw-charts.js tidak dapat diakses
-            // (Misal: saat dijalankan dalam sandbox/preview iframe yang tidak memiliki akses folder lokal)
-            if (typeof LightweightCharts === 'undefined') {
-                console.warn('File lokal static/lw-charts.js tidak ditemukan di lingkungan ini. Memuat dari CDN secara dinamis...');
-                const script = document.createElement('script');
-                script.src = 'https://cdn.jsdelivr.net/npm/lightweight-charts@4.1.1/dist/lightweight-charts.standalone.production.js';
-                script.onload = () => {
-                    console.log('CDN LightweightCharts berhasil dimuat sebagai fallback.');
-                    initChart(); // Panggil ulang setelah termuat
-                };
-                script.onerror = () => {
-                    chartContainer.innerHTML = '<div class="flex items-center justify-center h-full text-rose-400 text-sm">Gagal memuat modul chart. Pastikan static/lw-charts.js tersedia atau koneksi internet aktif.</div>';
-                };
-                document.head.appendChild(script);
-                return;
-            }
-            
-            const chartOptions = { 
-                layout: { 
-                    textColor: '#94a3b8', 
-                    background: { type: 'solid', color: 'transparent' } 
-                },
-                grid: {
-                    vertLines: { color: 'rgba(51, 65, 85, 0.4)' },
-                    horzLines: { color: 'rgba(51, 65, 85, 0.4)' }
-                },
-                crosshair: {
-                    mode: 1, // Normal mode
-                },
-                rightPriceScale: {
-                    borderColor: 'rgba(51, 65, 85, 0.8)',
-                },
-                timeScale: {
-                    borderColor: 'rgba(51, 65, 85, 0.8)',
-                    timeVisible: true,
-                    secondsVisible: false,
-                }
-            };
-            
-            // Standard call for local lightweight-charts.js
-            const chart = LightweightCharts.createChart(chartContainer, chartOptions);
-            
-            const candlestickSeries = chart.addCandlestickSeries({
-                upColor: '#10b981', 
-                downColor: '#f43f5e', 
-                borderVisible: false,
-                wickUpColor: '#10b981', 
-                wickDownColor: '#f43f5e',
-            });
-
-            // Mock Data Generator
-            const data = [];
-            let time = Math.floor(Date.now() / 1000) - (100 * 3600);
-            let close = 65000;
-            
-            for (let i = 0; i < 100; i++) {
-                const open = close + (Math.random() - 0.5) * 200;
-                const high = Math.max(open, close) + Math.random() * 100;
-                const low = Math.min(open, close) - Math.random() * 100;
-                close = open + (Math.random() - 0.5) * 300;
-                
-                data.push({ time: time + (i * 3600), open, high, low, close });
-            }
-            candlestickSeries.setData(data);
-
-            // Responsive resize
-            new ResizeObserver(entries => {
-                if (entries.length === 0 || entries[0].target !== chartContainer) return;
-                const newRect = entries[0].contentRect;
-                chart.applyOptions({ height: newRect.height, width: newRect.width });
-            }).observe(chartContainer);
-        }
-
-        // --- Populate Orders Table ---
-        function populateOrders() {
-            const tbody = document.getElementById('orders-body');
-            const orders = [
-                { pair: 'BTC/USDT', side: 'BUY', price: '64,230.50', time: '2m ago' },
-                { pair: 'ETH/USDT', side: 'SELL', price: '3,450.10', time: '15m ago' },
-                { pair: 'SOL/USDT', side: 'BUY', price: '145.20', time: '1h ago' },
-                { pair: 'BTC/USDT', side: 'SELL', price: '65,100.00', time: '2h ago' },
-                { pair: 'DOGE/USDT', side: 'BUY', price: '0.1650', time: '3h ago' },
-                { pair: 'XRP/USDT', side: 'SELL', price: '0.5820', time: '5h ago' }
-            ];
-
-            let html = '';
-            orders.forEach(o => {
-                const isBuy = o.side === 'BUY';
-                const color = isBuy ? 'text-emerald-400' : 'text-rose-400';
-                const bg = isBuy ? 'bg-emerald-500/10 border-emerald-500/20' : 'bg-rose-500/10 border-rose-500/20';
-                
-                html += `
-                    <tr class="border-b border-slate-800/50 hover:bg-slate-800/30 transition">
-                        <td class="px-4 py-3">
-                            <div class="font-medium text-slate-200">${o.pair}</div>
-                            <div class="text-[10px] text-slate-500">${o.time}</div>
-                        </td>
-                        <td class="px-4 py-3">
-                            <span class="px-2 py-1 rounded text-[10px] font-bold border ${bg} ${color}">${o.side}</span>
-                        </td>
-                        <td class="px-4 py-3 text-right text-slate-300 font-medium">${o.price}</td>
-                    </tr>
-                `;
-            });
-            tbody.innerHTML = html;
-        }
-
-        // --- Bot & Signal Control Logic ---
-        let botRunning = false;
-        
-        function toggleBot() {
-            botRunning = !botRunning;
-            const btn = document.getElementById('btn-toggle-bot');
-            const icon = document.getElementById('icon-bot-state');
-            const text = document.getElementById('text-bot-state');
-            const signalText = document.getElementById('ai-signal-text');
-            const confBadge = signalText.parentElement.nextElementSibling.querySelector('span');
-            
-            if (botRunning) {
-                // Set to ACTIVE
-                btn.className = "flex items-center gap-2 px-4 py-1.5 rounded-md bg-emerald-500/20 text-emerald-400 border border-emerald-500/30 hover:bg-emerald-500/30 transition-all font-medium text-sm";
-                icon.className = "ph-fill ph-play-circle text-lg";
-                text.textContent = "ACTIVE";
-                showToast('Auto Trading Engine Started', 'success');
-                simulateSignals();
-            } else {
-                // Set to STOPPED
-                btn.className = "flex items-center gap-2 px-4 py-1.5 rounded-md bg-rose-500/20 text-rose-400 border border-rose-500/30 hover:bg-rose-500/30 transition-all font-medium text-sm";
-                icon.className = "ph-fill ph-stop-circle text-lg";
-                text.textContent = "STOPPED";
-                signalText.textContent = "WAITING";
-                signalText.className = "text-2xl font-bold text-slate-400 transition-colors duration-300";
-                confBadge.textContent = "CONFIDENCE: --%";
-                showToast('Auto Trading Engine Halted', 'error');
-                clearInterval(window.signalInterval);
-            }
-        }
-
-        function simulateSignals() {
-            const signals = ['STRONG LONG', 'WEAK LONG', 'NEUTRAL', 'WEAK SHORT', 'STRONG SHORT'];
-            const colors = ['text-emerald-400', 'text-emerald-300', 'text-slate-400', 'text-rose-300', 'text-rose-400'];
-            
-            const updateSignal = () => {
-                if(!botRunning) return;
-                const signalEl = document.getElementById('ai-signal-text');
-                const randIdx = Math.floor(Math.random() * signals.length);
-                
-                signalEl.textContent = signals[randIdx];
-                signalEl.className = `text-2xl font-bold ${colors[randIdx]} transition-colors duration-300`;
-                
-                const conf = document.querySelector('#ai-signal-text').parentElement.nextElementSibling.querySelector('span');
-                conf.textContent = `CONFIDENCE: ${Math.floor(Math.random() * 30 + 70)}%`;
-            };
-
-            updateSignal(); // Call immediately once
-            window.signalInterval = setInterval(updateSignal, 5000);
-        }
-
-        // --- Init Everything ---
-        window.addEventListener('DOMContentLoaded', () => {
-            initChart();
-            populateOrders();
-        });
-    </script>
+    <!-- Main Logic -->
+    <script src="dashboard.js" defer></script>
 </body>
 </html>
