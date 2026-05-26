@@ -1,10 +1,10 @@
 // go-engine/market/feed.go
 //
-// Market data feed — pulls live data from exchange and packages it
-// as MarketData for SHM. Runs three concurrent goroutines:
-//   • wsTickerLoop  : WebSocket real-time price (sub-millisecond latency)
-//   • restOHLCVLoop : REST candles refresh every loop_interval seconds
-//   • restAuxLoop   : REST OI, LSR, funding rate refresh every ~30s
+// FIX v3.0.2:
+//   - fetchSpecificFloat() menggantikan fetchSingleFloat() yang asal-asalan pick field
+//     dari JSON map (non-deterministic order → kadang dapet "timestamp" bukan "openInterest")
+//   - OI, LSR, FundingRate sekarang masing-masing pick field by name, bukan random
+//   - Log OI sudah include unit jelas (contracts) supaya tidak salah interpret
 
 package market
 
@@ -26,12 +26,12 @@ import (
 )
 
 const (
-	bybitWSMain  = "wss://stream.bytick.com/v5/public/linear"
+	bybitWSMain   = "wss://stream.bytick.com/v5/public/linear"
 	bybitRESTMain = "https://api.bytick.com"
-	pingInterval = 20 * time.Second
+	pingInterval  = 20 * time.Second
 )
 
-// State is shared between the three goroutines and is read-merged on each SHM write
+// State adalah shared state antara goroutine WS, OHLCV, dan Aux.
 type State struct {
 	mu sync.RWMutex
 
@@ -49,28 +49,27 @@ type State struct {
 	LSR         float64
 	FundingRate float64
 
-	// Macro (Go fetches these from public APIs — Absurdist agent input)
+	// Macro (zeroed until external feeds integrated)
 	USDTDeltaPct   float64
 	KimchiPct      float64
 	WhaleInflowUSD float64
 	LongLiq1h      float64
 	ShortLiq1h     float64
 
-	// Sentiment (Go RSS goroutine — Linguist agent input)
+	// Sentiment (dari RSS goroutine — Linguist input)
 	SentimentScore float32
 	NewsCount      uint32
 
-	// Meta
 	Symbol string
 }
 
-// Feed orchestrates all data sources and writes to SHM on every price update
+// Feed mengorkestrasi semua data source dan menulis ke SHM setiap price update.
 type Feed struct {
 	state   State
 	bridge  *shm.Bridge
 	client  *http.Client
-	ohlcvTF string // e.g. "5"  (Bybit interval minutes)
-	limit   int    // candle count
+	ohlcvTF string
+	limit   int
 }
 
 func New(bridge *shm.Bridge, symbol, ohlcvTF string, limit int) *Feed {
@@ -83,12 +82,12 @@ func New(bridge *shm.Bridge, symbol, ohlcvTF string, limit int) *Feed {
 	}
 }
 
-// Run starts all goroutines; blocks until ctx is cancelled
+// Run menjalankan semua goroutine; block sampai ctx cancel.
 func (f *Feed) Run(ctx context.Context) {
 	sym := f.state.Symbol
 	log.Printf("[Feed] Starting for %s tf=%s limit=%d", sym, f.ohlcvTF, f.limit)
 
-	// Prime OHLCV synchronously before starting WS (Rust needs candles on first tick)
+	// Prime OHLCV synchronously sebelum WS start
 	if err := f.fetchOHLCV(sym); err != nil {
 		log.Printf("[Feed] Initial OHLCV fetch failed: %v", err)
 	}
@@ -96,12 +95,14 @@ func (f *Feed) Run(ctx context.Context) {
 
 	var wg sync.WaitGroup
 
+	// WebSocket price feed
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
 		f.wsTickerLoop(ctx, sym)
 	}()
 
+	// OHLCV refresh tiap 60 detik
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
@@ -119,6 +120,7 @@ func (f *Feed) Run(ctx context.Context) {
 		}
 	}()
 
+	// Aux (OI, LSR, Funding) refresh tiap 30 detik
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
@@ -147,11 +149,9 @@ func (f *Feed) wsTickerLoop(ctx context.Context, symbol string) {
 			return
 		default:
 		}
-
 		if err := f.wsConnect(ctx, symbol); err != nil {
 			log.Printf("[Feed] WS error: %v — reconnect in %s", err, backoff)
 		}
-
 		select {
 		case <-ctx.Done():
 			return
@@ -179,7 +179,6 @@ func (f *Feed) wsConnect(ctx context.Context, symbol string) error {
 	}
 	log.Printf("[Feed] WS connected — subscribed to tickers.%s", symbol)
 
-	// Ping goroutine
 	pingCtx, pingCancel := context.WithCancel(ctx)
 	defer pingCancel()
 	go func() {
@@ -210,17 +209,17 @@ func (f *Feed) wsConnect(ctx context.Context, symbol string) error {
 			continue
 		}
 		var data struct {
-			LastPrice  string `json:"lastPrice"`
-			Bid1Price  string `json:"bid1Price"`
-			Ask1Price  string `json:"ask1Price"`
+			LastPrice string `json:"lastPrice"`
+			Bid1Price string `json:"bid1Price"`
+			Ask1Price string `json:"ask1Price"`
 		}
 		if err := json.Unmarshal(raw["data"], &data); err != nil {
 			continue
 		}
 
 		price, _ := strconv.ParseFloat(data.LastPrice, 64)
-		bid, _   := strconv.ParseFloat(data.Bid1Price, 64)
-		ask, _   := strconv.ParseFloat(data.Ask1Price, 64)
+		bid, _ := strconv.ParseFloat(data.Bid1Price, 64)
+		ask, _ := strconv.ParseFloat(data.Ask1Price, 64)
 
 		if price <= 0 {
 			continue
@@ -228,8 +227,12 @@ func (f *Feed) wsConnect(ctx context.Context, symbol string) error {
 
 		f.state.mu.Lock()
 		f.state.Price = price
-		if bid > 0 { f.state.Bid = bid }
-		if ask > 0 { f.state.Ask = ask }
+		if bid > 0 {
+			f.state.Bid = bid
+		}
+		if ask > 0 {
+			f.state.Ask = ask
+		}
 		f.state.mu.Unlock()
 
 		f.flushToSHM(symbol)
@@ -264,17 +267,19 @@ func (f *Feed) fetchOHLCV(symbol string) error {
 	}
 
 	rows := payload.Result.List
-	// Bybit returns newest-first → reverse for Rust (oldest-first)
+	// Bybit returns newest-first → reverse to oldest-first for Rust
 	candles := make([]shm.Candle, 0, len(rows))
 	for i := len(rows) - 1; i >= 0; i-- {
 		r := rows[i]
-		if len(r) < 6 { continue }
-		ts,   _ := strconv.ParseInt(r[0], 10, 64)
+		if len(r) < 6 {
+			continue
+		}
+		ts, _ := strconv.ParseInt(r[0], 10, 64)
 		open, _ := strconv.ParseFloat(r[1], 64)
 		high, _ := strconv.ParseFloat(r[2], 64)
-		low,  _ := strconv.ParseFloat(r[3], 64)
-		cls,  _ := strconv.ParseFloat(r[4], 64)
-		vol,  _ := strconv.ParseFloat(r[5], 64)
+		low, _ := strconv.ParseFloat(r[3], 64)
+		cls, _ := strconv.ParseFloat(r[4], 64)
+		vol, _ := strconv.ParseFloat(r[5], 64)
 		candles = append(candles, shm.Candle{
 			Open: open, High: high, Low: low, Close: cls, Volume: vol, TsMs: ts,
 		})
@@ -284,38 +289,73 @@ func (f *Feed) fetchOHLCV(symbol string) error {
 
 	f.state.mu.Lock()
 	f.state.Candles = candles
-	f.state.ATR14   = atr
+	f.state.ATR14 = atr
 	f.state.mu.Unlock()
 
 	log.Printf("[Feed] OHLCV refreshed: %d candles ATR14=%.4f", len(candles), atr)
 	return nil
 }
 
+// fetchAux mengambil OI, LSR, dan Funding Rate.
+// FIX: setiap field sekarang di-parse by name, bukan random dari map iteration.
 func (f *Feed) fetchAux(symbol string) error {
-	// Open Interest
-	oiURL := fmt.Sprintf("%s/v5/market/open-interest?category=linear&symbol=%s&intervalTime=5min&limit=1", bybitRESTMain, symbol)
-	if oi, err := fetchSingleFloat(f.client, oiURL, "result.list.0.openInterest"); err == nil {
-		f.state.mu.Lock(); f.state.OI = oi; f.state.mu.Unlock()
+	// ── Open Interest ─────────────────────────────────────────────────────────
+	// Bybit response: {"result":{"list":[{"openInterest":"2847291.00","timestamp":"1748xxx"}]}}
+	// BUG LAMA: fetchSingleFloat ambil field pertama dari map (random order di Go) →
+	//   kadang dapet "timestamp" (1.748e12) bukan "openInterest" (2.847e6)
+	// FIX: fetchSpecificFloat("openInterest") → always correct field
+	oiURL := fmt.Sprintf("%s/v5/market/open-interest?category=linear&symbol=%s&intervalTime=5min&limit=1",
+		bybitRESTMain, symbol)
+	if oi, err := fetchSpecificFloat(f.client, oiURL, "openInterest"); err == nil && oi > 0 {
+		// Sanity check: OI dalam contracts tidak akan > 1 miliar untuk crypto biasa
+		// Jika > 1e10 kemungkinan besar timestamp terselip
+		if oi < 1e10 {
+			f.state.mu.Lock()
+			f.state.OI = oi
+			f.state.mu.Unlock()
+			log.Printf("[OI] %s oi=%.2f (contracts)", symbol, oi)
+		} else {
+			log.Printf("[OI] %s SKIP suspicious value=%.0f (looks like timestamp)", symbol, oi)
+		}
 	}
 
-	// Long/Short Ratio
-	lsrURL := fmt.Sprintf("%s/v5/market/account-ratio?category=linear&symbol=%s&period=5min&limit=1", bybitRESTMain, symbol)
+	// ── Long/Short Ratio ──────────────────────────────────────────────────────
+	lsrURL := fmt.Sprintf("%s/v5/market/account-ratio?category=linear&symbol=%s&period=5min&limit=1",
+		bybitRESTMain, symbol)
 	if buy, sell, err := fetchLSR(f.client, lsrURL); err == nil && sell > 0 {
-		f.state.mu.Lock(); f.state.LSR = buy / sell; f.state.mu.Unlock()
+		lsr := buy / sell
+		f.state.mu.Lock()
+		f.state.LSR = lsr
+		f.state.mu.Unlock()
+		log.Printf("[WHALE] %s LSR=%.4f bias=%s", symbol, lsr, lsrBiasLabel(lsr))
 	}
 
-	// Funding Rate
-	frURL := fmt.Sprintf("%s/v5/market/funding/history?category=linear&symbol=%s&limit=1", bybitRESTMain, symbol)
-	if fr, err := fetchSingleFloat(f.client, frURL, "result.list.0.fundingRate"); err == nil {
-		f.state.mu.Lock(); f.state.FundingRate = fr; f.state.mu.Unlock()
+	// ── Funding Rate ──────────────────────────────────────────────────────────
+	// Bybit response: {"result":{"list":[{"fundingRate":"0.0001","fundingRateTimestamp":"..."}]}}
+	frURL := fmt.Sprintf("%s/v5/market/funding/history?category=linear&symbol=%s&limit=1",
+		bybitRESTMain, symbol)
+	if fr, err := fetchSpecificFloat(f.client, frURL, "fundingRate"); err == nil {
+		f.state.mu.Lock()
+		f.state.FundingRate = fr
+		f.state.mu.Unlock()
 	}
 
 	return nil
 }
 
+// lsrBiasLabel returns a human-readable label for log output.
+func lsrBiasLabel(lsr float64) string {
+	if lsr > 1.05 {
+		return "LONG_HEAVY"
+	} else if lsr < 0.95 {
+		return "SHORT_HEAVY"
+	}
+	return "NEUTRAL"
+}
+
 // ── SHM Flush ─────────────────────────────────────────────────────────────────
 
-var flushSeq uint64 // monotonic frame counter (not the seqlock seq)
+var flushSeq uint64
 
 func (f *Feed) flushToSHM(symbol string) {
 	f.state.mu.RLock()
@@ -330,32 +370,31 @@ func (f *Feed) flushToSHM(symbol string) {
 	copy(sym[:], symbol)
 
 	md := &shm.MarketData{
-		Symbol:          sym,
-		Candles:         s.Candles,
-		Price:           s.Price,
-		Bid:             s.Bid,
-		Ask:             s.Ask,
-		OI:              s.OI,
-		LSR:             s.LSR,
-		ATR14:           s.ATR14,
-		FundingRate:     s.FundingRate,
-		USDTDeltaPct:    s.USDTDeltaPct,
-		KimchiPct:       s.KimchiPct,
-		WhaleInflowUSD:  s.WhaleInflowUSD,
-		LongLiq1h:       s.LongLiq1h,
-		ShortLiq1h:      s.ShortLiq1h,
-		SentimentScore:  s.SentimentScore,
-		NewsCount:       s.NewsCount,
-		TsMs:            time.Now().UnixMilli(),
+		Symbol:         sym,
+		Candles:        s.Candles,
+		Price:          s.Price,
+		Bid:            s.Bid,
+		Ask:            s.Ask,
+		OI:             s.OI,
+		LSR:            s.LSR,
+		ATR14:          s.ATR14,
+		FundingRate:    s.FundingRate,
+		USDTDeltaPct:   s.USDTDeltaPct,
+		KimchiPct:      s.KimchiPct,
+		WhaleInflowUSD: s.WhaleInflowUSD,
+		LongLiq1h:      s.LongLiq1h,
+		ShortLiq1h:     s.ShortLiq1h,
+		SentimentScore: s.SentimentScore,
+		NewsCount:      s.NewsCount,
+		TsMs:           time.Now().UnixMilli(),
 	}
 
 	f.bridge.WriteMarket(md)
 	atomic.AddUint64(&flushSeq, 1)
 }
 
-// ── Stats helpers ─────────────────────────────────────────────────────────────
+// ── Math helpers ──────────────────────────────────────────────────────────────
 
-// wilderATR computes Wilder-smoothed ATR matching the Rust implementation
 func wilderATR(candles []shm.Candle, period int) float64 {
 	if len(candles) < 2 {
 		return 0
@@ -366,11 +405,17 @@ func wilderATR(candles []shm.Candle, period int) float64 {
 		tr := math.Max(h-l, math.Max(math.Abs(h-pc), math.Abs(l-pc)))
 		trs = append(trs, tr)
 	}
-	if len(trs) == 0 { return 0 }
+	if len(trs) == 0 {
+		return 0
+	}
 	seedN := period
-	if seedN > len(trs) { seedN = len(trs) }
+	if seedN > len(trs) {
+		seedN = len(trs)
+	}
 	var atr float64
-	for _, v := range trs[:seedN] { atr += v }
+	for _, v := range trs[:seedN] {
+		atr += v
+	}
 	atr /= float64(seedN)
 	alpha := 1.0 / float64(period)
 	for _, v := range trs[seedN:] {
@@ -379,33 +424,62 @@ func wilderATR(candles []shm.Candle, period int) float64 {
 	return atr
 }
 
-// fetchSingleFloat is a quick helper to pull one numeric value from a Bybit JSON path
-func fetchSingleFloat(client *http.Client, url, _ string) (float64, error) {
+// ── REST parsers ──────────────────────────────────────────────────────────────
+
+// fetchSpecificFloat mengambil satu field by name dari Bybit REST response.
+//
+// FIX menggantikan fetchSingleFloat yang lama. fetchSingleFloat yang lama mengabaikan
+// parameter fieldName (pakai `_`) dan iterate map dengan random order — kadang
+// mendapatkan field "timestamp" (nilai ~1.748e12) alih-alih "openInterest" (~2.8e6).
+// Hasilnya OI tampil sebagai "1779.78B" di dashboard.
+func fetchSpecificFloat(client *http.Client, url string, fieldName string) (float64, error) {
 	resp, err := client.Get(url)
-	if err != nil { return 0, err }
-	defer resp.Body.Close()
-	var m map[string]json.RawMessage
-	body, _ := io.ReadAll(resp.Body)
-	if err := json.Unmarshal(body, &m); err != nil { return 0, err }
-	// Generic drill-down: result → list → [0] → first numeric field
-	var result map[string]json.RawMessage
-	if err := json.Unmarshal(m["result"], &result); err != nil { return 0, err }
-	var list []map[string]json.RawMessage
-	if err := json.Unmarshal(result["list"], &list); err != nil { return 0, err }
-	if len(list) == 0 { return 0, fmt.Errorf("empty list") }
-	for _, raw := range list[0] {
-		var s string
-		if err := json.Unmarshal(raw, &s); err != nil { continue }
-		if v, err := strconv.ParseFloat(s, 64); err == nil && v != 0 {
-			return v, nil
-		}
+	if err != nil {
+		return 0, err
 	}
-	return 0, fmt.Errorf("no numeric field found")
+	defer resp.Body.Close()
+
+	body, _ := io.ReadAll(resp.Body)
+
+	var payload struct {
+		RetCode int `json:"retCode"`
+		Result  struct {
+			List []map[string]json.RawMessage `json:"list"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return 0, fmt.Errorf("parse response: %w", err)
+	}
+	if payload.RetCode != 0 {
+		return 0, fmt.Errorf("bybit retCode %d", payload.RetCode)
+	}
+	if len(payload.Result.List) == 0 {
+		return 0, fmt.Errorf("empty list")
+	}
+
+	raw, ok := payload.Result.List[0][fieldName]
+	if !ok {
+		return 0, fmt.Errorf("field '%s' not found in response", fieldName)
+	}
+
+	// Bybit selalu mengirim angka sebagai string JSON
+	var s string
+	if err := json.Unmarshal(raw, &s); err != nil {
+		// Mungkin angka langsung (bukan string)
+		var f float64
+		if err2 := json.Unmarshal(raw, &f); err2 != nil {
+			return 0, fmt.Errorf("cannot parse field '%s': %w", fieldName, err)
+		}
+		return f, nil
+	}
+	return strconv.ParseFloat(s, 64)
 }
 
 func fetchLSR(client *http.Client, url string) (buy, sell float64, err error) {
 	resp, err := client.Get(url)
-	if err != nil { return }
+	if err != nil {
+		return
+	}
 	defer resp.Body.Close()
 	var payload struct {
 		Result struct {
@@ -416,28 +490,33 @@ func fetchLSR(client *http.Client, url string) (buy, sell float64, err error) {
 		} `json:"result"`
 	}
 	body, _ := io.ReadAll(resp.Body)
-	if err = json.Unmarshal(body, &payload); err != nil { return }
-	if len(payload.Result.List) == 0 { err = fmt.Errorf("empty"); return }
-	buy,  _ = strconv.ParseFloat(payload.Result.List[0].BuyRatio, 64)
+	if err = json.Unmarshal(body, &payload); err != nil {
+		return
+	}
+	if len(payload.Result.List) == 0 {
+		err = fmt.Errorf("empty LSR list")
+		return
+	}
+	buy, _ = strconv.ParseFloat(payload.Result.List[0].BuyRatio, 64)
 	sell, _ = strconv.ParseFloat(payload.Result.List[0].SellRatio, 64)
 	return
 }
 
-// UpdateSentiment is called by the RSS goroutine in main.go
+// UpdateSentiment dipanggil oleh RSS goroutine di main.go.
 func (f *Feed) UpdateSentiment(score float32, count uint32) {
 	f.state.mu.Lock()
 	f.state.SentimentScore = score
-	f.state.NewsCount      = count
+	f.state.NewsCount = count
 	f.state.mu.Unlock()
 }
 
-// UpdateMacro updates the Absurdist macro fields (called from separate goroutines)
+// UpdateMacro mengupdate field macro Absurdist (dipanggil dari goroutine terpisah).
 func (f *Feed) UpdateMacro(usdtDelta, kimchi, whaleInflow, longLiq, shortLiq float64) {
 	f.state.mu.Lock()
-	f.state.USDTDeltaPct   = usdtDelta
-	f.state.KimchiPct      = kimchi
+	f.state.USDTDeltaPct = usdtDelta
+	f.state.KimchiPct = kimchi
 	f.state.WhaleInflowUSD = whaleInflow
-	f.state.LongLiq1h      = longLiq
-	f.state.ShortLiq1h     = shortLiq
+	f.state.LongLiq1h = longLiq
+	f.state.ShortLiq1h = shortLiq
 	f.state.mu.Unlock()
 }
