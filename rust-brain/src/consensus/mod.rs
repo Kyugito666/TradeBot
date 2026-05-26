@@ -1,4 +1,14 @@
 // rust-brain/src/consensus/mod.rs
+// FIX v3.0.2:
+//   [FIX-1] Trading style name aliases: "daytrade" → handled same as "daytrading",
+//           "sniper" → handled same as "swing". Dashboard HTML sends "daytrade"/"sniper"
+//           but old code only matched "daytrading"/"swing" → fell through to conservative
+//           default (min_confidence: 0.65, min_agree: 4) causing bot to never entry.
+//   [FIX-2] noise_veto is now per-style instead of a global constant (0.65 was too
+//           aggressive for scalping — choppy crypto easily triggers noise > 0.65).
+//           Scalping: 0.80  |  Daytrading: 0.68  |  Swing: 0.55
+//   [FIX-3] Default fallback style is now "scalping-like" (min_confidence: 0.40)
+//           instead of the most conservative swing settings.
 
 use crate::agents::{AgentVote, Direction};
 use crate::shm::{MarketSnapshot, SignalOutput, AGENT_COUNT};
@@ -14,14 +24,14 @@ const WEIGHTS: [(&str, f64); AGENT_COUNT] = [
     ("absurdist",     0.10),
 ];
 
-const NOISE_VETO: f64 = 0.65;
-const GBM_BOOST:  f64 = 0.2;
+const GBM_BOOST: f64 = 0.2;
 
 struct StyleConfig {
     min_confidence: f64,
     min_agree:      usize,
     tp_atr_mult:    f64,
     sl_atr_mult:    f64,
+    noise_veto:     f64,  // [FIX-2] per-style noise tolerance
 }
 
 // Membaca Trading Style dari .env dan merekalibrasi semua parameter agen
@@ -32,15 +42,58 @@ fn get_style() -> &'static StyleConfig {
         if let Ok(content) = std::fs::read_to_string(".env") {
             for line in content.lines() {
                 let line = line.trim();
+                // Skip komentar dan baris kosong
+                if line.is_empty() || line.starts_with('#') { continue; }
                 if line.starts_with("TRADING_STYLE=") {
-                    style_name = line["TRADING_STYLE=".len()..].trim_matches('"').to_lowercase();
+                    style_name = line["TRADING_STYLE=".len()..]
+                        .trim()
+                        .trim_matches('"')
+                        .trim_matches('\'')
+                        .to_lowercase();
+                    break;
                 }
             }
         }
+        log::info!("[Consensus] Trading style loaded: '{style_name}'");
+
+        // [FIX-1] Handle semua alias yang dikirim dari dashboard HTML
+        // Dashboard option values: "scalping", "daytrade", "sniper"
+        // Old code hanya match: "scalping", "daytrading" → "daytrade" selalu fallthrough!
         match style_name.as_str() {
-            "scalping"   => StyleConfig { min_confidence: 0.35, min_agree: 2, tp_atr_mult: 1.0, sl_atr_mult: 0.8 },
-            "daytrading" => StyleConfig { min_confidence: 0.50, min_agree: 3, tp_atr_mult: 2.0, sl_atr_mult: 1.2 },
-            _            => StyleConfig { min_confidence: 0.65, min_agree: 4, tp_atr_mult: 3.5, sl_atr_mult: 1.5 }, // swing default
+            "scalping" => StyleConfig {
+                min_confidence: 0.35,
+                min_agree:      2,
+                tp_atr_mult:    1.0,
+                sl_atr_mult:    0.8,
+                noise_veto:     0.80, // [FIX-2] lebih toleran untuk scalping
+            },
+            // [FIX-1] "daytrade" (dari dashboard) = "daytrading" (old code)
+            "daytrading" | "daytrade" | "day" => StyleConfig {
+                min_confidence: 0.50,
+                min_agree:      3,
+                tp_atr_mult:    2.0,
+                sl_atr_mult:    1.2,
+                noise_veto:     0.68,
+            },
+            // [FIX-1] "sniper" (dari dashboard) = "swing" (old code)
+            "swing" | "sniper" | "sniper_swing" => StyleConfig {
+                min_confidence: 0.62,
+                min_agree:      4,
+                tp_atr_mult:    3.5,
+                sl_atr_mult:    1.5,
+                noise_veto:     0.55, // ketat untuk swing
+            },
+            // [FIX-3] Default fallback masuk akal, bukan konservatif ekstrem
+            _ => {
+                log::warn!("[Consensus] Unknown TRADING_STYLE='{style_name}', using scalping defaults");
+                StyleConfig {
+                    min_confidence: 0.40,
+                    min_agree:      2,
+                    tp_atr_mult:    1.5,
+                    sl_atr_mult:    1.0,
+                    noise_veto:     0.75,
+                }
+            }
         }
     })
 }
@@ -53,7 +106,7 @@ impl ConsensusEngine {
         let cfg   = get_style();
 
         // ── VETO CHAIN ───────────────────────────────────────────────────────
-        if let Some(reason) = self.check_veto(votes, snap) {
+        if let Some(reason) = self.check_veto(votes, cfg) {
             log::warn!("[Consensus] VETO: {reason}");
             return self.make_wait(votes, reason, ts_ms);
         }
@@ -65,7 +118,10 @@ impl ConsensusEngine {
         let mut sell_count = 0_usize;
 
         for vote in votes {
-            let w = WEIGHTS.iter().find(|(n, _)| *n == vote.agent).map(|(_, w)| *w).unwrap_or(0.05);
+            let w = WEIGHTS.iter()
+                .find(|(n, _)| *n == vote.agent)
+                .map(|(_, w)| *w)
+                .unwrap_or(0.05);
             let sign = match vote.direction {
                 Direction::Buy  => { buy_count  += 1;  1.0 },
                 Direction::Sell => { sell_count += 1; -1.0 },
@@ -79,8 +135,11 @@ impl ConsensusEngine {
 
         // ── GBM Bias Adjustment ──────────────────────────────────────────────
         let gbm_bias = extract_gbm_bias(votes);
-        if gbm_bias > 0.6 && score > 0.0 { score *= 1.0 + (gbm_bias - 0.5) * GBM_BOOST; }
-        else if gbm_bias < 0.4 && score < 0.0 { score *= 1.0 + (0.5 - gbm_bias) * GBM_BOOST; }
+        if gbm_bias > 0.6 && score > 0.0 {
+            score *= 1.0 + (gbm_bias - 0.5) * GBM_BOOST;
+        } else if gbm_bias < 0.4 && score < 0.0 {
+            score *= 1.0 + (0.5 - gbm_bias) * GBM_BOOST;
+        }
 
         let confidence = score.abs().min(1.0);
 
@@ -101,13 +160,15 @@ impl ConsensusEngine {
             Direction::Buy => {
                 let e = price;
                 let s = price - atr * cfg.sl_atr_mult;
-                let t = liq_tp_above(snap, price, atr, cfg.tp_atr_mult * 1.5).unwrap_or(price + atr * cfg.tp_atr_mult);
+                let t = liq_tp_above(snap, price, atr, cfg.tp_atr_mult * 1.5)
+                    .unwrap_or(price + atr * cfg.tp_atr_mult);
                 (e, t, s)
             }
             Direction::Sell => {
                 let e = price;
                 let s = price + atr * cfg.sl_atr_mult;
-                let t = liq_tp_below(snap, price, atr, cfg.tp_atr_mult * 1.5).unwrap_or(price - atr * cfg.tp_atr_mult);
+                let t = liq_tp_below(snap, price, atr, cfg.tp_atr_mult * 1.5)
+                    .unwrap_or(price - atr * cfg.tp_atr_mult);
                 (e, t, s)
             }
             Direction::Wait => (price, price, price),
@@ -136,24 +197,35 @@ impl ConsensusEngine {
         }
     }
 
-    fn check_veto(&self, votes: &[AgentVote], snap: &MarketSnapshot) -> Option<String> {
+    // [FIX-2] check_veto sekarang terima cfg untuk pakai noise_veto per-style
+    fn check_veto(&self, votes: &[AgentVote], cfg: &StyleConfig) -> Option<String> {
         if let Some(v) = votes.iter().find(|v| v.agent == "physicist") {
-            if v.reasoning.contains("VOLATILITY CRISIS") { return Some(v.reasoning.clone()); }
+            if v.reasoning.contains("VOLATILITY CRISIS") {
+                return Some(v.reasoning.clone());
+            }
         }
         if let Some(v) = votes.iter().find(|v| v.agent == "mathematician") {
             if let Some(noise) = parse_f64_field(&v.reasoning, "noise=") {
-                if noise > NOISE_VETO { return Some(format!("Market noise {noise:.3} > threshold {NOISE_VETO}")); }
+                // [FIX-2] pakai cfg.noise_veto bukan hardcoded 0.65
+                if noise > cfg.noise_veto {
+                    return Some(format!(
+                        "Market noise {noise:.3} > threshold {:.2} (style noise_veto)",
+                        cfg.noise_veto
+                    ));
+                }
             }
-            if v.reasoning.contains("anomaly=true") { return Some("Mathematical anomaly detected (|Z| > 4σ)".into()); }
+            if v.reasoning.contains("anomaly=true") {
+                return Some("Mathematical anomaly detected (|Z| > 4σ)".into());
+            }
         }
         None
     }
 
     fn make_wait(&self, votes: &[AgentVote], reason: String, ts_ms: i64) -> SignalOutput {
-        let mut agent_dirs = [0u8; AGENT_COUNT];
+        let mut agent_dirs        = [0u8; AGENT_COUNT];
         let mut agent_convictions = [0.0f64; AGENT_COUNT];
         for (i, v) in votes.iter().take(AGENT_COUNT).enumerate() {
-            agent_dirs[i] = v.direction as u8;
+            agent_dirs[i]        = v.direction as u8;
             agent_convictions[i] = v.conviction;
         }
         SignalOutput {
@@ -165,14 +237,17 @@ impl ConsensusEngine {
 }
 
 fn extract_gbm_bias(votes: &[AgentVote]) -> f64 {
-    votes.iter().find(|v| v.agent == "physicist")
-        .and_then(|v| parse_f64_field(&v.reasoning, "upside_bias=")).unwrap_or(0.5)
+    votes.iter()
+        .find(|v| v.agent == "physicist")
+        .and_then(|v| parse_f64_field(&v.reasoning, "upside_bias="))
+        .unwrap_or(0.5)
 }
 
 fn parse_f64_field(s: &str, field: &str) -> Option<f64> {
     let pos = s.find(field)?;
     let rest = &s[pos + field.len()..];
-    let end = rest.find(|c: char| c == ' ' || c == ',' || c == ']').unwrap_or(rest.len());
+    let end = rest.find(|c: char| c == ' ' || c == ',' || c == ']')
+        .unwrap_or(rest.len());
     rest[..end].parse::<f64>().ok()
 }
 
@@ -193,7 +268,7 @@ fn liq_tp_above(snap: &MarketSnapshot, price: f64, atr: f64, look_mult: f64) -> 
     }
     if candidates.is_empty() { None } else {
         candidates.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
-        Some(candidates[candidates.len() / 4]) 
+        Some(candidates[candidates.len() / 4])
     }
 }
 
