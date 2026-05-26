@@ -201,10 +201,17 @@ function updatePriceStats() {
   }
 }
 
+// FIX: Format OI untuk BTC biar muncul Miliar (B)
 function updateOIStats() {
   const v = stats.oi;
   if (!v) return;
-  const fmt = v >= 1e6 ? (v/1e6).toFixed(2) + 'M' : v >= 1e3 ? (v/1e3).toFixed(1) + 'K' : v.toFixed(0);
+  
+  let fmt;
+  if (v >= 1e9) fmt = (v/1e9).toFixed(2) + 'B';
+  else if (v >= 1e6) fmt = (v/1e6).toFixed(2) + 'M';
+  else if (v >= 1e3) fmt = (v/1e3).toFixed(1) + 'K';
+  else fmt = v.toFixed(0);
+  
   document.getElementById('stat-oi').textContent = fmt;
   document.getElementById('stat-oi-time').textContent = stats.oiTime || '--';
 }
@@ -432,22 +439,115 @@ async function startChart() {
 }
 startChart();
 
+// FIX: Update untuk render table posisi Paper Trading Go Engine
+let _chartLines = [];
+async function fetchPositions() {
+    try {
+        const r = await fetch('/api/positions');
+        const d = await r.json();
+        
+        // Hapus garis lama
+        if (_chartLines && _chartLines.length > 0) {
+            _chartLines.forEach(l => _candleSeries.removePriceLine(l));
+            _chartLines = [];
+        }
+
+        // Gambar garis baru jika ada posisi aktif dari Go
+        if (d.active && d.active.length > 0) {
+            const pos = d.active[0];
+            const color = pos.side === 'BUY' ? THEME.up : THEME.down;
+            
+            _chartLines.push(_candleSeries.createPriceLine({
+                price: pos.entry_price, color: color, lineWidth: 2, lineStyle: 1, axisLabelVisible: true, title: `ENTRY ${pos.side}`
+            }));
+            _chartLines.push(_candleSeries.createPriceLine({
+                price: pos.take_profit, color: THEME.up, lineWidth: 1, lineStyle: 2, axisLabelVisible: true, title: 'TP'
+            }));
+            _chartLines.push(_candleSeries.createPriceLine({
+                price: pos.stop_loss, color: THEME.down, lineWidth: 1, lineStyle: 2, axisLabelVisible: true, title: 'SL'
+            }));
+            
+            // Hapus log local JS, ganti dengan data Go
+            renderTradesTableGo(d.active, d.history);
+        } else {
+             // Render table (History only)
+            renderTradesTableGo([], d.history || []);
+        }
+    } catch (e) {
+        // Abaikan fetch error ringan
+    }
+}
+
+function renderTradesTableGo(active, history) {
+    const tbody = document.getElementById('trades-tbody');
+    if (!tbody) return;
+    
+    let html = '';
+    
+    // Render Active
+    if (active && active.length > 0) {
+        const p = active[0];
+        const cls = p.side === 'BUY' ? 'trade-win' : 'trade-loss';
+        const pnlColor = p.pnl >= 0 ? 'trade-win' : 'trade-loss';
+        const pnlSign = p.pnl >= 0 ? '+' : '';
+        html += `
+            <tr style="background: rgba(30, 41, 59, 0.5)">
+                <td>${p.time}</td>
+                <td class="${cls}">${p.side} (LIVE)</td>
+                <td>${p.entry_price.toFixed(4)}</td>
+                <td class="trade-win">${p.take_profit.toFixed(4)}</td>
+                <td class="trade-loss">${p.stop_loss.toFixed(4)}</td>
+                <td style="color:var(--accent)">OPEN</td>
+                <td class="${pnlColor}" style="font-weight:bold">${pnlSign}${p.pnl.toFixed(2)}%</td>
+            </tr>
+        `;
+    }
+    
+    // Render History
+    if (history && history.length > 0) {
+        history.slice(0, 20).forEach(p => {
+             const cls = p.side === 'BUY' ? 'trade-win' : 'trade-loss';
+             const pnlColor = p.pnl >= 0 ? 'trade-win' : 'trade-loss';
+             const pnlSign = p.pnl >= 0 ? '+' : '';
+             html += `
+                <tr>
+                    <td>${p.time}</td>
+                    <td class="${cls}">${p.side}</td>
+                    <td>${p.entry_price.toFixed(4)}</td>
+                    <td>${p.take_profit.toFixed(4)}</td>
+                    <td>${p.stop_loss.toFixed(4)}</td>
+                    <td class="${cls}">${p.status}</td>
+                    <td class="${pnlColor}">${pnlSign}${p.pnl.toFixed(2)}%</td>
+                </tr>
+            `;
+        });
+    }
+    
+    if (html === '') {
+        html = '<tr><td colspan="7" style="text-align:center; padding: 2rem; color:#64748B;">No trades yet (Dry Run / Paper Trading)</td></tr>';
+    }
+    
+    tbody.innerHTML = html;
+}
+
+// Fallback untuk history Javascript Local (akan ditimpa renderTradesTableGo kalau server Go idup)
 function renderTradesTable() {
-  const tbody = document.getElementById('trades-tbody');
-  if (!tradeHistory.length && !activeTrade) {
-    tbody.innerHTML = '<tr><td colspan="7" style="color:var(--text2);text-align:center;padding:10px">Belum ada trade</td></tr>';
-    return;
-  }
-  let rows = '';
-  if (activeTrade) {
-    rows += `<tr><td>${activeTrade.time}</td><td class="trade-open">${activeTrade.action}</td><td>${activeTrade.entry.toFixed(4)}</td><td class="trade-win">${activeTrade.tp.toFixed(4)}</td><td class="trade-loss">${activeTrade.sl.toFixed(4)}</td><td class="trade-open">OPEN</td><td class="trade-open">--</td></tr>`;
-  }
-  tradeHistory.slice(0, 20).forEach(t => {
-    const cls = t.result === 'WIN' ? 'trade-win' : 'trade-loss';
-    const pnl = (t.pnl_pct >= 0 ? '+' : '') + t.pnl_pct.toFixed(2) + '%';
-    rows += `<tr><td>${t.time}</td><td class="${cls}">${t.action}</td><td>${t.entry.toFixed(4)}</td><td>${t.tp.toFixed(4)}</td><td>${t.sl.toFixed(4)}</td><td class="${cls}">${t.result}</td><td class="${cls}">${pnl}</td></tr>`;
-  });
-  tbody.innerHTML = rows;
+    if (_chartLines.length > 0) return; // Dicegah agar tidak bentrok dengan Go
+    const tbody = document.getElementById('trades-tbody');
+    if (!tradeHistory.length && !activeTrade) {
+      tbody.innerHTML = '<tr><td colspan="7" style="color:var(--text2);text-align:center;padding:10px">Belum ada trade</td></tr>';
+      return;
+    }
+    let rows = '';
+    if (activeTrade) {
+      rows += `<tr><td>${activeTrade.time}</td><td class="trade-open">${activeTrade.action}</td><td>${activeTrade.entry.toFixed(4)}</td><td class="trade-win">${activeTrade.tp.toFixed(4)}</td><td class="trade-loss">${activeTrade.sl.toFixed(4)}</td><td class="trade-open">OPEN</td><td class="trade-open">--</td></tr>`;
+    }
+    tradeHistory.slice(0, 20).forEach(t => {
+      const cls = t.result === 'WIN' ? 'trade-win' : 'trade-loss';
+      const pnl = (t.pnl_pct >= 0 ? '+' : '') + t.pnl_pct.toFixed(2) + '%';
+      rows += `<tr><td>${t.time}</td><td class="${cls}">${t.action}</td><td>${t.entry.toFixed(4)}</td><td>${t.tp.toFixed(4)}</td><td>${t.sl.toFixed(4)}</td><td class="${cls}">${t.result}</td><td class="${cls}">${pnl}</td></tr>`;
+    });
+    tbody.innerHTML = rows;
 }
 
 function switchTab(name, btn) {
@@ -478,6 +578,7 @@ function toggleAutoScroll() {
   const btn = document.getElementById('btn-autoscroll');
   btn.style.borderColor = autoScroll ? 'var(--accent)' : '';
   btn.style.color = autoScroll ? 'var(--accent)' : '';
+  if (autoScroll) renderLogs();
 }
 
 async function clearLogs() {
@@ -516,7 +617,11 @@ async function poll() {
     const d = await r.json();
     if (d.logs && d.logs.length) {
       d.logs.forEach(parseLog);
-      logs = [...logs, ...d.logs].slice(-500); lastCount = d.total; renderLogs();
+      logs = [...logs, ...d.logs].slice(-500); 
+      lastCount = d.total; 
+    if (autoScroll) {
+          renderLogs();
+      }
     }
     updateStatus(d.running);
   } catch(e) {}
@@ -752,9 +857,17 @@ async function fetchAIInsight() {
     document.getElementById('ai-advice').textContent = d.advice || "-";
     document.getElementById('ai-ts').textContent = d.timestamp || "-";
     
-    document.getElementById('ai-entry').textContent = (d.entry_target || 0).toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 6});
-    document.getElementById('ai-tp').textContent = (d.tp_target || 0).toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 6});
-    document.getElementById('ai-sl').textContent = (d.sl_target || 0).toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 6});
+    // FIX: Hanya tampilkan target angka saat ada sinyal trading aktif.
+    // Jika WAIT, ubah jadi "-" biar lu tau AI sedang menganalisa.
+    if (d.signal_status === 'BUY' || d.signal_status === 'SELL') {
+        document.getElementById('ai-entry').textContent = (d.entry_target || 0).toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 6});
+        document.getElementById('ai-tp').textContent = (d.tp_target || 0).toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 6});
+        document.getElementById('ai-sl').textContent = (d.sl_target || 0).toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 6});
+    } else {
+        document.getElementById('ai-entry').textContent = "Menunggu Momen...";
+        document.getElementById('ai-tp').textContent = "-";
+        document.getElementById('ai-sl').textContent = "-";
+    }
     
     if (d.last_price && !stats.price) { stats.price = d.last_price; updatePriceStats(); }
     if (d.pct_24h !== undefined && d.pct_24h !== null) {
@@ -787,3 +900,4 @@ poll();
 setInterval(poll, 1500);
 setInterval(fetchAIInsight, 3000);
 setTimeout(connectLivePriceWS, 1000);
+setInterval(fetchPositions, 1000);
