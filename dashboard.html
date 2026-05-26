@@ -11,10 +11,12 @@
     <!-- Using CDN for simplicity in this single-file demo, in production use Tailwind CLI -->
     <script src="https://cdn.tailwindcss.com"></script>
     
-    <!-- Update Lightweight Charts to a stable v4 -->
-    <script src="https://unpkg.com/lightweight-charts@4.1.1/dist/lightweight-charts.standalone.production.js"></script>
-    <!-- Phosphor Icons -->
-    <script src="https://unpkg.com/@phosphor-icons/web"></script>
+    <!-- Bypassing Storage Block: Pakai jsdelivr langsung untuk Charts -->
+    <script src="https://cdn.jsdelivr.net/npm/lightweight-charts@4.1.1/dist/lightweight-charts.standalone.production.js"></script>
+    
+    <!-- Bypassing Storage Block: Load static CSS Phosphor Icons alih-alih JS loader -->
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@phosphor-icons/web@2.1.2/src/regular/style.css">
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@phosphor-icons/web@2.1.2/src/fill/style.css">
     
     <script>
         tailwind.config = {
