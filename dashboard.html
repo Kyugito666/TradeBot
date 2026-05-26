@@ -5,10 +5,8 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>TradeBot Quantum Control</title>
     
-    <!-- Favicon Dummy -->
     <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🤖</text></svg>">
     
-    <!-- Tailwind CSS (CDN for Dev) -->
     <script>
         const _warn = console.warn;
         console.warn = (...args) => {
@@ -32,15 +30,14 @@
         }
     </script>
     
-    <!-- Phosphor Icons -->
     <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@phosphor-icons/web@2.1.2/src/regular/style.css" crossorigin="anonymous">
     <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@phosphor-icons/web@2.1.2/src/fill/style.css" crossorigin="anonymous">
     
-    <!-- Custom CSS -->
-    <link rel="stylesheet" href="dashboard.css">
+    <!-- Sesuai dengan mux.Handle("/dashboard.css", ...) -->
+    <link rel="stylesheet" href="/dashboard.css">
     
-    <!-- Local Lightweight Charts (Ensure your Go server serves /static/ correctly with JS MIME type) -->
-    <script src="/static/lw-charts.js"></script>
+    <!-- Sesuai dengan mux.Handle("/lw-charts.js", ...) -->
+    <script src="/lw-charts.js"></script>
 </head>
 <body class="flex h-screen w-full selection:bg-brand-500/30 selection:text-brand-200">
 
@@ -54,33 +51,32 @@
         <nav class="flex-1 py-6 flex flex-col gap-2 px-3">
             <a href="#" class="flex items-center gap-3 px-3 py-2.5 rounded-lg bg-brand-500/10 text-brand-400 border border-brand-500/20 transition-colors group">
                 <i class="ph ph-squares-four text-xl group-hover:scale-110 transition-transform"></i>
-                <span class="font-medium text-sm hidden md:block">Dashboard</span>
+                <span class="font-medium text-sm hidden md:block">Dasbor</span>
             </a>
             <a href="#" class="flex items-center gap-3 px-3 py-2.5 rounded-lg text-slate-400 hover:text-white hover:bg-slate-800/50 transition-colors group">
                 <i class="ph ph-chart-line-up text-xl group-hover:scale-110 transition-transform"></i>
-                <span class="font-medium text-sm hidden md:block">Market Data</span>
+                <span class="font-medium text-sm hidden md:block">Data Pasar</span>
             </a>
             <a href="#" class="flex items-center gap-3 px-3 py-2.5 rounded-lg text-slate-400 hover:text-white hover:bg-slate-800/50 transition-colors group">
                 <i class="ph ph-robot text-xl group-hover:scale-110 transition-transform"></i>
-                <span class="font-medium text-sm hidden md:block">Rust Brain Agents</span>
+                <span class="font-medium text-sm hidden md:block">Agen Rust Brain</span>
             </a>
             <a href="#" class="flex items-center gap-3 px-3 py-2.5 rounded-lg text-slate-400 hover:text-white hover:bg-slate-800/50 transition-colors group">
                 <i class="ph ph-brain text-xl group-hover:scale-110 transition-transform"></i>
-                <span class="font-medium text-sm hidden md:block">NLP Sentiment</span>
+                <span class="font-medium text-sm hidden md:block">Sentimen NLP</span>
             </a>
         </nav>
 
         <div class="p-4 border-t border-slate-800">
             <a href="#" class="flex items-center gap-3 px-3 py-2.5 rounded-lg text-slate-400 hover:text-white hover:bg-slate-800/50 transition-colors">
                 <i class="ph ph-gear text-xl"></i>
-                <span class="font-medium text-sm hidden md:block">Settings</span>
+                <span class="font-medium text-sm hidden md:block">Pengaturan</span>
             </a>
         </div>
     </aside>
 
     <!-- Main Content -->
     <main class="flex-1 flex flex-col h-screen overflow-hidden relative">
-        <!-- Grid Background Pattern -->
         <div class="absolute inset-0 z-0 opacity-[0.03] pointer-events-none" style="background-image: linear-gradient(#38bdf8 1px, transparent 1px), linear-gradient(90deg, #38bdf8 1px, transparent 1px); background-size: 30px 30px;"></div>
 
         <!-- Header -->
@@ -89,20 +85,20 @@
                 <button class="md:hidden text-slate-400 hover:text-white">
                     <i class="ph ph-list text-2xl"></i>
                 </button>
-                <h1 class="text-xl font-semibold">System Overview</h1>
+                <h1 class="text-xl font-semibold">Tinjauan Sistem</h1>
                 
                 <!-- AUTO TRADING CONTROL -->
                 <div class="ml-4 flex items-center gap-2 bg-slate-800/80 p-1 rounded-lg border border-slate-700">
-                    <span class="text-xs font-semibold text-slate-400 pl-2 pr-1">AUTO TRADING</span>
+                    <span class="text-xs font-semibold text-slate-400 pl-2 pr-1">PERDAGANGAN OTOMATIS</span>
                     <button id="btn-toggle-bot" class="flex items-center gap-2 px-4 py-1.5 rounded-md bg-rose-500/20 text-rose-400 border border-rose-500/30 hover:bg-rose-500/30 transition-all font-medium text-sm" onclick="toggleBot()">
                         <i class="ph-fill ph-stop-circle text-lg" id="icon-bot-state"></i>
-                        <span id="text-bot-state">STOPPED</span>
+                        <span id="text-bot-state">BERHENTI</span>
                     </button>
                 </div>
 
                 <div class="hidden sm:flex items-center gap-2 px-3 py-1 rounded-full bg-emerald-500/10 text-emerald-400 text-xs font-medium border border-emerald-500/20 ml-2" id="gateway-status">
                     <span class="w-2 h-2 rounded-full bg-emerald-500 pulse-ring"></span>
-                    Gateway: Online
+                    Gateway: Daring
                 </div>
             </div>
             
@@ -128,15 +124,15 @@
                     <div class="absolute -right-4 -top-4 w-24 h-24 bg-brand-500/10 rounded-full blur-2xl"></div>
                     <div class="flex justify-between items-start mb-4">
                         <div>
-                            <p class="text-sm font-medium text-slate-400 mb-1">Current AI Signal</p>
-                            <h3 class="text-2xl font-bold text-slate-400" id="ai-signal-text">WAITING</h3>
+                            <p class="text-sm font-medium text-slate-400 mb-1">Sinyal AI Saat Ini</p>
+                            <h3 class="text-2xl font-bold text-slate-400" id="ai-signal-text">MENUNGGU</h3>
                         </div>
                         <div class="p-2 rounded-lg bg-slate-800 text-white border border-slate-700">
                             <i class="ph ph-lightning text-xl text-brand-400"></i>
                         </div>
                     </div>
                     <div class="flex items-center text-sm gap-2">
-                        <span class="px-2 py-0.5 rounded text-xs font-bold bg-brand-500/20 text-brand-400 border border-brand-500/20">CONFIDENCE: --%</span>
+                        <span class="px-2 py-0.5 rounded text-xs font-bold bg-brand-500/20 text-brand-400 border border-brand-500/20">KEYAKINAN: --%</span>
                         <span class="text-slate-500 text-xs font-mono">BTC/USDT</span>
                     </div>
                 </div>
@@ -145,7 +141,7 @@
                 <div class="glass-panel p-5 rounded-2xl">
                     <div class="flex justify-between items-start mb-4">
                         <div>
-                            <p class="text-sm font-medium text-slate-400 mb-1">24h PnL</p>
+                            <p class="text-sm font-medium text-slate-400 mb-1">PnL 24j</p>
                             <h3 class="text-2xl font-bold text-emerald-400">+$1,240.50</h3>
                         </div>
                         <div class="p-2 rounded-lg bg-emerald-500/10 text-emerald-400 border border-emerald-500/20">
@@ -154,7 +150,7 @@
                     </div>
                     <div class="flex items-center text-sm">
                         <span class="text-emerald-400 font-medium">+2.4%</span>
-                        <span class="text-slate-500 ml-2">vs yesterday</span>
+                        <span class="text-slate-500 ml-2">vs kemarin</span>
                     </div>
                 </div>
 
@@ -162,7 +158,7 @@
                 <div class="glass-panel p-5 rounded-2xl">
                     <div class="flex justify-between items-start mb-4">
                         <div>
-                            <p class="text-sm font-medium text-slate-400 mb-1">Win Rate (30d)</p>
+                            <p class="text-sm font-medium text-slate-400 mb-1">Tingkat Menang (30h)</p>
                             <h3 class="text-2xl font-bold text-white">68.5%</h3>
                         </div>
                         <div class="p-2 rounded-lg bg-purple-500/10 text-purple-400 border border-purple-500/20">
@@ -178,7 +174,7 @@
                 <div class="glass-panel p-5 rounded-2xl">
                     <div class="flex justify-between items-start mb-4">
                         <div>
-                            <p class="text-sm font-medium text-slate-400 mb-1">Active Positions</p>
+                            <p class="text-sm font-medium text-slate-400 mb-1">Posisi Aktif</p>
                             <h3 class="text-2xl font-bold text-white">3</h3>
                         </div>
                         <div class="p-2 rounded-lg bg-orange-500/10 text-orange-400 border border-orange-500/20">
@@ -198,12 +194,12 @@
                 <div class="lg:col-span-2 glass-panel rounded-2xl flex flex-col h-[400px]">
                     <div class="p-4 border-b border-slate-800 flex justify-between items-center">
                         <h2 class="font-semibold text-white flex items-center gap-2">
-                            <i class="ph-fill ph-chart-bar text-brand-400"></i> Market Overview (BTC/USDT)
+                            <i class="ph-fill ph-chart-bar text-brand-400"></i> Tinjauan Pasar (BTC/USDT)
                         </h2>
                         <div class="flex gap-2">
                             <button class="px-2 py-1 rounded bg-slate-800 text-xs text-slate-300 hover:bg-slate-700 transition">15m</button>
-                            <button class="px-2 py-1 rounded bg-brand-600 text-xs text-white shadow shadow-brand-500/20 transition">1H</button>
-                            <button class="px-2 py-1 rounded bg-slate-800 text-xs text-slate-300 hover:bg-slate-700 transition">4H</button>
+                            <button class="px-2 py-1 rounded bg-brand-600 text-xs text-white shadow shadow-brand-500/20 transition">1J</button>
+                            <button class="px-2 py-1 rounded bg-slate-800 text-xs text-slate-300 hover:bg-slate-700 transition">4J</button>
                         </div>
                     </div>
                     <div id="chart-container" class="flex-1 w-full relative">
@@ -215,16 +211,16 @@
                 <div class="glass-panel rounded-2xl flex flex-col h-[400px]">
                     <div class="p-4 border-b border-slate-800 flex justify-between items-center">
                         <h2 class="font-semibold text-white flex items-center gap-2">
-                            <i class="ph-fill ph-list-dashes text-brand-400"></i> Recent Actions
+                            <i class="ph-fill ph-list-dashes text-brand-400"></i> Tindakan Terbaru
                         </h2>
                     </div>
                     <div class="flex-1 overflow-y-auto p-2">
                         <table class="w-full text-sm text-left">
                             <thead class="text-xs text-slate-400 uppercase bg-slate-900/50 sticky top-0">
                                 <tr>
-                                    <th class="px-4 py-3 rounded-tl-lg">Pair</th>
-                                    <th class="px-4 py-3">Side</th>
-                                    <th class="px-4 py-3 text-right rounded-tr-lg">Price</th>
+                                    <th class="px-4 py-3 rounded-tl-lg">Pasangan</th>
+                                    <th class="px-4 py-3">Sisi</th>
+                                    <th class="px-4 py-3 text-right rounded-tr-lg">Harga</th>
                                 </tr>
                             </thead>
                             <tbody id="orders-body" class="font-mono text-xs">
@@ -236,7 +232,7 @@
             </div>
             
             <div class="mt-6 text-center text-xs text-slate-500 font-mono pb-4">
-                TradeBot Core System &middot; Inter-Process Communication Active &middot; Rust x Go
+                Sistem Inti TradeBot &middot; Komunikasi Antar-Proses Aktif &middot; Rust x Go
             </div>
         </div>
     </main>
@@ -244,7 +240,7 @@
     <!-- Toast Container -->
     <div id="toast-container" class="fixed bottom-4 right-4 flex flex-col gap-2 z-50"></div>
 
-    <!-- Main Logic -->
-    <script src="dashboard.js" defer></script>
+    <!-- Sesuai dengan mux.Handle("/dashboard.js", ...) -->
+    <script src="/dashboard.js"></script>
 </body>
 </html>
