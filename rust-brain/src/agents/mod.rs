@@ -1,8 +1,4 @@
 // rust-brain/src/agents/mod.rs
-//
-// Defines the universal contract all 6 agents must fulfill.
-// Each agent is a pure function: MarketSnapshot → AgentVote.
-// All agents run in parallel via rayon::join chains.
 
 pub mod absurdist;
 pub mod cryptographer;
@@ -13,11 +9,8 @@ pub mod physicist;
 
 use crate::shm::MarketSnapshot;
 
-// ── Canonical vote structure ─────────────────────────────────────────────────
-
-#[repr(u8)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Direction { Wait = 0, Buy = 1, Sell = 2 }
+// ── RE-EXPORT DIRECTION DARI SHM AGAR TIDAK DUPLIKAT ─────────────────────────
+pub use crate::shm::Direction;
 
 #[derive(Debug, Clone)]
 pub struct AgentVote {
@@ -33,16 +26,8 @@ impl AgentVote {
     }
 }
 
-/// Every agent implements this trait. It is intentionally synchronous —
-/// rayon handles the parallelism at the call site in main.rs.
-pub trait Agent: Send + Sync {
-    fn name(&self) -> &'static str;
-    fn analyze(&self, snap: &MarketSnapshot) -> AgentVote;
-}
-
 // ── Utility: basic stats used by multiple agents ─────────────────────────────
 
-/// Compute closes slice from snapshot
 pub fn closes(snap: &MarketSnapshot) -> Vec<f64> {
     snap.candles.iter().map(|c| c.close).collect()
 }
@@ -59,7 +44,6 @@ pub fn volumes(snap: &MarketSnapshot) -> Vec<f64> {
     snap.candles.iter().map(|c| c.vol).collect()
 }
 
-/// Wilder-smoothed RSI (period 14)
 pub fn rsi(closes: &[f64], period: usize) -> f64 {
     if closes.len() < period + 1 { return 50.0; }
 
@@ -79,7 +63,6 @@ pub fn rsi(closes: &[f64], period: usize) -> f64 {
     100.0 - 100.0 / (1.0 + avg_up / avg_down)
 }
 
-/// Z-score of last element over a rolling window
 pub fn zscore(series: &[f64], window: usize) -> f64 {
     if series.len() < window { return 0.0; }
     let w = &series[series.len() - window..];
@@ -90,8 +73,6 @@ pub fn zscore(series: &[f64], window: usize) -> f64 {
     (series.last().unwrap() - mean) / std
 }
 
-/// Bayesian update of prior probability with a piece of evidence
-///   P(Up | E) = P(E | Up) * P(Up) / P(E)
 pub fn bayesian_update(prior_up: f64, lik_up: f64, lik_down: f64) -> f64 {
     let prior_down = 1.0 - prior_up;
     let evidence   = lik_up * prior_up + lik_down * prior_down;
@@ -99,7 +80,6 @@ pub fn bayesian_update(prior_up: f64, lik_up: f64, lik_down: f64) -> f64 {
     (lik_up * prior_up) / evidence
 }
 
-/// Wilder 14-period ATR from raw slices
 pub fn wilder_atr(highs: &[f64], lows: &[f64], closes: &[f64], period: usize) -> f64 {
     if closes.len() < 2 { return 0.0; }
     let tr: Vec<f64> = (1..closes.len()).map(|i| {
@@ -116,4 +96,9 @@ pub fn wilder_atr(highs: &[f64], lows: &[f64], closes: &[f64], period: usize) ->
         atr = atr * (1.0 - alpha) + t * alpha;
     }
     atr
+}
+
+pub trait Agent: Send + Sync {
+    fn name(&self) -> &'static str;
+    fn analyze(&self, snap: &MarketSnapshot) -> AgentVote;
 }
