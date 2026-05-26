@@ -1,10 +1,10 @@
-// dashboard.js — TradeBot v3.0.2
-// FIXES:
-// [FIX-1] OI: improved timestamp detection (ms + seconds range)
-// [FIX-2] Percentage: WS ticker is sole source, bot_insight pct_24h NEVER overrides
-// [FIX-3] AI INSIGHT → AI SIGNAL: independent multi-pair scanner, jalan tanpa bot
-// [FIX-4] Markers: retry mechanism + guard kalau chart belum ready
-// [FIX-5] Trade history: fix guard condition yang block render
+// dashboard.js — TradeBot v3.0.3
+// FIXES vs v3.0.2:
+// [FIX-1] AI INSIGHT → AI SIGNAL: ensureSignalPaneReady() dipanggil di boot, tidak lazy lagi
+// [FIX-2] _lastAIScanResults global → selectAISignalPair bisa add chart markers + TP/SL lines
+// [FIX-3] selectAISignalPair: saat klik signal card, langsung tampilkan marker + price lines di chart
+// [FIX-4] OI: explicit reset ke '—' jika nilai tidak valid, hindari stale display
+// [FIX-5] Tab label AI SIGNAL langsung set di HTML (ensureSignalPaneReady juga set ini tapi nowait)
 
 let logs = [];
 let filterLevel = 'ALL';
@@ -19,6 +19,9 @@ let _chartReady = false;
 let _lastCandleTs = 0;
 let priceHistory = [];
 const MAX_CHART_POINTS = 150;
+
+// [FIX-2] Global untuk store hasil AI scan terakhir
+let _lastAIScanResults = [];
 
 let stats = {
   price: null, prevPrice: null, atr: null, oi: null, oiTime: null,
@@ -140,7 +143,6 @@ const PARSERS = [
   } },
   { re: /\[OI\]\s+\S+\s+oi=([\d.]+)/, fn(m) { 
       const raw = parseFloat(m[1]);
-      // [FIX-1] Jangan set OI kalau nilainya kelihatan seperti Unix timestamp
       if (!isLikelyTimestamp(raw)) { stats.oi = raw; stats.oiTime = new Date().toLocaleTimeString(); updateOIStats(); }
   } },
   { re: /\[WHALE\]\s+\S+\s+LSR=([\d.]+)\s+bias=(\w+)/, fn(m) { stats.lsr = parseFloat(m[1]); stats.bias = m[2]; updateLSRStats(); } },
@@ -178,16 +180,11 @@ function parseLog(log) {
     for (const p of PARSERS) { const m = log.msg.match(p.re); if (m) { p.fn(m, log); break; } } 
 }
 
-// ── [FIX-1] Helper: deteksi apakah nilai itu Unix timestamp ──────────────────
-// Unix ms timestamp untuk tahun 2020-2035: 1.58e12 – 2.05e12
-// Unix sec timestamp untuk tahun 2020-2035: 1.58e9 – 2.05e9
+// [FIX-OI] Helper: deteksi apakah nilai itu Unix timestamp
 function isLikelyTimestamp(v) {
     if (!v || isNaN(v)) return false;
-    // Range Unix ms (milli): tahun 2020-2035
     if (v >= 1.58e12 && v <= 2.05e12) return true;
-    // Range Unix sec: tahun 2020-2035
     if (v >= 1.58e9 && v <= 2.05e9) return true;
-    // Value gila, pasti bukan OI real
     if (v > 1e11) return true;
     return false;
 }
@@ -242,15 +239,12 @@ function updatePriceStats() {
   }
 }
 
-// [FIX-1] OI display — validasi timestamp lebih ketat
+// [FIX-OI] Display — validasi ketat, jangan tampilkan timestamp sebagai OI
 function updateOIStats() {
   const v = stats.oi;
-  if (!v || isNaN(v)) return;
-
-  // Sanity check: nilai seperti Unix timestamp = bukan OI
-  if (isLikelyTimestamp(v)) {
+  if (!v || isNaN(v) || isLikelyTimestamp(v)) {
     document.getElementById('stat-oi').textContent = '—';
-    document.getElementById('stat-oi-time').textContent = 'data err';
+    document.getElementById('stat-oi-time').textContent = isLikelyTimestamp(v) ? 'data err' : '--';
     return;
   }
   
@@ -419,7 +413,7 @@ function _resetLiveCandle() { _liveCandle = null; }
 
 let _pendingMarkers = [];
 
-// [FIX-4] addSignalMarker dengan retry kalau chart belum ready
+// [FIX-MARKER] addSignalMarker dengan retry kalau chart belum ready
 function addSignalMarker(action, price) {
   const tf = parseInt(_currentTf) || 5; const tfSec = tf * 60;
   const now = Math.floor(Date.now() / 1000);
@@ -428,7 +422,6 @@ function addSignalMarker(action, price) {
   if (_pendingMarkers.length > 50) _pendingMarkers.shift();
   priceHistory.push({ price, time: Date.now(), signal: action });
   if (priceHistory.length > MAX_CHART_POINTS) priceHistory.shift();
-  // Retry apply dengan sedikit delay kalau chart belum siap
   if (_candleSeries && _lastCandleTs) {
     _applyMarkers();
   } else {
@@ -436,7 +429,6 @@ function addSignalMarker(action, price) {
   }
 }
 
-// [FIX-4] _applyMarkers dengan null guard
 function _applyMarkers() {
   if (!_candleSeries || !_pendingMarkers.length) return;
   try {
@@ -515,22 +507,17 @@ async function fetchPositions() {
 
         if (d.active && d.active.length > 0) {
             const pos = d.active[0];
-            const upColor   = '#00e5a0';
-            const downColor = '#ef4444';
-            
             try {
                 _chartLines.push(_candleSeries.createPriceLine({ price: pos.entry_price, color: '#3b82f6', lineWidth: 2, lineStyle: 0, axisLabelVisible: true, title: `ENTRY ${pos.side}` }));
-                _chartLines.push(_candleSeries.createPriceLine({ price: pos.take_profit, color: upColor, lineWidth: 1, lineStyle: 2, axisLabelVisible: true, title: 'TP' }));
-                _chartLines.push(_candleSeries.createPriceLine({ price: pos.stop_loss, color: downColor, lineWidth: 1, lineStyle: 2, axisLabelVisible: true, title: 'SL' }));
+                _chartLines.push(_candleSeries.createPriceLine({ price: pos.take_profit, color: '#00e5a0', lineWidth: 1, lineStyle: 2, axisLabelVisible: true, title: 'TP' }));
+                _chartLines.push(_candleSeries.createPriceLine({ price: pos.stop_loss, color: '#ef4444', lineWidth: 1, lineStyle: 2, axisLabelVisible: true, title: 'SL' }));
             } catch(e) {}
             
             renderTradesTableGo(d.active, d.history || []);
         } else {
             renderTradesTableGo([], d.history || []);
         }
-    } catch (e) {
-        // Bot mungkin tidak running, skip
-    }
+    } catch (e) {}
 }
 
 function renderTradesTableGo(active, history) {
@@ -583,11 +570,10 @@ function renderTradesTableGo(active, history) {
     tbody.innerHTML = html;
 }
 
-// [FIX-5] renderTradesTable — hapus guard yang block render pas Go API available
+// [FIX-5] renderTradesTable — hapus guard yang block render
 function renderTradesTable() {
     const tbody = document.getElementById('trades-tbody');
     if (!tbody) return;
-    // Kalau Go API punya active position, skip (biar Go yang handle)
     if (_chartLines.length > 0 && (activeTrade === null && tradeHistory.length === 0)) return;
     if (!tradeHistory.length && !activeTrade) {
       tbody.innerHTML = '<tr><td colspan="7" style="color:var(--text2);text-align:center;padding:10px">Belum ada trade</td></tr>';
@@ -622,7 +608,6 @@ function switchTab(name, btn) {
      }, 50);
    }
    if (name === 'insight') {
-     // AI SIGNAL pane - ensure scanner is init
      ensureSignalPaneReady();
    }
 }
@@ -836,6 +821,8 @@ function _onSymbolChange(sym) {
     if (_candleSeries) try { _candleSeries.setData([]); } catch(e) {}
     if (_volSeries) try { _volSeries.setData([]); } catch(e) {}
     _pendingMarkers = [];
+    // [FIX-CHART] Clear TP/SL lines saat ganti symbol
+    setTpSlLines(null, null, null);
     stats.price = null; stats.prevPrice = null;
     document.getElementById('hdr-price').textContent = "--";
     document.getElementById('stat-price').textContent = "--";
@@ -846,6 +833,8 @@ function onExchangeChange(val) { loadBybitPairs(val); updateLeverageLimits(); sa
 let _wsTicker = null;
 function _getLiveSymbol() { const sel = document.getElementById('cfg-symbol'); return (sel && sel.value) ? sel.value.replace('_','') : 'BTCUSDT'; }
 
+// [FIX-3] WS ticker: sumber tunggal untuk price + 24h%
+// price24hPcnt dari Bybit WS = decimal form (e.g. 0.0117 = +1.17%)
 function connectLivePriceWS() {
   const sym = _getLiveSymbol(); 
   if (_wsTicker) { _wsTicker.close(); _wsTicker = null; }
@@ -867,11 +856,11 @@ function connectLivePriceWS() {
             }
         }
         
-        // [FIX-2] Percentage SELALU dari WS ticker, kalikan 100 (Bybit WS selalu decimal form)
+        // 24h% HANYA dari WS ticker, bukan dari bot_insight
         if (ticker.price24hPcnt !== undefined) {
             const raw = parseFloat(ticker.price24hPcnt);
             if (!isNaN(raw)) {
-                const pct24h = raw * 100;
+                const pct24h = raw * 100; // Bybit kirim decimal form
                 const deltaEl = document.getElementById('hdr-delta');
                 if (deltaEl) {
                     const sign = pct24h >= 0 ? '+' : '';
@@ -887,17 +876,22 @@ function connectLivePriceWS() {
   _wsTicker.onclose = () => setTimeout(connectLivePriceWS, 3000);
 }
 
-// [FIX-2] fetchAIInsight: pct_24h dari bot_insight TIDAK dipakai utk header delta
+// [FIX-OI] fetchAIInsight: pct_24h dari bot_insight TIDAK dipakai untuk header delta
+// Hanya OI, LSR, balance yang diambil (dan hanya jika valid)
 async function fetchAIInsight() {
   try {
     const r = await fetch('/api/insight'); const d = await r.json();
     
-    // Hanya update OI dari bot_insight kalau nilainya valid (bukan timestamp)
-    if (d.open_interest && !isLikelyTimestamp(d.open_interest)) { 
-        stats.oi = d.open_interest; 
-        stats.oiTime = d.timestamp; 
-        updateOIStats();
+    // OI: hanya update jika nilai valid (bukan timestamp)
+    if (d.open_interest !== undefined) {
+        if (!isLikelyTimestamp(d.open_interest) && d.open_interest > 0) { 
+            stats.oi = d.open_interest; 
+            stats.oiTime = d.timestamp; 
+            updateOIStats();
+        }
+        // jika timestamp / invalid: tampilkan '—' dan jangan update stats.oi
     }
+    
     if (d.lsr_val) { 
         stats.lsr = d.lsr_val; 
         let biasTxt = 'NEUTRAL'; 
@@ -917,16 +911,15 @@ async function fetchAIInsight() {
     }
     if (d.last_price && !stats.price) { stats.price = d.last_price; updatePriceStats(); }
     
-    // [FIX-2] TIDAK update hdr-delta dari bot_insight.pct_24h — itu ATR/price bukan 24h change!
-    // pct_24h dari bot_insight = (atr/price)*100 = volatility, bukan perubahan harga 24 jam.
-    // 24h% yang benar sudah dihandle oleh WS ticker di connectLivePriceWS.
+    // TIDAK update hdr-delta dari pct_24h bot_insight
+    // Karena pct_24h di bot_insight = (ATR/price)*100 = volatility, bukan 24h change
     
   } catch(e) {}
 }
 
 
 // ═══════════════════════════════════════════════════════════════════
-// [FIX-3] AI SIGNAL SCANNER — Independent, langsung ke Bybit publik
+// [FIX-6] AI SIGNAL SCANNER — Independent, langsung ke Bybit publik
 // Jalan tanpa bot, auto-update setiap 5 menit
 // ═══════════════════════════════════════════════════════════════════
 
@@ -938,7 +931,7 @@ const AI_SIGNAL_PAIRS = [
 let _aiSignalTimer = null;
 let _aiSignalPaneReady = false;
 
-// Inisialisasi pane AI SIGNAL (replace konten static dari HTML)
+// [FIX-1] Inisialisasi pane AI SIGNAL — dipanggil di boot sequence juga
 function ensureSignalPaneReady() {
     if (_aiSignalPaneReady) return;
     _aiSignalPaneReady = true;
@@ -952,7 +945,7 @@ function ensureSignalPaneReady() {
             <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px;flex-wrap:wrap;gap:8px;border-bottom:1px solid var(--border);padding-bottom:12px;">
                 <div>
                     <div style="font-family:var(--mono);color:var(--accent);font-size:13px;font-weight:600;letter-spacing:2px;">🎯 AI SIGNAL SCANNER</div>
-                    <div style="font-family:var(--mono);font-size:9px;color:var(--text2);margin-top:3px;">Independent • Langsung ke Bybit • Tanpa bot</div>
+                    <div style="font-family:var(--mono);font-size:9px;color:var(--text2);margin-top:3px;">Independent • Langsung ke Bybit • Tanpa bot • Klik signal → tampil di chart</div>
                 </div>
                 <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
                     <span id="ai-scan-status" style="font-family:var(--mono);font-size:10px;color:var(--text2);">⟳ idle</span>
@@ -973,7 +966,8 @@ function ensureSignalPaneReady() {
             <!-- Signal cards grid -->
             <div id="ai-signal-grid" style="display:grid;gap:8px;grid-template-columns:repeat(auto-fill,minmax(290px,1fr));">
                 <div style="color:var(--text2);font-family:var(--mono);font-size:12px;padding:30px;text-align:center;grid-column:1/-1;border:1px dashed var(--border);border-radius:6px;">
-                    Klik <strong style="color:var(--accent)">⚡ SCAN</strong> untuk mulai analisa ${AI_SIGNAL_PAIRS.length} pair sekaligus
+                    Klik <strong style="color:var(--accent)">⚡ SCAN</strong> untuk analisa ${AI_SIGNAL_PAIRS.length} pair sekaligus<br>
+                    <span style="font-size:10px;opacity:0.6;margin-top:6px;display:block;">Klik kartu signal → tampil di chart + entry/TP/SL lines</span>
                 </div>
             </div>
         </div>
@@ -1061,7 +1055,6 @@ function _analyzeSignal(symbol, candles) {
     
     if (atr < 1e-8) return null;
     
-    // Volume analysis (20 candle avg)
     const recentVols = candles.slice(-5).map(c => c.v);
     const histVols   = candles.slice(-25, -5).map(c => c.v);
     const avgVol     = histVols.reduce((s, v) => s + v, 0) / (histVols.length || 1);
@@ -1071,7 +1064,6 @@ function _analyzeSignal(symbol, candles) {
     let bullScore = 0, bearScore = 0;
     const reasons = [];
     
-    // RSI evidence
     if (rsi <= 25)       { bullScore += 3; reasons.push(`RSI ${rsi.toFixed(0)} (oversold++)`); }
     else if (rsi <= 35)  { bullScore += 2; reasons.push(`RSI ${rsi.toFixed(0)} (oversold)`); }
     else if (rsi <= 45)  { bullScore += 1; }
@@ -1079,7 +1071,6 @@ function _analyzeSignal(symbol, candles) {
     else if (rsi >= 65)  { bearScore += 2; reasons.push(`RSI ${rsi.toFixed(0)} (overbought)`); }
     else if (rsi >= 55)  { bearScore += 1; }
     
-    // EMA alignment (trend confirmation)
     const emaBullAlign = ema9 > ema21 && ema21 > ema50;
     const emaBearAlign = ema9 < ema21 && ema21 < ema50;
     if (emaBullAlign)     { bullScore += 2; reasons.push('EMA bull align'); }
@@ -1087,61 +1078,49 @@ function _analyzeSignal(symbol, candles) {
     else if (ema9 > ema21){ bullScore += 1; }
     else                  { bearScore += 1; }
     
-    // Price vs EMA50
     if (price > ema50 * 1.002) { bullScore += 1; }
     else if (price < ema50 * 0.998) { bearScore += 1; }
     
-    // Volume spike confirmation
     if (volRatio > 1.8) {
         const last = candles[candles.length - 1];
         if (last.c > last.o) { bullScore += 1; reasons.push(`Vol ${volRatio.toFixed(1)}x spike`); }
         else                 { bearScore += 1; reasons.push(`Vol ${volRatio.toFixed(1)}x spike`); }
     }
     
-    // Candlestick patterns
     const last = candles[candles.length - 1];
     const prev = candles[candles.length - 2];
     const prev2 = candles[candles.length - 3];
     
-    // Bullish engulfing
-    if (last.c > last.o && prev.c < prev.o &&
-        last.c > prev.o && last.o < prev.c) {
+    if (last.c > last.o && prev.c < prev.o && last.c > prev.o && last.o < prev.c) {
         bullScore += 2; reasons.push('Bullish engulf');
     }
-    // Bearish engulfing
-    if (last.c < last.o && prev.c > prev.o &&
-        last.c < prev.o && last.o > prev.c) {
+    if (last.c < last.o && prev.c > prev.o && last.c < prev.o && last.o > prev.c) {
         bearScore += 2; reasons.push('Bearish engulf');
     }
-    // Morning star (3 candle)
     if (prev2.c < prev2.o && Math.abs(prev.c - prev.o) < atr * 0.3 && last.c > last.o && last.c > (prev2.o + prev2.c) / 2) {
         bullScore += 2; reasons.push('Morning star');
     }
-    // Evening star
     if (prev2.c > prev2.o && Math.abs(prev.c - prev.o) < atr * 0.3 && last.c < last.o && last.c < (prev2.o + prev2.c) / 2) {
         bearScore += 2; reasons.push('Evening star');
     }
     
-    // Minimum score threshold for valid signal
     const minScore = 4;
     if (bullScore < minScore && bearScore < minScore) return null;
-    if (Math.abs(bullScore - bearScore) < 2) return null; // Terlalu confusing
+    if (Math.abs(bullScore - bearScore) < 2) return null;
     
     const isBull = bullScore > bearScore;
     const direction = isBull ? 'LONG' : 'SHORT';
     const score = isBull ? bullScore : bearScore;
     const confidence = Math.min(0.95, 0.35 + score * 0.08);
     
-    // TP/SL kalkulasi dengan ATR
     const slMult = 1.2;
-    const tpMult = rsi < 40 || rsi > 60 ? 2.8 : 2.2; // Lebih agresif kalau momentum kuat
+    const tpMult = rsi < 40 || rsi > 60 ? 2.8 : 2.2;
     
     const entry = price;
     const sl = isBull ? price - atr * slMult : price + atr * slMult;
     const tp = isBull ? price + atr * tpMult : price - atr * tpMult;
     const rr = Math.abs(tp - entry) / Math.abs(sl - entry);
     
-    // Skip kalau RR kurang bagus
     if (rr < 1.5) return null;
     
     return { symbol, direction, confidence, entry, tp, sl, rr, rsi, reasons, price, ema9, ema21, volRatio };
@@ -1164,7 +1143,6 @@ async function runAISignalScan() {
     const results = [];
     let scanned = 0, errors = 0;
     
-    // Scan semua pair secara concurrent (batch 5 sekaligus)
     const batchSize = 5;
     for (let i = 0; i < AI_SIGNAL_PAIRS.length; i += batchSize) {
         const batch = AI_SIGNAL_PAIRS.slice(i, i + batchSize);
@@ -1189,7 +1167,6 @@ async function runAISignalScan() {
             else if (res.status === 'rejected') errors++;
         }
         
-        // Update grid secara progressive
         if (results.length > 0) _renderAISignals(results, scanned, tf);
     }
     
@@ -1219,16 +1196,20 @@ function _renderAIScanStats(results, total, errors, el) {
     `).join('');
 }
 
+// [FIX-2] _renderAISignals: simpan ke _lastAIScanResults global
 function _renderAISignals(results, total, tf) {
     const gridEl = document.getElementById('ai-signal-grid');
     if (!gridEl) return;
     
     if (!results.length) {
         gridEl.innerHTML = `<div style="color:var(--text2);font-family:var(--mono);font-size:12px;padding:30px;text-align:center;grid-column:1/-1;border:1px dashed var(--border);border-radius:6px;">Tidak ada sinyal kuat dari ${total} pair di TF ${tf}m.<br><span style="font-size:10px;opacity:0.6;">Coba TF lebih besar atau tunggu momentum terbentuk.</span></div>`;
+        _lastAIScanResults = [];
         return;
     }
     
     const sorted = [...results].sort((a, b) => b.confidence - a.confidence);
+    // [FIX-2] Simpan ke global supaya selectAISignalPair bisa akses
+    _lastAIScanResults = sorted;
     
     gridEl.innerHTML = sorted.map(s => {
         const isLong  = s.direction === 'LONG';
@@ -1276,18 +1257,35 @@ function _renderAISignals(results, total, tf) {
     }).join('');
 }
 
-// Klik signal card → pindah ke chart tab dengan pair tersebut
+// [FIX-3] Klik signal card → pindah ke chart + tampilkan marker + TP/SL lines
 function selectAISignalPair(symbol) {
+    // Ganti symbol di selector
     const sel = document.getElementById('cfg-symbol');
     if (sel && [...sel.options].some(o => o.value === symbol)) {
         sel.value = symbol;
         _onSymbolChange(symbol);
     }
+
+    // Cari signal dari hasil scan terakhir
+    const sig = _lastAIScanResults.find(s => s.symbol === symbol);
+    
     // Switch ke chart tab
     const chartBtn = document.querySelector('.tab[onclick*="chart"]');
     if (chartBtn) {
         switchTab('chart', chartBtn);
-        toast(`Pindah ke chart ${symbol}`, true);
+    }
+    
+    // [FIX-3] Setelah chart load candles baru, tambahkan marker dan TP/SL lines
+    if (sig) {
+        const action = sig.direction === 'LONG' ? 'BUY' : 'SELL';
+        toast(`📍 ${symbol} ${sig.direction} | Entry:${sig.entry.toFixed(sig.price < 10 ? 4 : 2)} TP:${sig.tp.toFixed(sig.price < 10 ? 4 : 2)} SL:${sig.sl.toFixed(sig.price < 10 ? 4 : 2)}`, true);
+        // Delay untuk kasih waktu chart load data pair baru
+        setTimeout(() => {
+            addSignalMarker(action, sig.price);
+            setTpSlLines(sig.entry, sig.tp, sig.sl);
+        }, 1200);
+    } else {
+        toast(`Chart: ${symbol}`, true);
     }
 }
 
@@ -1296,15 +1294,14 @@ function selectAISignalPair(symbol) {
 // Boot sequence
 // ═══════════════════════════════════════════════════════════════════
 
-const _BYBIT_INSTRUMENTS_URL_CONST = 'https://api.bytick.com/v5/market/instruments-info';
-
-async function loadBybitPairsConst(exchange) {
-  return loadBybitPairs(exchange);
-}
-
 loadConfig();
 loadSimState();
 loadBybitPairs('bybit');
+
+// [FIX-1] Init AI SIGNAL pane di startup, jangan lazy
+// Ini memastikan tab label langsung "AI SIGNAL" tanpa harus klik tab dulu
+ensureSignalPaneReady();
+
 poll();
 setInterval(poll, 1500);
 setInterval(fetchAIInsight, 3000);
