@@ -1,23 +1,4 @@
 // go-engine/gateway/server.go
-//
-// Dashboard HTTP Server — replaces bot_server.py
-// ================================================
-// Serves the existing dashboard.html / .js / .css without ANY change to the UI.
-// Provides EXACTLY the same REST endpoints bot_server.py exposed:
-//
-//   GET  /                  → dashboard.html
-//   GET  /api/insight       → bot_insight.json content
-//   GET  /api/logs          → last N log lines
-//   GET  /api/status        → {"running": bool}
-//   GET  /api/get-env       → current .env values
-//   POST /api/save-env      → write .env
-//   POST /api/start         → no-op (Go engine is always running)
-//   POST /api/stop          → graceful shutdown signal
-//   POST /api/clear-logs    → truncate log file
-//
-// bot_insight.json schema is IDENTICAL to what Python produced, so dashboard.js
-// requires ZERO changes.
-
 package gateway
 
 import (
@@ -28,7 +9,6 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
-	"regexp"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -43,8 +23,6 @@ const (
 	MaxLogLines = 500
 )
 
-// InsightData mirrors what Python main.py wrote to bot_insight.json.
-// All field names are IDENTICAL so dashboard.js needs no changes.
 type InsightData struct {
 	Symbol       string  `json:"symbol"`
 	LastPrice    float64 `json:"last_price"`
@@ -62,7 +40,6 @@ type InsightData struct {
 	SLTarget     float64 `json:"sl_target"`
 }
 
-// LogLine matches the parse format in dashboard.js
 type LogLine struct {
 	Ts    string `json:"ts"`
 	Level string `json:"level"`
@@ -70,51 +47,80 @@ type LogLine struct {
 	Msg   string `json:"msg"`
 }
 
-// Server is the HTTP server with a shared insight cache
-type Server struct {
-	mu      sync.RWMutex
-	insight InsightData
-	running atomic.Bool
-	stop    chan struct{}
-	baseDir string
+// Data model untuk Live Paper Trading
+type Position struct {
+	Side       string  `json:"side"`
+	EntryPrice float64 `json:"entry_price"`
+	TakeProfit float64 `json:"take_profit"`
+	StopLoss   float64 `json:"stop_loss"`
+	Time       string  `json:"time"`
+	Status     string  `json:"status"` // OPEN, CLOSED_TP, CLOSED_SL
+	PnL        float64 `json:"pnl"`
 }
 
-var logLineRE = regexp.MustCompile(
-	`^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}),\d+ \[(\w+)\] (.+?) - (.+)$`,
-)
+type Server struct {
+	mu         sync.RWMutex
+	insight    InsightData
+	running    atomic.Bool
+	botRunning atomic.Bool // Mengontrol status aktif trading via Dashboard
+	stop       chan struct{}
+	baseDir    string
+
+	// Storage in-memory untuk Paper Trading
+	activePos  *Position
+	history    []Position
+}
 
 func New(baseDir string) *Server {
-	return &Server{
+	s := &Server{
 		stop:    make(chan struct{}),
 		baseDir: baseDir,
 		insight: InsightData{SignalStatus: "WAIT", TrendState: "RANGING"},
+		history: make([]Position, 0),
 	}
+	s.botRunning.Store(false) // Mula-mula diset FALSE agar tidak langsung trading saat start
+	return s
 }
 
-// UpdateInsight is called by the orchestrator on every consensus cycle
 func (s *Server) UpdateInsight(d InsightData) {
 	s.mu.Lock()
 	s.insight = d
 	s.mu.Unlock()
 
-	// Also write to file so any external tool can read it
 	if b, err := json.Marshal(d); err == nil {
 		path := filepath.Join(s.baseDir, InsightFile)
 		_ = os.WriteFile(path, b, 0o644)
 	}
 }
 
-// Start launches the HTTP server; blocks until ctx is cancelled or Stop is called
+// Fungsi untuk injeksi data posisi dari Main Engine ke HTTP
+func (s *Server) UpdatePositions(active *Position, hist []Position) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	
+	if active != nil {
+		p := *active
+		s.activePos = &p
+	} else {
+		s.activePos = nil
+	}
+	
+	s.history = make([]Position, len(hist))
+	copy(s.history, hist)
+}
+
+func (s *Server) IsBotRunning() bool {
+	return s.botRunning.Load()
+}
+
 func (s *Server) Start() {
 	s.running.Store(true)
 	mux := http.NewServeMux()
 
-	// Static files: serve from baseDir (where dashboard.html lives)
 	mux.Handle("/dashboard.css", s.staticFile("dashboard.css"))
 	mux.Handle("/dashboard.js",  s.staticFile("dashboard.js"))
 	mux.Handle("/lw-charts.js",  s.staticFile("static/lw-charts.js"))
 
-	// Root → dashboard.html
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/" || r.URL.Path == "/dashboard.html" {
 			http.ServeFile(w, r, filepath.Join(s.baseDir, "dashboard.html"))
@@ -123,8 +129,8 @@ func (s *Server) Start() {
 		http.NotFound(w, r)
 	})
 
-	// API
 	mux.HandleFunc("/api/insight",    s.handleInsight)
+	mux.HandleFunc("/api/positions",  s.handlePositions) // Endpoint baru buat visual chart
 	mux.HandleFunc("/api/logs",       s.handleLogs)
 	mux.HandleFunc("/api/status",     s.handleStatus)
 	mux.HandleFunc("/api/get-env",    s.handleGetEnv)
@@ -158,13 +164,27 @@ func (s *Server) Stop() {
 	close(s.stop)
 }
 
-// ── Handlers ─────────────────────────────────────────────────────────────────
-
 func (s *Server) handleInsight(w http.ResponseWriter, r *http.Request) {
 	s.mu.RLock()
 	d := s.insight
 	s.mu.RUnlock()
 	s.jsonOK(w, d)
+}
+
+// Handler baru agar web tau bot lagi open posisi paper di angka berapa
+func (s *Server) handlePositions(w http.ResponseWriter, r *http.Request) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	activeArr := []Position{}
+	if s.activePos != nil {
+		activeArr = append(activeArr, *s.activePos)
+	}
+
+	s.jsonOK(w, map[string]interface{}{
+		"active":  activeArr,
+		"history": s.history,
+	})
 }
 
 func (s *Server) handleLogs(w http.ResponseWriter, r *http.Request) {
@@ -175,7 +195,6 @@ func (s *Server) handleLogs(w http.ResponseWriter, r *http.Request) {
 	raw, _ := os.ReadFile(path)
 	all := strings.Split(strings.TrimRight(string(raw), "\n"), "\n")
 
-	// Keep last 500
 	if len(all) > MaxLogLines {
 		all = all[len(all)-MaxLogLines:]
 	}
@@ -194,12 +213,12 @@ func (s *Server) handleLogs(w http.ResponseWriter, r *http.Request) {
 	s.jsonOK(w, map[string]interface{}{
 		"logs":    parsed,
 		"total":   len(all),
-		"running": s.running.Load(),
+		"running": s.botRunning.Load(),
 	})
 }
 
 func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
-	s.jsonOK(w, map[string]bool{"running": s.running.Load()})
+	s.jsonOK(w, map[string]bool{"running": s.botRunning.Load()})
 }
 
 func (s *Server) handleGetEnv(w http.ResponseWriter, r *http.Request) {
@@ -228,16 +247,15 @@ func (s *Server) handleSaveEnv(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleStart(w http.ResponseWriter, _ *http.Request) {
-	// Go engine is always running — this is a no-op kept for UI compat
-	s.jsonOK(w, map[string]interface{}{"ok": true, "message": "Go engine is always running."})
+	s.botRunning.Store(true)
+	log.Printf("[Dashboard] Engine START activated via web UI.")
+	s.jsonOK(w, map[string]interface{}{"ok": true, "message": "Bot trading engine started."})
 }
 
 func (s *Server) handleStop(w http.ResponseWriter, _ *http.Request) {
-	s.jsonOK(w, map[string]interface{}{"ok": true, "message": "Shutdown signal sent."})
-	go func() {
-		time.Sleep(300 * time.Millisecond)
-		s.Stop()
-	}()
+	s.botRunning.Store(false)
+	log.Printf("[Dashboard] Engine STOP activated via web UI. Orders locked to WAIT.")
+	s.jsonOK(w, map[string]interface{}{"ok": true, "message": "Bot trading engine stopped."})
 }
 
 func (s *Server) handleClearLogs(w http.ResponseWriter, r *http.Request) {
@@ -250,8 +268,6 @@ func (s *Server) handleClearLogs(w http.ResponseWriter, r *http.Request) {
 	}
 	s.jsonOK(w, map[string]bool{"ok": true})
 }
-
-// ── Helpers ───────────────────────────────────────────────────────────────────
 
 func (s *Server) staticFile(name string) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -274,15 +290,31 @@ func (s *Server) jsonErr(w http.ResponseWriter, msg string) {
 }
 
 func parseLogLine(line string) LogLine {
-	m := logLineRE.FindStringSubmatch(line)
-	if m != nil {
-		ts := ""
-		if len(m[1]) >= 16 { ts = m[1][11:16] }
-		name := m[3]
-		if len(name) > 14 { name = name[len(name)-14:] }
-		return LogLine{Ts: ts, Level: m[2], Name: name, Msg: m[4]}
+	if strings.HasPrefix(line, "[MONITOR]") {
+		return LogLine{Ts: time.Now().Format("15:04:05"), Level: "WARN", Name: "monitor", Msg: line}
 	}
-	return LogLine{Ts: "--:--", Level: "INFO", Name: "engine", Msg: line}
+	if strings.HasPrefix(line, "[202") {
+		parts := strings.SplitN(line, "]", 2)
+		if len(parts) == 2 {
+			meta := strings.Fields(strings.TrimPrefix(parts[0], "["))
+			if len(meta) >= 3 {
+				ts := meta[0]
+				if len(ts) >= 19 { ts = ts[11:19] }
+				return LogLine{Ts: ts, Level: meta[1], Name: "rust", Msg: strings.TrimSpace(parts[1])}
+			}
+		}
+	}
+	if strings.HasPrefix(line, "202") {
+		parts := strings.Fields(line)
+		if len(parts) >= 4 {
+			ts := parts[1]
+			if len(ts) >= 8 { ts = ts[:8] }
+			name := strings.Trim(parts[2], "[]")
+			msg := strings.Join(parts[3:], " ")
+			return LogLine{Ts: ts, Level: "INFO", Name: name, Msg: msg}
+		}
+	}
+	return LogLine{Ts: "--:--", Level: "INFO", Name: "sys", Msg: line}
 }
 
 func parseEnvFile(path string) map[string]string {
