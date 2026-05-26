@@ -123,7 +123,6 @@ var BearishTerms = map[string]float64{
 	"capitulation": -0.7,
 	"correction":   -0.5,
 	"pullback":     -0.4,
-	"dump":         -0.9,
 	"flash crash":  -0.9,
 	"flash-crash":  -0.9,
 	"insolvent":    -0.9,
