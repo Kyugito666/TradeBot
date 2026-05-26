@@ -1,268 +1,556 @@
 <!DOCTYPE html>
-<html lang="id">
+<html lang="en" class="dark">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width,initial-scale=1">
-    <title>BotTrade Dashboard</title>
-    <link rel="stylesheet" href="/dashboard.css">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>TradeBot Quantum Control</title>
+    
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://unpkg.com/lightweight-charts/dist/lightweight-charts.standalone.production.js"></script>
+    <!-- Phosphor Icons -->
+    <script src="https://unpkg.com/@phosphor-icons/web"></script>
+    
+    <script>
+        tailwind.config = {
+            darkMode: 'class',
+            theme: {
+                extend: {
+                    colors: {
+                        slate: {
+                            850: '#151e2e',
+                            900: '#0f172a',
+                            950: '#020617',
+                        },
+                        brand: {
+                            500: '#3b82f6',
+                            600: '#2563eb',
+                        },
+                        profit: '#10b981',
+                        loss: '#f43f5e'
+                    },
+                    fontFamily: {
+                        sans: ['Inter', 'sans-serif'],
+                        mono: ['Fira Code', 'monospace'],
+                    }
+                }
+            }
+        }
+    </script>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Fira+Code:wght@400;500&family=Inter:wght@300;400;500;600;700&display=swap');
+        
+        body {
+            font-family: 'Inter', sans-serif;
+            background-color: #0f172a;
+            color: #f8fafc;
+        }
+        
+        /* Custom Scrollbar */
+        ::-webkit-scrollbar {
+            width: 6px;
+            height: 6px;
+        }
+        ::-webkit-scrollbar-track {
+            background: #0f172a; 
+        }
+        ::-webkit-scrollbar-thumb {
+            background: #334155; 
+            border-radius: 10px;
+        }
+        ::-webkit-scrollbar-thumb:hover {
+            background: #475569; 
+        }
+
+        .glass-panel {
+            background: rgba(30, 41, 59, 0.7);
+            backdrop-filter: blur(12px);
+            -webkit-backdrop-filter: blur(12px);
+            border: 1px solid rgba(255, 255, 255, 0.05);
+        }
+
+        .pulse-ring {
+            animation: pulse-ring 2s cubic-bezier(0.215, 0.61, 0.355, 1) infinite;
+        }
+
+        @keyframes pulse-ring {
+            0% { transform: scale(0.8); box-shadow: 0 0 0 0 rgba(16, 185, 129, 0.7); }
+            70% { transform: scale(1); box-shadow: 0 0 0 10px rgba(16, 185, 129, 0); }
+            100% { transform: scale(0.8); box-shadow: 0 0 0 0 rgba(16, 185, 129, 0); }
+        }
+
+        /* Toast notifications */
+        #toast-container {
+            position: fixed;
+            bottom: 20px;
+            right: 20px;
+            z-index: 50;
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+        }
+        .toast {
+            transform: translateX(100%);
+            transition: transform 0.3s ease-out;
+        }
+        .toast.show {
+            transform: translateX(0);
+        }
+    </style>
 </head>
-<body>
-<header>
-  <div class="logo">⬡ BOTTRADE</div>
-  <div class="header-center">
-    <span class="live-price" id="hdr-price">--</span>
-    <span class="price-delta" id="hdr-delta" style="display:none"></span>
-    <span style="font-size:10px; color:var(--text2); font-family:var(--mono)" id="hdr-symbol">--</span>
-  </div>
-  <div class="status-pill">
-    <div class="dot" id="status-dot"></div>
-    <span id="status-text" style="font-size:11px">STOPPED</span>
-  </div>
-</header>
+<body class="h-screen flex overflow-hidden selection:bg-brand-500 selection:text-white">
 
-<main>
-  <aside class="sidebar">
-    <div>
-      <div class="section-title">Control</div>
-      <div class="btn-group">
-        <button class="btn btn-start" id="btn-start" onclick="startBot()">▶ START</button>
-        <button class="btn btn-stop" id="btn-stop" onclick="stopBot()" disabled>■ STOP</button>
-      </div>
-    </div>
-    
-    <div>
-      <div class="section-title">Trading Config</div>
-      <div class="card" id="config-form">
-        <label style="display:flex;justify-content:space-between;align-items:center">
-          Symbol (Futures)
-          <span id="pairs-status" style="font-size:9px;color:var(--text2);font-style:normal;letter-spacing:0;font-weight:400">⟳ loading…</span>
-        </label>
-        <select id="cfg-symbol" style="font-size:12px"><option value="BTCUSDT">BTCUSDT</option></select>
-        
-        <label>Exchange</label>
-        <select id="cfg-exchange" onchange="onExchangeChange(this.value)">
-          <option value="bybit">Bybit</option>
-          <option value="mexc">MEXC</option>
-        </select>
-        
-        <label>Mode</label>
-        <select id="cfg-mode">
-          <option value="demo">Demo (Testnet)</option>
-          <option value="real">Real (Mainnet)</option>
-        </select>
-
-        <label>Trading Style (Auto-Interval)</label>
-        <select id="cfg-style">
-          <option value="scalping">Scalping (Modal Tipis / Cepat)</option>
-          <option value="daytrade">Day Trader (Menengah / Harian)</option>
-          <option value="sniper">Sniper Swing (Modal Tebel / Sabar)</option>
-        </select>
-        
-        <label>TP/SL Target Type</label>
-        <select id="cfg-target-type">
-          <option value="RR">Risk/Reward (ATR-based)</option>
-          <option value="ROI">Target ROI %</option>
-          <option value="PNL">Fixed PnL ($)</option>
-        </select>
-
-        <label style="display:flex; justify-content:space-between; align-items:center;">
-          Leverage
-          <span id="lev-val-display" style="color:var(--accent); font-size:12px; font-weight:600;">10x</span>
-        </label>
-        <div style="display:flex; flex-direction:column; gap:6px;">
-          <input type="range" id="cfg-lev-slider" min="1" max="100" value="10" oninput="syncLev('slider')">
-          <div style="display:flex;gap:6px;align-items:center">
-            <input type="number" id="cfg-leverage" value="10" min="1" max="100" style="flex:1" oninput="syncLev('number')">
-            <span style="font-family:var(--mono);font-size:10px;color:var(--text2);white-space:nowrap">× isolated</span>
-          </div>
+    <!-- Sidebar -->
+    <aside class="w-64 border-r border-slate-800 bg-slate-900/50 flex flex-col hidden md:flex">
+        <div class="h-16 flex items-center px-6 border-b border-slate-800">
+            <i class="ph-fill ph-hexagon text-brand-500 text-3xl mr-2"></i>
+            <span class="font-bold text-lg tracking-wider text-white">TRADE<span class="text-brand-500">BOT</span></span>
         </div>
         
-        <label style="display:flex; justify-content:space-between; align-items:center; margin-top:10px;">
-          Margin Usage / Risk
-          <span id="risk-val-display" style="color:var(--accent); font-size:12px; font-weight:600;">3%</span>
-        </label>
-        <input type="range" id="cfg-risk" min="1" max="100" value="3" oninput="document.getElementById('risk-val-display').textContent = this.value + '%'" style="margin-top:6px; cursor:pointer; width:100%;">
+        <div class="flex-1 overflow-y-auto py-6 px-4 space-y-1">
+            <p class="px-2 text-xs font-semibold text-slate-500 uppercase tracking-wider mb-2">Main Menu</p>
+            <a href="#" class="flex items-center gap-3 px-3 py-2.5 rounded-lg bg-brand-500/10 text-brand-500 font-medium">
+                <i class="ph ph-squares-four text-xl"></i> Dashboard
+            </a>
+            <a href="#" class="flex items-center gap-3 px-3 py-2.5 rounded-lg text-slate-400 hover:text-white hover:bg-slate-800 transition-colors">
+                <i class="ph ph-chart-line-up text-xl"></i> Trading Terminal
+            </a>
+            <a href="#" class="flex items-center gap-3 px-3 py-2.5 rounded-lg text-slate-400 hover:text-white hover:bg-slate-800 transition-colors">
+                <i class="ph ph-list-dashes text-xl"></i> Order Book
+            </a>
+            
+            <p class="px-2 text-xs font-semibold text-slate-500 uppercase tracking-wider mt-8 mb-2">Engines</p>
+            <a href="#" class="flex items-center gap-3 px-3 py-2.5 rounded-lg text-slate-400 hover:text-white hover:bg-slate-800 transition-colors">
+                <i class="ph ph-cpu text-xl"></i> Go Engine (Market)
+            </a>
+            <a href="#" class="flex items-center gap-3 px-3 py-2.5 rounded-lg text-slate-400 hover:text-white hover:bg-slate-800 transition-colors">
+                <i class="ph ph-brain text-xl"></i> Rust Brain (Agents)
+            </a>
 
-        <div class="toggle-row" style="margin-top:12px">
-          <span class="toggle-label">Mock OHLCV</span>
-          <label class="toggle"><input type="checkbox" id="cfg-mock"><span class="slider"></span></label>
+            <p class="px-2 text-xs font-semibold text-slate-500 uppercase tracking-wider mt-8 mb-2">System</p>
+            <a href="#" class="flex items-center gap-3 px-3 py-2.5 rounded-lg text-slate-400 hover:text-white hover:bg-slate-800 transition-colors">
+                <i class="ph ph-plugs text-xl"></i> Integrations
+            </a>
+            <a href="#" class="flex items-center gap-3 px-3 py-2.5 rounded-lg text-slate-400 hover:text-white hover:bg-slate-800 transition-colors">
+                <i class="ph ph-gear text-xl"></i> Settings
+            </a>
         </div>
-        <div class="toggle-row">
-          <span class="toggle-label">Dry Run (simulasi)</span>
-          <label class="toggle"><input type="checkbox" id="cfg-dryrun"><span class="slider"></span></label>
-        </div>
-      </div>
-    </div>
-    
-    <div>
-      <div class="section-title">API Bybit (Demo)</div>
-      <div class="card">
-        <label>API Key</label>
-        <input type="password" id="key-bybit-demo-key" placeholder="••••••••••••">
-        <label>API Secret</label>
-        <input type="password" id="key-bybit-demo-secret" placeholder="••••••••••••">
-      </div>
-    </div>
-    
-    <div>
-      <div class="section-title">API Bybit (Real)</div>
-      <div class="card">
-        <label>API Key</label>
-        <input type="password" id="key-bybit-real-key" placeholder="••••••••••••">
-        <label>API Secret</label>
-        <input type="password" id="key-bybit-real-secret" placeholder="••••••••••••">
-      </div>
-    </div>
-    
-    <div>
-      <div class="section-title">API MEXC (Real)</div>
-      <div class="card">
-        <label>API Key</label>
-        <input type="password" id="key-mexc-key" placeholder="••••••••••••">
-        <label>API Secret</label>
-        <input type="password" id="key-mexc-secret" placeholder="••••••••••••">
-      </div>
-    </div>
-    
-    <button class="btn btn-save" onclick="saveConfig()" style="margin-top:auto" id="btn-save-cfg">💾 SAVE CONFIG</button>
-  </aside>
-
-  <section class="main-panel">
-    <div class="stats-row">
-      <div class="stat-card">
-        <div class="stat-label"><span class="dot-sm live" id="dot-price"></span>PRICE</div>
-        <div class="stat-value" id="stat-price">--</div>
-        <div class="stat-sub" id="stat-atr">ATR --</div>
-      </div>
-      <div class="stat-card">
-        <div class="stat-label"><span class="dot-sm live" id="dot-oi"></span>OPEN INTEREST</div>
-        <div class="stat-value small" id="stat-oi">--</div>
-        <div class="stat-sub" id="stat-oi-time">--</div>
-      </div>
-      <div class="stat-card">
-        <div class="stat-label"><span class="dot-sm live" id="dot-lsr"></span>WHALE LSR</div>
-        <div class="stat-value" id="stat-lsr">--</div>
-        <div class="bias-badge NEUTRAL" id="stat-bias">NEUTRAL</div>
-      </div>
-      <div class="stat-card">
-        <div class="stat-label">BALANCE</div>
-        <div class="stat-value small" id="stat-balance">
-          -- USDT 
-          <span id="stat-bal-pct" style="font-size:10px; opacity:0.7;"></span>
-        </div>
-        <div class="stat-sub" id="stat-risk">Risk --% / trade</div>
-      </div>
-      <div class="stat-card">
-        <div class="stat-label">WIN RATE</div>
-        <div class="stat-value" id="stat-winrate">--</div>
-        <div class="stat-sub" id="stat-trades">0 trades</div>
-      </div>
-      <div class="stat-card">
-        <div class="stat-label">SIM P&L</div>
-        <div class="stat-value" id="stat-pnl">+0.00%</div>
-        <div class="stat-sub" id="stat-pnl-sub">0 signals fired</div>
-      </div>
-    </div>
-
-    <div class="tab-bar">
-      <button class="tab active" onclick="switchTab('chart', this)">📈 CHART</button>
-      <button class="tab" onclick="switchTab('logs', this)">📋 LOGS</button>
-      <button class="tab" onclick="switchTab('insight', this)">🧠 AI INSIGHT</button>
-      <div class="tab-spacer"></div>
-      
-      <button class="icon-btn" id="btn-toggle-chart" onclick="toggleChart()" style="margin-right:8px; border-color:var(--border);">👁️ Hide Chart</button>
-
-      <div class="filter-btns" id="log-filter-btns" style="display:none">
-        <button class="fbtn active" data-lvl="ALL" onclick="setFilter(this)">ALL</button>
-        <button class="fbtn lvl-INFO" data-lvl="INFO" onclick="setFilter(this)">INFO</button>
-        <button class="fbtn lvl-WARNING" data-lvl="WARNING" onclick="setFilter(this)">WARN</button>
-        <button class="fbtn lvl-ERROR" data-lvl="ERROR" onclick="setFilter(this)">ERR</button>
-      </div>
-      <div class="log-actions">
-        <button class="icon-btn" id="btn-autoscroll" onclick="toggleAutoScroll()">⬇ Auto</button>
-        <button class="icon-btn" onclick="clearLogs()">🗑 Clear</button>
-        <button class="icon-btn" onclick="resetHistory()">Reset DB</button>
-      </div>
-    </div>
-    
-    <div class="tab-pane active" id="pane-chart">
-      <div class="chart-toolbar" id="chart-toolbar">
-        <div class="tf-btns" id="tf-btns">
-          <button class="tf-btn" data-tf="1" onclick="setTimeframe(this)">1m</button>
-          <button class="tf-btn" data-tf="3" onclick="setTimeframe(this)">3m</button>
-          <button class="tf-btn active" data-tf="5" onclick="setTimeframe(this)">5m</button>
-          <button class="tf-btn" data-tf="15" onclick="setTimeframe(this)">15m</button>
-          <button class="tf-btn" data-tf="60" onclick="setTimeframe(this)">1h</button>
-          <button class="tf-btn" data-tf="240" onclick="setTimeframe(this)">4h</button>
-        </div>
-        <span class="chart-status" id="chart-status">⟳ loading…</span>
-      </div>
-      <div class="chart-wrap" id="chart-wrapper">
-        <div id="chart-container"></div>
-        <div class="chart-empty" id="chart-empty"><div class="chart-empty-icon">◈</div><div>Memuat chart…</div></div>
-      </div>
-      <div class="chart-legend" id="chart-legend">
-        <div class="legend-item"><div class="legend-dot" style="background:#26a69a"></div>Bullish</div>
-        <div class="legend-item"><div class="legend-dot" style="background:#ef5350"></div>Bearish</div>
-        <div class="legend-item"><div class="legend-dot" style="background:#3b82f6"></div>ENTRY Line</div>
-        <div class="legend-item"><div class="legend-dot" style="background:var(--accent)"></div>BUY Signal</div>
-        <div class="legend-item"><div class="legend-dot" style="background:var(--danger)"></div>SELL Signal</div>
-      </div>
-      <div class="trades-panel" id="trades-panel" style="flex: 1; min-height: 120px; overflow: auto; border-top: 1px solid var(--border);">
-        <div class="trades-panel-title" style="position: sticky; top: 0; background: var(--bg2);">Trade History</div>
-        <table class="trades-table">
-          <thead><tr><th>Time</th><th>Side</th><th>Entry</th><th>TP</th><th>SL</th><th>Result</th><th>P&L</th></tr></thead>
-          <tbody id="trades-tbody"><tr><td colspan="7" style="color:var(--text2); text-align:center; padding:10px">Belum ada trade</td></tr></tbody>
-        </table>
-      </div>
-    </div>
-
-    <div class="tab-pane" id="pane-logs">
-      <div id="log-container">
-        <div class="empty-state"><div class="empty-icon">◈</div><div>Belum ada log — start bot dulu</div></div>
-      </div>
-    </div>
-    
-    <div class="tab-pane" id="pane-insight" style="background:var(--bg2); padding:20px; overflow-y:auto;">
-      <div style="max-width: 600px; margin: 0 auto; border: 1px solid var(--border); border-radius: var(--r); padding: 20px; background: var(--panel);">
-        <h3 style="font-family:var(--mono); color:var(--accent); font-size:14px; margin-bottom:15px; border-bottom:1px solid var(--border); padding-bottom:10px;">
-          🤖 LIVE MARKET AI ANALYSIS
-        </h3>
-        <div class="ai-box">
-          <div class="ai-row"><span style="color:var(--text2)">Status Trend:</span><strong id="ai-trend" style="font-family:var(--mono);">-</strong></div>
-          <div class="ai-row"><span style="color:var(--text2)">Whale Dominance:</span><strong id="ai-whale" style="font-family:var(--mono);">-</strong></div>
-          <div class="ai-row"><span style="color:var(--text2)">Sinyal Aktif:</span><strong id="ai-signal" style="font-family:var(--mono);">-</strong></div>
-          
-          <div style="display:grid; grid-template-columns:1fr 1fr 1fr; gap:10px; margin-top:5px;">
-            <div style="background:var(--bg); border:1px solid var(--border2); padding:8px; border-radius:4px; text-align:center;">
-              <div style="font-size:9px; color:var(--text2); text-transform:uppercase;">Entry Target</div>
-              <div id="ai-entry" style="font-family:var(--mono); color:var(--blue); font-size:14px; font-weight:600;">0.0</div>
+        
+        <div class="p-4 border-t border-slate-800">
+            <div class="flex items-center gap-3 glass-panel p-3 rounded-xl">
+                <div class="relative">
+                    <img src="https://ui-avatars.com/api/?name=Admin&background=2563eb&color=fff" class="w-10 h-10 rounded-full" alt="User">
+                    <div class="absolute bottom-0 right-0 w-3 h-3 bg-profit border-2 border-slate-900 rounded-full"></div>
+                </div>
+                <div>
+                    <p class="text-sm font-medium text-white">System Admin</p>
+                    <p class="text-xs text-slate-400">SHM Bridge Active</p>
+                </div>
             </div>
-            <div style="background:var(--bg); border:1px solid var(--border2); padding:8px; border-radius:4px; text-align:center;">
-              <div style="font-size:9px; color:var(--text2); text-transform:uppercase;">Take Profit</div>
-              <div id="ai-tp" style="font-family:var(--mono); color:var(--accent); font-size:14px; font-weight:600;">0.0</div>
-            </div>
-            <div style="background:var(--bg); border:1px solid var(--border2); padding:8px; border-radius:4px; text-align:center;">
-              <div style="font-size:9px; color:var(--text2); text-transform:uppercase;">Stop Loss</div>
-              <div id="ai-sl" style="font-family:var(--mono); color:var(--danger); font-size:14px; font-weight:600;">0.0</div>
-            </div>
-          </div>
-          
-          <div style="margin-top:10px; padding:12px; border-radius:4px; background:#1d4ed815; border:1px solid var(--blue);">
-            <strong style="display:block; margin-bottom:5px; color:var(--blue); font-size:11px; text-transform:uppercase; letter-spacing:1px;">Deep Reasoning AI:</strong>
-            <span id="ai-advice" style="line-height:1.5;">Menunggu fetcher engine...</span>
-          </div>
-          
-          <div style="text-align:right; font-size:10px; color:var(--text2);">
-            Terakhir update: <span id="ai-ts">-</span>
-          </div>
         </div>
-      </div>
-    </div>
-  </section>
-</main>
-<div class="toast" id="toast"></div>
+    </aside>
 
-<script src="/dashboard.js"></script>
+    <!-- Main Content -->
+    <main class="flex-1 flex flex-col h-screen relative">
+        
+        <!-- Header -->
+        <header class="h-16 flex items-center justify-between px-6 border-b border-slate-800 bg-slate-900/80 backdrop-blur-md z-10">
+            <div class="flex items-center gap-4">
+                <button class="md:hidden text-slate-400 hover:text-white">
+                    <i class="ph ph-list text-2xl"></i>
+                </button>
+                <h1 class="text-xl font-semibold">System Overview</h1>
+                <div class="hidden sm:flex items-center gap-2 px-3 py-1 rounded-full bg-emerald-500/10 text-emerald-400 text-xs font-medium border border-emerald-500/20">
+                    <span class="w-2 h-2 rounded-full bg-emerald-500 pulse-ring"></span>
+                    Gateway: Online
+                </div>
+            </div>
+            <div class="flex items-center gap-4">
+                <div class="text-right hidden sm:block">
+                    <p class="text-sm font-medium" id="clock">00:00:00 UTC</p>
+                    <p class="text-xs text-slate-400">Market Data Synced</p>
+                </div>
+                <button class="relative p-2 text-slate-400 hover:text-white rounded-lg hover:bg-slate-800 transition-colors" onclick="showToast('No new alerts from agents.', 'info')">
+                    <i class="ph ph-bell text-xl"></i>
+                    <span class="absolute top-1.5 right-1.5 w-2 h-2 bg-brand-500 rounded-full"></span>
+                </button>
+            </div>
+        </header>
+
+        <!-- Content Scrollable Area -->
+        <div class="flex-1 overflow-y-auto p-4 sm:p-6 space-y-6">
+            
+            <!-- KPI Cards -->
+            <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
+                <!-- Total Equity -->
+                <div class="glass-panel p-5 rounded-2xl">
+                    <div class="flex justify-between items-start mb-4">
+                        <div>
+                            <p class="text-sm font-medium text-slate-400 mb-1">Total Equity</p>
+                            <h3 class="text-2xl font-bold text-white">$124,532.89</h3>
+                        </div>
+                        <div class="p-2 rounded-lg bg-brand-500/20 text-brand-400">
+                            <i class="ph ph-wallet text-xl"></i>
+                        </div>
+                    </div>
+                    <div class="flex items-center text-sm">
+                        <i class="ph ph-trend-up text-profit mr-1"></i>
+                        <span class="text-profit font-medium">+2.4%</span>
+                        <span class="text-slate-500 ml-2">vs yesterday</span>
+                    </div>
+                </div>
+
+                <!-- 24h PnL -->
+                <div class="glass-panel p-5 rounded-2xl">
+                    <div class="flex justify-between items-start mb-4">
+                        <div>
+                            <p class="text-sm font-medium text-slate-400 mb-1">24h PnL</p>
+                            <h3 class="text-2xl font-bold text-profit">+$3,420.50</h3>
+                        </div>
+                        <div class="p-2 rounded-lg bg-emerald-500/20 text-emerald-400">
+                            <i class="ph ph-currency-circle-dollar text-xl"></i>
+                        </div>
+                    </div>
+                    <div class="flex items-center text-sm">
+                        <span class="text-slate-300 font-mono">14 Trades Executed</span>
+                    </div>
+                </div>
+
+                <!-- Win Rate -->
+                <div class="glass-panel p-5 rounded-2xl">
+                    <div class="flex justify-between items-start mb-4">
+                        <div>
+                            <p class="text-sm font-medium text-slate-400 mb-1">Agent Win Rate</p>
+                            <h3 class="text-2xl font-bold text-white">68.2%</h3>
+                        </div>
+                        <div class="p-2 rounded-lg bg-purple-500/20 text-purple-400">
+                            <i class="ph ph-target text-xl"></i>
+                        </div>
+                    </div>
+                    <div class="w-full bg-slate-700 h-1.5 rounded-full mt-2">
+                        <div class="bg-purple-500 h-1.5 rounded-full" style="width: 68.2%"></div>
+                    </div>
+                </div>
+
+                <!-- NLP Sentiment -->
+                <div class="glass-panel p-5 rounded-2xl">
+                    <div class="flex justify-between items-start mb-4">
+                        <div>
+                            <p class="text-sm font-medium text-slate-400 mb-1">Market Sentiment</p>
+                            <h3 class="text-2xl font-bold text-emerald-400">Bullish</h3>
+                        </div>
+                        <div class="p-2 rounded-lg bg-slate-700 text-slate-300">
+                            <i class="ph ph-newspaper text-xl"></i>
+                        </div>
+                    </div>
+                    <div class="flex items-center text-sm">
+                        <span class="text-slate-400">NLP Engine Score: <span class="text-white font-mono">0.82</span></span>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Main Grid: Chart + System Status -->
+            <div class="grid grid-cols-1 lg:grid-cols-3 gap-6">
+                
+                <!-- Chart Area -->
+                <div class="lg:col-span-2 glass-panel rounded-2xl flex flex-col">
+                    <div class="p-5 border-b border-slate-700 flex justify-between items-center">
+                        <div class="flex items-center gap-3">
+                            <h2 class="text-lg font-semibold">BTC/USDT Perpetual</h2>
+                            <span class="px-2 py-0.5 rounded bg-brand-500/20 text-brand-400 text-xs font-bold border border-brand-500/20">BYBIT</span>
+                        </div>
+                        <div class="flex gap-2">
+                            <button class="px-3 py-1 rounded-md text-xs font-medium bg-slate-700 text-white hover:bg-slate-600">1H</button>
+                            <button class="px-3 py-1 rounded-md text-xs font-medium bg-slate-800 text-slate-400 hover:text-white">4H</button>
+                            <button class="px-3 py-1 rounded-md text-xs font-medium bg-slate-800 text-slate-400 hover:text-white">1D</button>
+                        </div>
+                    </div>
+                    <div class="p-1 flex-1 min-h-[400px] relative" id="chart-container">
+                        <!-- Lightweight Charts will render here -->
+                    </div>
+                </div>
+
+                <!-- System Architecture Status -->
+                <div class="space-y-6">
+                    
+                    <!-- Exchange Connections (Go Engine) -->
+                    <div class="glass-panel p-5 rounded-2xl">
+                        <h3 class="text-sm font-semibold text-slate-300 uppercase tracking-wider mb-4 flex items-center gap-2">
+                            <i class="ph ph-plugs-connected text-brand-400"></i> Exchange Adapters
+                        </h3>
+                        <div class="space-y-3">
+                            <div class="flex items-center justify-between p-3 rounded-lg bg-slate-800/50 border border-slate-700">
+                                <div class="flex items-center gap-3">
+                                    <div class="w-8 h-8 rounded bg-yellow-500/20 flex items-center justify-center text-yellow-500 font-bold text-xs">BY</div>
+                                    <div>
+                                        <p class="text-sm font-medium">Bybit</p>
+                                        <p class="text-xs text-slate-400">Latency: 12ms</p>
+                                    </div>
+                                </div>
+                                <div class="w-2.5 h-2.5 rounded-full bg-emerald-500 shadow-[0_0_8px_rgba(16,185,129,0.8)]"></div>
+                            </div>
+                            <div class="flex items-center justify-between p-3 rounded-lg bg-slate-800/50 border border-slate-700">
+                                <div class="flex items-center gap-3">
+                                    <div class="w-8 h-8 rounded bg-blue-500/20 flex items-center justify-center text-blue-500 font-bold text-xs">MX</div>
+                                    <div>
+                                        <p class="text-sm font-medium">MEXC</p>
+                                        <p class="text-xs text-slate-400">Latency: 18ms</p>
+                                    </div>
+                                </div>
+                                <div class="w-2.5 h-2.5 rounded-full bg-emerald-500 shadow-[0_0_8px_rgba(16,185,129,0.8)]"></div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Rust Brain Agents -->
+                    <div class="glass-panel p-5 rounded-2xl">
+                        <h3 class="text-sm font-semibold text-slate-300 uppercase tracking-wider mb-4 flex items-center gap-2">
+                            <i class="ph ph-brain text-purple-400"></i> Rust Brain Agents
+                        </h3>
+                        <div class="grid grid-cols-2 gap-3">
+                            <!-- Mathematician -->
+                            <div class="p-3 rounded-lg bg-slate-800/50 border border-slate-700 text-center relative overflow-hidden group cursor-pointer hover:bg-slate-700 transition">
+                                <i class="ph ph-function text-xl text-brand-400 mb-1"></i>
+                                <p class="text-xs font-medium text-slate-300">Mathematician</p>
+                                <div class="absolute top-2 right-2 w-1.5 h-1.5 rounded-full bg-emerald-500"></div>
+                            </div>
+                            <!-- Linguist -->
+                            <div class="p-3 rounded-lg bg-slate-800/50 border border-slate-700 text-center relative overflow-hidden group cursor-pointer hover:bg-slate-700 transition">
+                                <i class="ph ph-translate text-xl text-blue-400 mb-1"></i>
+                                <p class="text-xs font-medium text-slate-300">Linguist</p>
+                                <div class="absolute top-2 right-2 w-1.5 h-1.5 rounded-full bg-emerald-500"></div>
+                            </div>
+                            <!-- Liquidator -->
+                            <div class="p-3 rounded-lg bg-slate-800/50 border border-slate-700 text-center relative overflow-hidden group cursor-pointer hover:bg-slate-700 transition">
+                                <i class="ph ph-drop text-xl text-rose-400 mb-1"></i>
+                                <p class="text-xs font-medium text-slate-300">Liquidator</p>
+                                <div class="absolute top-2 right-2 w-1.5 h-1.5 rounded-full bg-emerald-500"></div>
+                            </div>
+                            <!-- Cryptographer -->
+                            <div class="p-3 rounded-lg bg-slate-800/50 border border-slate-700 text-center relative overflow-hidden group cursor-pointer hover:bg-slate-700 transition">
+                                <i class="ph ph-lock-key text-xl text-yellow-400 mb-1"></i>
+                                <p class="text-xs font-medium text-slate-300">Cryptographer</p>
+                                <div class="absolute top-2 right-2 w-1.5 h-1.5 rounded-full bg-emerald-500"></div>
+                            </div>
+                            <!-- Absurdist -->
+                            <div class="p-3 rounded-lg bg-slate-800/50 border border-slate-700 text-center relative overflow-hidden group cursor-pointer hover:bg-slate-700 transition">
+                                <i class="ph ph-mask-happy text-xl text-purple-400 mb-1"></i>
+                                <p class="text-xs font-medium text-slate-300">Absurdist</p>
+                                <div class="absolute top-2 right-2 w-1.5 h-1.5 rounded-full bg-slate-600"></div>
+                            </div>
+                            <!-- Physicist -->
+                            <div class="p-3 rounded-lg bg-slate-800/50 border border-slate-700 text-center relative overflow-hidden group cursor-pointer hover:bg-slate-700 transition">
+                                <i class="ph ph-atom text-xl text-emerald-400 mb-1"></i>
+                                <p class="text-xs font-medium text-slate-300">Physicist</p>
+                                <div class="absolute top-2 right-2 w-1.5 h-1.5 rounded-full bg-emerald-500"></div>
+                            </div>
+                        </div>
+                        <div class="mt-4 pt-4 border-t border-slate-700">
+                            <div class="flex justify-between items-center text-xs">
+                                <span class="text-slate-400">Consensus Engine:</span>
+                                <span class="font-mono text-emerald-400 bg-emerald-500/10 px-2 py-0.5 rounded border border-emerald-500/20">SYNCED via SHM</span>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Execution Log -->
+            <div class="glass-panel rounded-2xl overflow-hidden">
+                <div class="p-5 border-b border-slate-700 flex justify-between items-center">
+                    <h2 class="text-lg font-semibold">Active Orders & Executions</h2>
+                    <button class="text-xs text-brand-400 hover:text-brand-300">View All Data</button>
+                </div>
+                <div class="overflow-x-auto">
+                    <table class="w-full text-left text-sm whitespace-nowrap">
+                        <thead class="bg-slate-800/50 text-slate-400">
+                            <tr>
+                                <th class="px-5 py-3 font-medium">Time (UTC)</th>
+                                <th class="px-5 py-3 font-medium">Pair</th>
+                                <th class="px-5 py-3 font-medium">Type</th>
+                                <th class="px-5 py-3 font-medium">Agent Origin</th>
+                                <th class="px-5 py-3 font-medium text-right">Price</th>
+                                <th class="px-5 py-3 font-medium text-right">Size</th>
+                                <th class="px-5 py-3 font-medium text-center">Status</th>
+                            </tr>
+                        </thead>
+                        <tbody class="divide-y divide-slate-800/50" id="order-table-body">
+                            <!-- Populated via JS -->
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+            
+        </div>
+    </main>
+
+    <!-- Toast Container -->
+    <div id="toast-container"></div>
+
+    <script>
+        // --- Utility: Clock ---
+        function updateClock() {
+            const now = new Date();
+            const timeString = now.toISOString().substring(11, 19) + ' UTC';
+            document.getElementById('clock').textContent = timeString;
+        }
+        setInterval(updateClock, 1000);
+        updateClock();
+
+        // --- Utility: Toast Notification ---
+        function showToast(message, type = 'info') {
+            const container = document.getElementById('toast-container');
+            const toast = document.createElement('div');
+            
+            const bgClass = type === 'success' ? 'bg-emerald-500/90' : (type === 'error' ? 'bg-rose-500/90' : 'bg-slate-800/90');
+            const borderClass = type === 'success' ? 'border-emerald-500' : (type === 'error' ? 'border-rose-500' : 'border-slate-600');
+            
+            toast.className = `toast flex items-center gap-3 p-4 rounded-xl shadow-lg border ${borderClass} ${bgClass} text-white backdrop-blur-md`;
+            
+            const icon = type === 'success' ? 'ph-check-circle' : (type === 'error' ? 'ph-warning-circle' : 'ph-info');
+            
+            toast.innerHTML = `
+                <i class="ph ${icon} text-xl"></i>
+                <span class="text-sm font-medium">${message}</span>
+            `;
+            
+            container.appendChild(toast);
+            
+            // Trigger animation
+            setTimeout(() => toast.classList.add('show'), 10);
+            
+            // Remove after 3s
+            setTimeout(() => {
+                toast.classList.remove('show');
+                setTimeout(() => toast.remove(), 300);
+            }, 3000);
+        }
+
+        // --- Charting ---
+        function initChart() {
+            const chartContainer = document.getElementById('chart-container');
+            
+            const chartOptions = { 
+                layout: { 
+                    textColor: '#94a3b8', 
+                    background: { type: 'solid', color: 'transparent' } 
+                },
+                grid: {
+                    vertLines: { color: 'rgba(51, 65, 85, 0.4)' },
+                    horzLines: { color: 'rgba(51, 65, 85, 0.4)' }
+                },
+                crosshair: {
+                    mode: LightweightCharts.CrosshairMode.Normal,
+                },
+                rightPriceScale: {
+                    borderColor: 'rgba(51, 65, 85, 0.8)',
+                },
+                timeScale: {
+                    borderColor: 'rgba(51, 65, 85, 0.8)',
+                    timeVisible: true,
+                    secondsVisible: false,
+                }
+            };
+            
+            const chart = LightweightCharts.createChart(chartContainer, chartOptions);
+            const candlestickSeries = chart.addCandlestickSeries({
+                upColor: '#10b981', 
+                downColor: '#f43f5e', 
+                borderVisible: false,
+                wickUpColor: '#10b981', 
+                wickDownColor: '#f43f5e',
+            });
+
+            // Generate realistic looking mock candlestick data
+            const data = [];
+            let time = Math.floor(Date.now() / 1000) - 86400; // start 1 day ago
+            let open = 64000;
+            
+            for (let i = 0; i < 100; i++) {
+                const close = open + (Math.random() - 0.48) * 500;
+                const high = Math.max(open, close) + Math.random() * 200;
+                const low = Math.min(open, close) - Math.random() * 200;
+                
+                data.push({ time: time, open, high, low, close });
+                
+                open = close;
+                time += 900; // 15m intervals
+            }
+            
+            candlestickSeries.setData(data);
+            
+            // Handle Resize
+            new ResizeObserver(entries => {
+                if (entries.length === 0 || entries[0].target !== chartContainer) { return; }
+                const newRect = entries[0].contentRect;
+                chart.applyOptions({ height: newRect.height, width: newRect.width });
+            }).observe(chartContainer);
+
+            // Simulate live updates
+            setInterval(() => {
+                const last = data[data.length - 1];
+                const newClose = last.close + (Math.random() - 0.5) * 50;
+                candlestickSeries.update({
+                    time: last.time,
+                    open: last.open,
+                    high: Math.max(last.high, newClose),
+                    low: Math.min(last.low, newClose),
+                    close: newClose
+                });
+            }, 1000);
+        }
+
+        // --- Populate Table ---
+        function populateOrders() {
+            const tbody = document.getElementById('order-table-body');
+            const agents = ['Mathematician', 'Linguist', 'Physicist'];
+            const exchanges = ['Bybit', 'MEXC'];
+            
+            const mockOrders = [
+                { pair: 'BTC/USDT', type: 'LONG', agent: 'Mathematician', price: '64,231.50', size: '1.25 BTC', status: 'FILLED' },
+                { pair: 'ETH/USDT', type: 'SHORT', agent: 'Linguist', price: '3,450.25', size: '15.0 ETH', status: 'FILLED' },
+                { pair: 'SOL/USDT', type: 'LONG', agent: 'Physicist', price: '142.60', size: '150 SOL', status: 'PENDING' },
+                { pair: 'BTC/USDT', type: 'SHORT', agent: 'Mathematician', price: '64,800.00', size: '0.5 BTC', status: 'CANCELED' }
+            ];
+
+            let html = '';
+            mockOrders.forEach((order, idx) => {
+                const timeString = new Date(Date.now() - (idx * 1800000)).toISOString().substring(11, 19);
+                const typeColor = order.type === 'LONG' ? 'text-emerald-400 bg-emerald-400/10' : 'text-rose-400 bg-rose-400/10';
+                
+                let statusBadge = '';
+                if (order.status === 'FILLED') statusBadge = '<span class="px-2 py-1 rounded text-xs font-medium bg-slate-700 text-slate-300">FILLED</span>';
+                if (order.status === 'PENDING') statusBadge = '<span class="px-2 py-1 rounded text-xs font-medium bg-brand-500/20 text-brand-400 animate-pulse">PENDING</span>';
+                if (order.status === 'CANCELED') statusBadge = '<span class="px-2 py-1 rounded text-xs font-medium bg-slate-800 text-slate-500 line-through">CANCELED</span>';
+
+                html += `
+                    <tr class="hover:bg-slate-800/30 transition-colors">
+                        <td class="px-5 py-3 text-slate-400 font-mono">${timeString}</td>
+                        <td class="px-5 py-3 font-semibold text-white">${order.pair}</td>
+                        <td class="px-5 py-3">
+                            <span class="px-2 py-1 rounded text-xs font-bold ${typeColor}">${order.type}</span>
+                        </td>
+                        <td class="px-5 py-3 text-slate-300 flex items-center gap-2">
+                            <i class="ph ph-brain text-slate-500"></i> ${order.agent}
+                        </td>
+                        <td class="px-5 py-3 text-right font-mono text-white">$${order.price}</td>
+                        <td class="px-5 py-3 text-right font-mono text-slate-300">${order.size}</td>
+                        <td class="px-5 py-3 text-center">${statusBadge}</td>
+                    </tr>
+                `;
+            });
+            tbody.innerHTML = html;
+        }
+
+        // Initialize everything
+        window.addEventListener('DOMContentLoaded', () => {
+            initChart();
+            populateOrders();
+            
+            // Welcome notification
+            setTimeout(() => {
+                showToast('SHM Bridge connected. Agents online.', 'success');
+            }, 1000);
+        });
+    </script>
 </body>
 </html>
