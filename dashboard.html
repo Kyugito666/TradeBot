@@ -1,246 +1,268 @@
 <!DOCTYPE html>
-<html lang="en" class="dark">
+<html lang="id">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>TradeBot Quantum Control</title>
-    
-    <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🤖</text></svg>">
-    
-    <script>
-        const _warn = console.warn;
-        console.warn = (...args) => {
-            if (typeof args[0] === 'string' && args[0].includes('cdn.tailwindcss.com')) return;
-            _warn(...args);
-        };
-    </script>
-    <script src="https://cdn.tailwindcss.com"></script>
-    <script>
-        tailwind.config = {
-            darkMode: 'class',
-            theme: {
-                extend: {
-                    colors: {
-                        brand: { 400: '#38bdf8', 500: '#0ea5e9', 600: '#0284c7' },
-                        dark: { 800: '#1e293b', 900: '#0f172a', 950: '#020617' }
-                    },
-                    fontFamily: { sans: ['Inter', 'sans-serif'] }
-                }
-            }
-        }
-    </script>
-    
-    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@phosphor-icons/web@2.1.2/src/regular/style.css" crossorigin="anonymous">
-    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@phosphor-icons/web@2.1.2/src/fill/style.css" crossorigin="anonymous">
-    
-    <!-- Sesuai dengan mux.Handle("/dashboard.css", ...) -->
+    <meta name="viewport" content="width=device-width,initial-scale=1">
+    <title>BotTrade Dashboard</title>
     <link rel="stylesheet" href="/dashboard.css">
-    
-    <!-- Sesuai dengan mux.Handle("/lw-charts.js", ...) -->
-    <script src="/lw-charts.js"></script>
 </head>
-<body class="flex h-screen w-full selection:bg-brand-500/30 selection:text-brand-200">
+<body>
+<header>
+  <div class="logo">⬡ BOTTRADE</div>
+  <div class="header-center">
+    <span class="live-price" id="hdr-price">--</span>
+    <span class="price-delta" id="hdr-delta" style="display:none"></span>
+    <span style="font-size:10px; color:var(--text2); font-family:var(--mono)" id="hdr-symbol">--</span>
+  </div>
+  <div class="status-pill">
+    <div class="dot" id="status-dot"></div>
+    <span id="status-text" style="font-size:11px">STOPPED</span>
+  </div>
+</header>
 
-    <!-- Sidebar -->
-    <aside class="w-20 md:w-64 flex-shrink-0 glass-panel border-r border-slate-800 flex flex-col transition-all duration-300 z-20 hidden md:flex">
-        <div class="h-16 flex items-center justify-center md:justify-start md:px-6 border-b border-slate-800">
-            <div class="w-8 h-8 rounded bg-gradient-to-br from-brand-400 to-brand-600 flex items-center justify-center text-white font-bold text-xl flex-shrink-0 shadow-lg shadow-brand-500/20">T</div>
-            <span class="ml-3 font-bold text-lg hidden md:block bg-clip-text text-transparent bg-gradient-to-r from-white to-slate-400">TradeBot</span>
+<main>
+  <aside class="sidebar">
+    <div>
+      <div class="section-title">Control</div>
+      <div class="btn-group">
+        <button class="btn btn-start" id="btn-start" onclick="startBot()">▶ START</button>
+        <button class="btn btn-stop" id="btn-stop" onclick="stopBot()" disabled>■ STOP</button>
+      </div>
+    </div>
+    
+    <div>
+      <div class="section-title">Trading Config</div>
+      <div class="card" id="config-form">
+        <label style="display:flex;justify-content:space-between;align-items:center">
+          Symbol (Futures)
+          <span id="pairs-status" style="font-size:9px;color:var(--text2);font-style:normal;letter-spacing:0;font-weight:400">⟳ loading…</span>
+        </label>
+        <select id="cfg-symbol" style="font-size:12px"><option value="BTCUSDT">BTCUSDT</option></select>
+        
+        <label>Exchange</label>
+        <select id="cfg-exchange" onchange="onExchangeChange(this.value)">
+          <option value="bybit">Bybit</option>
+          <option value="mexc">MEXC</option>
+        </select>
+        
+        <label>Mode</label>
+        <select id="cfg-mode">
+          <option value="demo">Demo (Testnet)</option>
+          <option value="real">Real (Mainnet)</option>
+        </select>
+
+        <label>Trading Style (Auto-Interval)</label>
+        <select id="cfg-style">
+          <option value="scalping">Scalping (Modal Tipis / Cepat)</option>
+          <option value="daytrade">Day Trader (Menengah / Harian)</option>
+          <option value="sniper">Sniper Swing (Modal Tebel / Sabar)</option>
+        </select>
+        
+        <label>TP/SL Target Type</label>
+        <select id="cfg-target-type">
+          <option value="RR">Risk/Reward (ATR-based)</option>
+          <option value="ROI">Target ROI %</option>
+          <option value="PNL">Fixed PnL ($)</option>
+        </select>
+
+        <label style="display:flex; justify-content:space-between; align-items:center;">
+          Leverage
+          <span id="lev-val-display" style="color:var(--accent); font-size:12px; font-weight:600;">10x</span>
+        </label>
+        <div style="display:flex; flex-direction:column; gap:6px;">
+          <input type="range" id="cfg-lev-slider" min="1" max="100" value="10" oninput="syncLev('slider')">
+          <div style="display:flex;gap:6px;align-items:center">
+            <input type="number" id="cfg-leverage" value="10" min="1" max="100" style="flex:1" oninput="syncLev('number')">
+            <span style="font-family:var(--mono);font-size:10px;color:var(--text2);white-space:nowrap">× isolated</span>
+          </div>
         </div>
+        
+        <label style="display:flex; justify-content:space-between; align-items:center; margin-top:10px;">
+          Margin Usage / Risk
+          <span id="risk-val-display" style="color:var(--accent); font-size:12px; font-weight:600;">3%</span>
+        </label>
+        <input type="range" id="cfg-risk" min="1" max="100" value="3" oninput="document.getElementById('risk-val-display').textContent = this.value + '%'" style="margin-top:6px; cursor:pointer; width:100%;">
 
-        <nav class="flex-1 py-6 flex flex-col gap-2 px-3">
-            <a href="#" class="flex items-center gap-3 px-3 py-2.5 rounded-lg bg-brand-500/10 text-brand-400 border border-brand-500/20 transition-colors group">
-                <i class="ph ph-squares-four text-xl group-hover:scale-110 transition-transform"></i>
-                <span class="font-medium text-sm hidden md:block">Dasbor</span>
-            </a>
-            <a href="#" class="flex items-center gap-3 px-3 py-2.5 rounded-lg text-slate-400 hover:text-white hover:bg-slate-800/50 transition-colors group">
-                <i class="ph ph-chart-line-up text-xl group-hover:scale-110 transition-transform"></i>
-                <span class="font-medium text-sm hidden md:block">Data Pasar</span>
-            </a>
-            <a href="#" class="flex items-center gap-3 px-3 py-2.5 rounded-lg text-slate-400 hover:text-white hover:bg-slate-800/50 transition-colors group">
-                <i class="ph ph-robot text-xl group-hover:scale-110 transition-transform"></i>
-                <span class="font-medium text-sm hidden md:block">Agen Rust Brain</span>
-            </a>
-            <a href="#" class="flex items-center gap-3 px-3 py-2.5 rounded-lg text-slate-400 hover:text-white hover:bg-slate-800/50 transition-colors group">
-                <i class="ph ph-brain text-xl group-hover:scale-110 transition-transform"></i>
-                <span class="font-medium text-sm hidden md:block">Sentimen NLP</span>
-            </a>
-        </nav>
-
-        <div class="p-4 border-t border-slate-800">
-            <a href="#" class="flex items-center gap-3 px-3 py-2.5 rounded-lg text-slate-400 hover:text-white hover:bg-slate-800/50 transition-colors">
-                <i class="ph ph-gear text-xl"></i>
-                <span class="font-medium text-sm hidden md:block">Pengaturan</span>
-            </a>
+        <div class="toggle-row" style="margin-top:12px">
+          <span class="toggle-label">Mock OHLCV</span>
+          <label class="toggle"><input type="checkbox" id="cfg-mock"><span class="slider"></span></label>
         </div>
-    </aside>
-
-    <!-- Main Content -->
-    <main class="flex-1 flex flex-col h-screen overflow-hidden relative">
-        <div class="absolute inset-0 z-0 opacity-[0.03] pointer-events-none" style="background-image: linear-gradient(#38bdf8 1px, transparent 1px), linear-gradient(90deg, #38bdf8 1px, transparent 1px); background-size: 30px 30px;"></div>
-
-        <!-- Header -->
-        <header class="h-16 flex items-center justify-between px-6 border-b border-slate-800 bg-slate-900/80 backdrop-blur-md z-10">
-            <div class="flex items-center gap-4">
-                <button class="md:hidden text-slate-400 hover:text-white">
-                    <i class="ph ph-list text-2xl"></i>
-                </button>
-                <h1 class="text-xl font-semibold">Tinjauan Sistem</h1>
-                
-                <!-- AUTO TRADING CONTROL -->
-                <div class="ml-4 flex items-center gap-2 bg-slate-800/80 p-1 rounded-lg border border-slate-700">
-                    <span class="text-xs font-semibold text-slate-400 pl-2 pr-1">PERDAGANGAN OTOMATIS</span>
-                    <button id="btn-toggle-bot" class="flex items-center gap-2 px-4 py-1.5 rounded-md bg-rose-500/20 text-rose-400 border border-rose-500/30 hover:bg-rose-500/30 transition-all font-medium text-sm" onclick="toggleBot()">
-                        <i class="ph-fill ph-stop-circle text-lg" id="icon-bot-state"></i>
-                        <span id="text-bot-state">BERHENTI</span>
-                    </button>
-                </div>
-
-                <div class="hidden sm:flex items-center gap-2 px-3 py-1 rounded-full bg-emerald-500/10 text-emerald-400 text-xs font-medium border border-emerald-500/20 ml-2" id="gateway-status">
-                    <span class="w-2 h-2 rounded-full bg-emerald-500 pulse-ring"></span>
-                    Gateway: Daring
-                </div>
-            </div>
-            
-            <div class="flex items-center gap-4">
-                <div class="hidden sm:flex items-center gap-2 text-sm text-slate-400 bg-slate-800/50 px-3 py-1.5 rounded-lg border border-slate-700">
-                    <i class="ph ph-clock"></i>
-                    <span id="clock" class="font-mono">00:00:00 UTC</span>
-                </div>
-                <button class="w-8 h-8 rounded-full bg-slate-800 flex items-center justify-center text-slate-400 hover:text-white border border-slate-700 transition-colors">
-                    <i class="ph ph-bell"></i>
-                </button>
-            </div>
-        </header>
-
-        <!-- Dashboard Content -->
-        <div class="flex-1 overflow-y-auto p-4 sm:p-6 z-10 scroll-smooth">
-            
-            <!-- KPI Cards -->
-            <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
-                
-                <!-- AI Signal Status -->
-                <div class="glass-panel p-5 rounded-2xl relative overflow-hidden">
-                    <div class="absolute -right-4 -top-4 w-24 h-24 bg-brand-500/10 rounded-full blur-2xl"></div>
-                    <div class="flex justify-between items-start mb-4">
-                        <div>
-                            <p class="text-sm font-medium text-slate-400 mb-1">Sinyal AI Saat Ini</p>
-                            <h3 class="text-2xl font-bold text-slate-400" id="ai-signal-text">MENUNGGU</h3>
-                        </div>
-                        <div class="p-2 rounded-lg bg-slate-800 text-white border border-slate-700">
-                            <i class="ph ph-lightning text-xl text-brand-400"></i>
-                        </div>
-                    </div>
-                    <div class="flex items-center text-sm gap-2">
-                        <span class="px-2 py-0.5 rounded text-xs font-bold bg-brand-500/20 text-brand-400 border border-brand-500/20">KEYAKINAN: --%</span>
-                        <span class="text-slate-500 text-xs font-mono">BTC/USDT</span>
-                    </div>
-                </div>
-
-                <!-- 24h PnL -->
-                <div class="glass-panel p-5 rounded-2xl">
-                    <div class="flex justify-between items-start mb-4">
-                        <div>
-                            <p class="text-sm font-medium text-slate-400 mb-1">PnL 24j</p>
-                            <h3 class="text-2xl font-bold text-emerald-400">+$1,240.50</h3>
-                        </div>
-                        <div class="p-2 rounded-lg bg-emerald-500/10 text-emerald-400 border border-emerald-500/20">
-                            <i class="ph ph-trend-up text-xl"></i>
-                        </div>
-                    </div>
-                    <div class="flex items-center text-sm">
-                        <span class="text-emerald-400 font-medium">+2.4%</span>
-                        <span class="text-slate-500 ml-2">vs kemarin</span>
-                    </div>
-                </div>
-
-                <!-- Win Rate -->
-                <div class="glass-panel p-5 rounded-2xl">
-                    <div class="flex justify-between items-start mb-4">
-                        <div>
-                            <p class="text-sm font-medium text-slate-400 mb-1">Tingkat Menang (30h)</p>
-                            <h3 class="text-2xl font-bold text-white">68.5%</h3>
-                        </div>
-                        <div class="p-2 rounded-lg bg-purple-500/10 text-purple-400 border border-purple-500/20">
-                            <i class="ph ph-target text-xl"></i>
-                        </div>
-                    </div>
-                    <div class="w-full bg-slate-800 rounded-full h-1.5 mt-2">
-                        <div class="bg-purple-500 h-1.5 rounded-full" style="width: 68.5%"></div>
-                    </div>
-                </div>
-
-                <!-- Active Positions -->
-                <div class="glass-panel p-5 rounded-2xl">
-                    <div class="flex justify-between items-start mb-4">
-                        <div>
-                            <p class="text-sm font-medium text-slate-400 mb-1">Posisi Aktif</p>
-                            <h3 class="text-2xl font-bold text-white">3</h3>
-                        </div>
-                        <div class="p-2 rounded-lg bg-orange-500/10 text-orange-400 border border-orange-500/20">
-                            <i class="ph ph-briefcase text-xl"></i>
-                        </div>
-                    </div>
-                    <div class="flex gap-2 mt-2">
-                        <span class="px-2 py-1 rounded bg-slate-800 text-xs text-slate-300 font-mono border border-slate-700">BTC</span>
-                        <span class="px-2 py-1 rounded bg-slate-800 text-xs text-slate-300 font-mono border border-slate-700">ETH</span>
-                        <span class="px-2 py-1 rounded bg-slate-800 text-xs text-slate-300 font-mono border border-slate-700">SOL</span>
-                    </div>
-                </div>
-            </div>
-
-            <div class="grid grid-cols-1 lg:grid-cols-3 gap-6 mt-6">
-                <!-- Chart Section -->
-                <div class="lg:col-span-2 glass-panel rounded-2xl flex flex-col h-[400px]">
-                    <div class="p-4 border-b border-slate-800 flex justify-between items-center">
-                        <h2 class="font-semibold text-white flex items-center gap-2">
-                            <i class="ph-fill ph-chart-bar text-brand-400"></i> Tinjauan Pasar (BTC/USDT)
-                        </h2>
-                        <div class="flex gap-2">
-                            <button class="px-2 py-1 rounded bg-slate-800 text-xs text-slate-300 hover:bg-slate-700 transition">15m</button>
-                            <button class="px-2 py-1 rounded bg-brand-600 text-xs text-white shadow shadow-brand-500/20 transition">1J</button>
-                            <button class="px-2 py-1 rounded bg-slate-800 text-xs text-slate-300 hover:bg-slate-700 transition">4J</button>
-                        </div>
-                    </div>
-                    <div id="chart-container" class="flex-1 w-full relative">
-                        <!-- Chart renders here -->
-                    </div>
-                </div>
-
-                <!-- Recent Orders / Activity -->
-                <div class="glass-panel rounded-2xl flex flex-col h-[400px]">
-                    <div class="p-4 border-b border-slate-800 flex justify-between items-center">
-                        <h2 class="font-semibold text-white flex items-center gap-2">
-                            <i class="ph-fill ph-list-dashes text-brand-400"></i> Tindakan Terbaru
-                        </h2>
-                    </div>
-                    <div class="flex-1 overflow-y-auto p-2">
-                        <table class="w-full text-sm text-left">
-                            <thead class="text-xs text-slate-400 uppercase bg-slate-900/50 sticky top-0">
-                                <tr>
-                                    <th class="px-4 py-3 rounded-tl-lg">Pasangan</th>
-                                    <th class="px-4 py-3">Sisi</th>
-                                    <th class="px-4 py-3 text-right rounded-tr-lg">Harga</th>
-                                </tr>
-                            </thead>
-                            <tbody id="orders-body" class="font-mono text-xs">
-                                <!-- Populated by JS -->
-                            </tbody>
-                        </table>
-                    </div>
-                </div>
-            </div>
-            
-            <div class="mt-6 text-center text-xs text-slate-500 font-mono pb-4">
-                Sistem Inti TradeBot &middot; Komunikasi Antar-Proses Aktif &middot; Rust x Go
-            </div>
+        <div class="toggle-row">
+          <span class="toggle-label">Dry Run (simulasi)</span>
+          <label class="toggle"><input type="checkbox" id="cfg-dryrun"><span class="slider"></span></label>
         </div>
-    </main>
+      </div>
+    </div>
+    
+    <div>
+      <div class="section-title">API Bybit (Demo)</div>
+      <div class="card">
+        <label>API Key</label>
+        <input type="password" id="key-bybit-demo-key" placeholder="••••••••••••">
+        <label>API Secret</label>
+        <input type="password" id="key-bybit-demo-secret" placeholder="••••••••••••">
+      </div>
+    </div>
+    
+    <div>
+      <div class="section-title">API Bybit (Real)</div>
+      <div class="card">
+        <label>API Key</label>
+        <input type="password" id="key-bybit-real-key" placeholder="••••••••••••">
+        <label>API Secret</label>
+        <input type="password" id="key-bybit-real-secret" placeholder="••••••••••••">
+      </div>
+    </div>
+    
+    <div>
+      <div class="section-title">API MEXC (Real)</div>
+      <div class="card">
+        <label>API Key</label>
+        <input type="password" id="key-mexc-key" placeholder="••••••••••••">
+        <label>API Secret</label>
+        <input type="password" id="key-mexc-secret" placeholder="••••••••••••">
+      </div>
+    </div>
+    
+    <button class="btn btn-save" onclick="saveConfig()" style="margin-top:auto" id="btn-save-cfg">💾 SAVE CONFIG</button>
+  </aside>
 
-    <!-- Toast Container -->
-    <div id="toast-container" class="fixed bottom-4 right-4 flex flex-col gap-2 z-50"></div>
+  <section class="main-panel">
+    <div class="stats-row">
+      <div class="stat-card">
+        <div class="stat-label"><span class="dot-sm live" id="dot-price"></span>PRICE</div>
+        <div class="stat-value" id="stat-price">--</div>
+        <div class="stat-sub" id="stat-atr">ATR --</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-label"><span class="dot-sm live" id="dot-oi"></span>OPEN INTEREST</div>
+        <div class="stat-value small" id="stat-oi">--</div>
+        <div class="stat-sub" id="stat-oi-time">--</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-label"><span class="dot-sm live" id="dot-lsr"></span>WHALE LSR</div>
+        <div class="stat-value" id="stat-lsr">--</div>
+        <div class="bias-badge NEUTRAL" id="stat-bias">NEUTRAL</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-label">BALANCE</div>
+        <div class="stat-value small" id="stat-balance">
+          -- USDT 
+          <span id="stat-bal-pct" style="font-size:10px; opacity:0.7;"></span>
+        </div>
+        <div class="stat-sub" id="stat-risk">Risk --% / trade</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-label">WIN RATE</div>
+        <div class="stat-value" id="stat-winrate">--</div>
+        <div class="stat-sub" id="stat-trades">0 trades</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-label">SIM P&L</div>
+        <div class="stat-value" id="stat-pnl">+0.00%</div>
+        <div class="stat-sub" id="stat-pnl-sub">0 signals fired</div>
+      </div>
+    </div>
 
-    <!-- Sesuai dengan mux.Handle("/dashboard.js", ...) -->
-    <script src="/dashboard.js"></script>
+    <div class="tab-bar">
+      <button class="tab active" onclick="switchTab('chart', this)">📈 CHART</button>
+      <button class="tab" onclick="switchTab('logs', this)">📋 LOGS</button>
+      <button class="tab" onclick="switchTab('insight', this)">🧠 AI INSIGHT</button>
+      <div class="tab-spacer"></div>
+      
+      <button class="icon-btn" id="btn-toggle-chart" onclick="toggleChart()" style="margin-right:8px; border-color:var(--border);">👁️ Hide Chart</button>
+
+      <div class="filter-btns" id="log-filter-btns" style="display:none">
+        <button class="fbtn active" data-lvl="ALL" onclick="setFilter(this)">ALL</button>
+        <button class="fbtn lvl-INFO" data-lvl="INFO" onclick="setFilter(this)">INFO</button>
+        <button class="fbtn lvl-WARNING" data-lvl="WARNING" onclick="setFilter(this)">WARN</button>
+        <button class="fbtn lvl-ERROR" data-lvl="ERROR" onclick="setFilter(this)">ERR</button>
+      </div>
+      <div class="log-actions">
+        <button class="icon-btn" id="btn-autoscroll" onclick="toggleAutoScroll()">⬇ Auto</button>
+        <button class="icon-btn" onclick="clearLogs()">🗑 Clear</button>
+        <button class="icon-btn" onclick="resetHistory()">Reset DB</button>
+      </div>
+    </div>
+    
+    <div class="tab-pane active" id="pane-chart">
+      <div class="chart-toolbar" id="chart-toolbar">
+        <div class="tf-btns" id="tf-btns">
+          <button class="tf-btn" data-tf="1" onclick="setTimeframe(this)">1m</button>
+          <button class="tf-btn" data-tf="3" onclick="setTimeframe(this)">3m</button>
+          <button class="tf-btn active" data-tf="5" onclick="setTimeframe(this)">5m</button>
+          <button class="tf-btn" data-tf="15" onclick="setTimeframe(this)">15m</button>
+          <button class="tf-btn" data-tf="60" onclick="setTimeframe(this)">1h</button>
+          <button class="tf-btn" data-tf="240" onclick="setTimeframe(this)">4h</button>
+        </div>
+        <span class="chart-status" id="chart-status">⟳ loading…</span>
+      </div>
+      <div class="chart-wrap" id="chart-wrapper">
+        <div id="chart-container"></div>
+        <div class="chart-empty" id="chart-empty"><div class="chart-empty-icon">◈</div><div>Memuat chart…</div></div>
+      </div>
+      <div class="chart-legend" id="chart-legend">
+        <div class="legend-item"><div class="legend-dot" style="background:#26a69a"></div>Bullish</div>
+        <div class="legend-item"><div class="legend-dot" style="background:#ef5350"></div>Bearish</div>
+        <div class="legend-item"><div class="legend-dot" style="background:#3b82f6"></div>ENTRY Line</div>
+        <div class="legend-item"><div class="legend-dot" style="background:var(--accent)"></div>BUY Signal</div>
+        <div class="legend-item"><div class="legend-dot" style="background:var(--danger)"></div>SELL Signal</div>
+      </div>
+      <div class="trades-panel" id="trades-panel" style="flex: 1; min-height: 120px; overflow: auto; border-top: 1px solid var(--border);">
+        <div class="trades-panel-title" style="position: sticky; top: 0; background: var(--bg2);">Trade History</div>
+        <table class="trades-table">
+          <thead><tr><th>Time</th><th>Side</th><th>Entry</th><th>TP</th><th>SL</th><th>Result</th><th>P&L</th></tr></thead>
+          <tbody id="trades-tbody"><tr><td colspan="7" style="color:var(--text2); text-align:center; padding:10px">Belum ada trade</td></tr></tbody>
+        </table>
+      </div>
+    </div>
+
+    <div class="tab-pane" id="pane-logs">
+      <div id="log-container">
+        <div class="empty-state"><div class="empty-icon">◈</div><div>Belum ada log — start bot dulu</div></div>
+      </div>
+    </div>
+    
+    <div class="tab-pane" id="pane-insight" style="background:var(--bg2); padding:20px; overflow-y:auto;">
+      <div style="max-width: 600px; margin: 0 auto; border: 1px solid var(--border); border-radius: var(--r); padding: 20px; background: var(--panel);">
+        <h3 style="font-family:var(--mono); color:var(--accent); font-size:14px; margin-bottom:15px; border-bottom:1px solid var(--border); padding-bottom:10px;">
+          🤖 LIVE MARKET AI ANALYSIS
+        </h3>
+        <div class="ai-box">
+          <div class="ai-row"><span style="color:var(--text2)">Status Trend:</span><strong id="ai-trend" style="font-family:var(--mono);">-</strong></div>
+          <div class="ai-row"><span style="color:var(--text2)">Whale Dominance:</span><strong id="ai-whale" style="font-family:var(--mono);">-</strong></div>
+          <div class="ai-row"><span style="color:var(--text2)">Sinyal Aktif:</span><strong id="ai-signal" style="font-family:var(--mono);">-</strong></div>
+          
+          <div style="display:grid; grid-template-columns:1fr 1fr 1fr; gap:10px; margin-top:5px;">
+            <div style="background:var(--bg); border:1px solid var(--border2); padding:8px; border-radius:4px; text-align:center;">
+              <div style="font-size:9px; color:var(--text2); text-transform:uppercase;">Entry Target</div>
+              <div id="ai-entry" style="font-family:var(--mono); color:var(--blue); font-size:14px; font-weight:600;">0.0</div>
+            </div>
+            <div style="background:var(--bg); border:1px solid var(--border2); padding:8px; border-radius:4px; text-align:center;">
+              <div style="font-size:9px; color:var(--text2); text-transform:uppercase;">Take Profit</div>
+              <div id="ai-tp" style="font-family:var(--mono); color:var(--accent); font-size:14px; font-weight:600;">0.0</div>
+            </div>
+            <div style="background:var(--bg); border:1px solid var(--border2); padding:8px; border-radius:4px; text-align:center;">
+              <div style="font-size:9px; color:var(--text2); text-transform:uppercase;">Stop Loss</div>
+              <div id="ai-sl" style="font-family:var(--mono); color:var(--danger); font-size:14px; font-weight:600;">0.0</div>
+            </div>
+          </div>
+          
+          <div style="margin-top:10px; padding:12px; border-radius:4px; background:#1d4ed815; border:1px solid var(--blue);">
+            <strong style="display:block; margin-bottom:5px; color:var(--blue); font-size:11px; text-transform:uppercase; letter-spacing:1px;">Deep Reasoning AI:</strong>
+            <span id="ai-advice" style="line-height:1.5;">Menunggu fetcher engine...</span>
+          </div>
+          
+          <div style="text-align:right; font-size:10px; color:var(--text2);">
+            Terakhir update: <span id="ai-ts">-</span>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+</main>
+<div class="toast" id="toast"></div>
+
+<script src="/dashboard.js"></script>
 </body>
 </html>
