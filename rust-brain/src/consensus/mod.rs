@@ -1,54 +1,30 @@
 // rust-brain/src/consensus/mod.rs
 //
 // ═══════════════════════════════════════════════════════════════════════════
-// CHANGELOG vs v3.0.2:
+// CHANGELOG vs v3.0.3:
 //
-// [FIX-C1] EMA TREND HARD VETO — Problem 5
-//   (dari sesi sebelumnya — dipertahankan, diperbaiki di v2)
-//
-// [FIX-C1-v2] ← FIX UTAMA PROBLEM 2 + 5 INI
-//   ROOT CAUSE FIX-C1-v1 TERLALU AGRESIF:
-//   Threshold lama: price < ema50 * 0.995 (hanya 0.5% di bawah EMA50)
-//   Akibat: di SETIAP downtrend, SEMUA sinyal BUY di-hard-veto karena
-//   harga selalu sedikit di bawah EMA50 saat bear alignment.
-//   Ini menyebabkan "gada entry sama sekali" di demo backtest.
-//
+// [FIX-CONF] READ bot_runtime.conf BUKAN .env
+//   ROOT CAUSE: get_style() lama baca dari ".env" via OnceLock.
+//   Masalah 1: server.go [FIX-S4] nulis TRADING_STYLE ke "bot_runtime.conf",
+//              bukan ".env" — jadi Rust gak pernah dapet nilai dari dashboard.
+//   Masalah 2: OnceLock → cuma baca SEKALI saat startup. User ganti style
+//              di dashboard → bot_runtime.conf diupdate → Rust gak tau.
 //   FIX:
-//   - HARD VETO hanya saat price < ema50 * 0.975 (2.5% di bawah = downtrend serius)
-//   - SOFT VETO (confidence penalty) saat price antara ema50*0.975 dan ema50*1.0
-//     → confidence dikali 0.60 (dikurangi 40%) + require 1 extra agreement
-//   - Efek: bot masih bisa masuk di downtrend ringan, tapi dengan conviction lebih tinggi
-//   - LSR whale fake tetap dibatasi oleh [FIX-C2] weight dampening
+//   - Ganti baca file dari ".env" → "bot_runtime.conf"
+//   - Ganti OnceLock → baca file setiap kali evaluate() dipanggil
+//     (file read murah, config change jarang — no perf issue)
+//   - Tambah fallback: jika bot_runtime.conf tidak ada, coba .env, lalu default
 //
-// [FIX-C2] DYNAMIC WEIGHT DAMPENING — LSR anti-manipulation
-//   (dari sesi sebelumnya — dipertahankan)
-//   Absurdist weight direduksi ke 30% saat EMA conflict terdeteksi.
-//   Linguist direduksi ke 50% saat news_count < 3.
-//
-// [FIX-C3-v2] ← FIX THRESHOLD SCALPING
-//   min_confidence scalping: 0.25 → 0.18
-//   ROOT CAUSE: active_w normalization membuat skor aktual lebih rendah dari
-//   ekspektasi. Dengan 3-4 agent vote WAIT, active_w bisa ~0.5, sehingga
-//   confidence efektif = raw_score/0.5. Threshold 0.25 terlalu ketat.
-//   FIX: 0.18 untuk scalping (cukup ketat tapi reachable)
-//       0.38 untuk daytrade (turun dari 0.42)
-//       0.50 untuk swing/sniper (turun dari 0.55)
-//
-// [FIX-C4] TP/SL SANITY — ATR floor 0.2%
-//   (dari sesi sebelumnya — dipertahankan)
-//
-// [FIX-C6-NEW] ← CONSENSUS OVERRIDE UNTUK STRONG SIGNAL
-//   Jika buy_count >= 4 (dari 6 agents) DAN confidence >= 0.40, skip EMA
-//   soft veto. Strong consensus = 4+ agents setuju = signal valid meski
-//   EMA tidak ideal. Ini mencegah over-filtering saat whale genuinely BUY.
-//
-// MARKING: FIX-C1-v2, FIX-C3-v2, FIX-C6-NEW
+// [FIX-C1-v2] EMA TREND HARD/SOFT VETO — dipertahankan
+// [FIX-C2]    DYNAMIC WEIGHT DAMPENING — dipertahankan
+// [FIX-C3-v2] THRESHOLD SCALPING FIX — dipertahankan
+// [FIX-C4]    TP/SL SANITY ATR FLOOR — dipertahankan
+// [FIX-C6-NEW] CONSENSUS OVERRIDE 4+ AGENTS — dipertahankan
 // ═══════════════════════════════════════════════════════════════════════════
 
 use crate::agents::{AgentVote, Direction};
 use crate::shm::{MarketSnapshot, SignalOutput, AGENT_COUNT};
 use chrono::Utc;
-use std::sync::OnceLock;
 
 const WEIGHTS: [(&str, f64); AGENT_COUNT] = [
     ("mathematician", 0.28),
@@ -59,10 +35,14 @@ const WEIGHTS: [(&str, f64); AGENT_COUNT] = [
     ("absurdist",     0.10),
 ];
 
-const ABSURDIST_DAMP:  f64 = 0.30;
-const LINGUIST_DAMP:   f64 = 0.50;
+const ABSURDIST_DAMP: f64 = 0.30;
+const LINGUIST_DAMP:  f64 = 0.50;
 
+// [FIX-CONF] StyleConfig tidak lagi di-cache via OnceLock.
+// Di-construct fresh setiap evaluate() call dari bot_runtime.conf.
+#[derive(Debug, Clone)]
 struct StyleConfig {
+    style_name:     String,
     min_confidence: f64,
     min_agree:      usize,
     tp_atr_mult:    f64,
@@ -71,67 +51,81 @@ struct StyleConfig {
     min_rr:         f64,
 }
 
-fn get_style() -> &'static StyleConfig {
-    static STYLE: OnceLock<StyleConfig> = OnceLock::new();
-    STYLE.get_or_init(|| {
-        let mut style_name = String::from("scalping");
-        if let Ok(content) = std::fs::read_to_string(".env") {
+// [FIX-CONF] Baca TRADING_STYLE dari bot_runtime.conf (diwrite server.go tiap
+// user save config di dashboard). Fallback ke .env, lalu ke "scalping".
+fn read_trading_style() -> String {
+    // Priority 1: bot_runtime.conf (diupdate server.go tanpa restart)
+    // Priority 2: .env (backward compat)
+    // Priority 3: default "scalping"
+    for filename in &["bot_runtime.conf", ".env"] {
+        if let Ok(content) = std::fs::read_to_string(filename) {
             for line in content.lines() {
                 let line = line.trim();
-                if line.is_empty() || line.starts_with('#') { continue; }
+                if line.is_empty() || line.starts_with('#') {
+                    continue;
+                }
                 if line.starts_with("TRADING_STYLE=") {
-                    style_name = line["TRADING_STYLE=".len()..]
+                    let val = line["TRADING_STYLE=".len()..]
                         .trim()
                         .trim_matches('"')
                         .trim_matches('\'')
                         .to_lowercase();
-                    break;
+                    if !val.is_empty() {
+                        return val;
+                    }
                 }
             }
         }
-        log::info!("[Consensus] Trading style loaded: '{style_name}'");
+    }
+    "scalping".to_string()
+}
 
-        match style_name.as_str() {
-            "scalping" => StyleConfig {
-                // [FIX-C3-v2] min_confidence: 0.25 → 0.18 (threshold realistis setelah active_w normalisasi)
+// [FIX-CONF] Build StyleConfig dari style name string.
+fn make_style_config(style_name: &str) -> StyleConfig {
+    match style_name {
+        "scalping" => StyleConfig {
+            style_name:     style_name.to_string(),
+            // [FIX-C3-v2] min_confidence: 0.18 (realistis setelah active_w normalisasi)
+            min_confidence: 0.18,
+            min_agree:      2,
+            tp_atr_mult:    1.2,
+            sl_atr_mult:    0.7,
+            noise_veto:     0.82,
+            min_rr:         1.2,
+        },
+        "daytrading" | "daytrade" | "day" => StyleConfig {
+            style_name:     style_name.to_string(),
+            // [FIX-C3-v2] min_confidence: 0.38
+            min_confidence: 0.38,
+            min_agree:      3,
+            tp_atr_mult:    2.2,
+            sl_atr_mult:    1.2,
+            noise_veto:     0.68,
+            min_rr:         1.5,
+        },
+        "swing" | "sniper" | "sniper_swing" => StyleConfig {
+            style_name:     style_name.to_string(),
+            // [FIX-C3-v2] min_confidence: 0.50
+            min_confidence: 0.50,
+            min_agree:      3,
+            tp_atr_mult:    3.5,
+            sl_atr_mult:    1.5,
+            noise_veto:     0.55,
+            min_rr:         2.0,
+        },
+        _ => {
+            log::warn!("[Consensus] [FIX-CONF] Unknown TRADING_STYLE='{style_name}', using scalping defaults");
+            StyleConfig {
+                style_name:     style_name.to_string(),
                 min_confidence: 0.18,
                 min_agree:      2,
-                tp_atr_mult:    1.2,
-                sl_atr_mult:    0.7,
-                noise_veto:     0.82,
+                tp_atr_mult:    1.5,
+                sl_atr_mult:    1.0,
+                noise_veto:     0.78,
                 min_rr:         1.2,
-            },
-            "daytrading" | "daytrade" | "day" => StyleConfig {
-                // [FIX-C3-v2] min_confidence: 0.42 → 0.38
-                min_confidence: 0.38,
-                min_agree:      3,
-                tp_atr_mult:    2.2,
-                sl_atr_mult:    1.2,
-                noise_veto:     0.68,
-                min_rr:         1.5,
-            },
-            "swing" | "sniper" | "sniper_swing" => StyleConfig {
-                // [FIX-C3-v2] min_confidence: 0.55 → 0.50
-                min_confidence: 0.50,
-                min_agree:      3,
-                tp_atr_mult:    3.5,
-                sl_atr_mult:    1.5,
-                noise_veto:     0.55,
-                min_rr:         2.0,
-            },
-            _ => {
-                log::warn!("[Consensus] Unknown TRADING_STYLE='{style_name}', using scalping defaults");
-                StyleConfig {
-                    min_confidence: 0.18, // [FIX-C3-v2] default juga diperbaiki
-                    min_agree:      2,
-                    tp_atr_mult:    1.5,
-                    sl_atr_mult:    1.0,
-                    noise_veto:     0.78,
-                    min_rr:         1.2,
-                }
             }
         }
-    })
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -139,7 +133,9 @@ fn get_style() -> &'static StyleConfig {
 // ═══════════════════════════════════════════════════════════════════════════
 
 fn calc_ema(closes: &[f64], period: usize) -> f64 {
-    if closes.is_empty() { return 0.0; }
+    if closes.is_empty() {
+        return 0.0;
+    }
     if closes.len() < period {
         return closes.iter().sum::<f64>() / closes.len() as f64;
     }
@@ -165,19 +161,12 @@ fn ema_alignment(snap: &MarketSnapshot) -> (f64, f64, f64, bool, bool) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// [FIX-C1-v2] EmaVetoResult — hasil dari EMA trend check
-//   Hard  = block total (hanya saat price sangat jauh dari trend)
-//   Soft  = confidence penalty (masih bisa masuk tapi butuh lebih yakin)
-//   Clear = tidak ada conflict
+// [FIX-C1-v2] EmaVetoResult
 // ═══════════════════════════════════════════════════════════════════════════
 #[derive(Debug)]
 enum EmaVetoResult {
-    /// Hard block — price sangat melawan trend (>2.5% dari EMA50)
     Hard(String),
-    /// Soft penalty — EMA alignment melawan tapi tidak ekstrem
-    /// Parameter: confidence_multiplier (misal 0.60 = potong 40%)
     Soft(f64),
-    /// Tidak ada conflict
     Clear,
 }
 
@@ -186,13 +175,20 @@ pub struct ConsensusEngine;
 impl ConsensusEngine {
     pub fn evaluate(&self, votes: &[AgentVote], snap: &MarketSnapshot) -> SignalOutput {
         let ts_ms = Utc::now().timestamp_millis();
-        let cfg   = get_style();
+
+        // [FIX-CONF] Baca style dari file setiap evaluate() — tidak ada OnceLock.
+        // Ini memungkinkan user ganti TRADING_STYLE di dashboard langsung efektif
+        // tanpa restart binary. File read cost ~microseconds, tradeoff OK.
+        let style_name = read_trading_style();
+        let cfg = make_style_config(&style_name);
+        log::debug!("[Consensus] [FIX-CONF] style={} min_conf={} min_agree={} tp_mult={} sl_mult={}",
+            cfg.style_name, cfg.min_confidence, cfg.min_agree, cfg.tp_atr_mult, cfg.sl_atr_mult);
 
         // Pre-compute EMA alignment sekali untuk semua checks
         let (ema9, ema21, ema50, ema_bear, ema_bull) = ema_alignment(snap);
 
         // ── VETO CHAIN (volatility crisis + noise) ───────────────────────────
-        if let Some(reason) = self.check_veto(votes, cfg) {
+        if let Some(reason) = self.check_veto(votes, &cfg) {
             log::warn!("[Consensus] VETO: {reason}");
             return self.make_wait(votes, reason, ts_ms);
         }
@@ -201,10 +197,10 @@ impl ConsensusEngine {
         let effective_weights = self.calc_effective_weights(votes, snap, ema_bear, ema_bull);
 
         // ── Weighted Scoring dengan active_w normalisasi [FIX-C3-v2] ─────────
-        let mut score       = 0.0_f64;
-        let mut active_w    = 0.0_f64;
-        let mut buy_count   = 0_usize;
-        let mut sell_count  = 0_usize;
+        let mut score      = 0.0_f64;
+        let mut active_w   = 0.0_f64;
+        let mut buy_count  = 0_usize;
+        let mut sell_count = 0_usize;
 
         for vote in votes {
             let w = effective_weights.iter()
@@ -225,7 +221,7 @@ impl ConsensusEngine {
             }
         }
 
-        // [FIX-C3-v2] Normalisasi dengan active_weight saja (bukan total_weight)
+        // [FIX-C3-v2] Normalisasi dengan active_weight saja
         if active_w > 0.05 {
             score /= active_w;
         } else {
@@ -257,32 +253,27 @@ impl ConsensusEngine {
             || (tentative_action == Direction::Sell && sell_count >= 4);
 
         let ema_veto = self.check_ema_trend_veto_v2(
-            tentative_action, snap.price, ema9, ema21, ema50, ema_bear, ema_bull
+            tentative_action, snap.price, ema9, ema21, ema50, ema_bear, ema_bull,
         );
 
         let action = match ema_veto {
             EmaVetoResult::Hard(ref reason) => {
-                // [FIX-C1-v2] Hard veto: price sangat melawan trend (>2.5%)
-                // [FIX-C6-NEW] Strong consensus TIDAK override hard veto
                 log::warn!("[Consensus] [FIX-C1-v2] HARD EMA VETO: {reason}");
                 return self.make_wait(votes, reason.clone(), ts_ms);
             }
             EmaVetoResult::Soft(multiplier) => {
                 if strong_consensus {
-                    // [FIX-C6-NEW] Strong consensus override soft veto
                     log::info!(
                         "[Consensus] [FIX-C6] Strong consensus ({} agents) override EMA soft veto",
                         if tentative_action == Direction::Buy { buy_count } else { sell_count }
                     );
                     tentative_action
                 } else {
-                    // [FIX-C1-v2] Apply confidence penalty
                     confidence *= multiplier;
                     log::info!(
                         "[Consensus] [FIX-C1-v2] EMA soft conflict — confidence penalized to {:.3} (×{:.2})",
                         confidence, multiplier
                     );
-                    // Re-check threshold setelah penalty
                     if confidence >= cfg.min_confidence {
                         tentative_action
                     } else {
@@ -350,59 +341,51 @@ impl ConsensusEngine {
         }
 
         log::info!(
-            "[Consensus] {:?} conf={:.3} BUY={buy_count} SELL={sell_count} score={score:.3} RR={rr:.2} EMA=({:.2},{:.2},{:.2}) bear={ema_bear} bull={ema_bull} strong={strong_consensus}",
-            action, confidence, ema9, ema21, ema50
+            "[Consensus] {:?} conf={:.3} BUY={buy_count} SELL={sell_count} score={score:.3} RR={rr:.2} style={} EMA=({:.2},{:.2},{:.2}) bear={ema_bear} bull={ema_bull} strong={strong_consensus}",
+            action, confidence, cfg.style_name, ema9, ema21, ema50
         );
 
         SignalOutput {
-            action, confidence, entry, take_profit: tp, stop_loss: sl,
-            risk_reward: rr, veto: false, veto_reason: String::new(),
-            agent_dirs, agent_convictions, ts_ms,
+            action,
+            confidence,
+            entry,
+            take_profit: tp,
+            stop_loss: sl,
+            risk_reward: rr,
+            veto: false,
+            veto_reason: String::new(),
+            agent_dirs,
+            agent_convictions,
+            ts_ms,
         }
     }
 
     // ═══════════════════════════════════════════════════════════════════════
-    // [FIX-C1-v2] check_ema_trend_veto_v2 — SOFT + HARD veto
-    //
-    // SEBELUMNYA (v1):
-    //   Hard veto saat price < ema50 * 0.995 (0.5% di bawah) → TERLALU AGRESIF
-    //   Semua buy di downtrend ringan langsung diblok → "gada entry sama sekali"
-    //
-    // SESUDAH (v2):
-    //   HARD veto  : price < ema50 * 0.975 (2.5% di bawah = downtrend serius)
-    //   SOFT veto  : price antara ema50*0.975 dan ema50*1.0 (ema bear + sedikit di bawah)
-    //                → confidence *= 0.60 (potong 40%), tidak langsung diblok
-    //   CLEAR      : price di atas ema50 atau tidak ada EMA conflict
-    //
-    // Untuk SELL di uptrend:
-    //   HARD veto  : price > ema50 * 1.025 (2.5% di atas)
-    //   SOFT veto  : price antara ema50*1.0 dan ema50*1.025
+    // [FIX-C1-v2] EMA trend veto — SOFT + HARD
+    // HARD  : price > 2.5% melawan EMA50 saat bear/bull align
+    // SOFT  : price sedikit melawan — confidence *= 0.60
+    // CLEAR : tidak ada conflict
     // ═══════════════════════════════════════════════════════════════════════
     fn check_ema_trend_veto_v2(
         &self,
         action: Direction,
         price: f64,
         ema9: f64, ema21: f64, ema50: f64,
-        ema_bear: bool, ema_bull: bool
+        ema_bear: bool, ema_bull: bool,
     ) -> EmaVetoResult {
         match action {
             Direction::Buy => {
                 if ema_bear {
                     if price < ema50 * 0.975 {
-                        // [FIX-C1-v2] HARD VETO: harga 2.5%+ di bawah EMA50 + bear align
-                        // Ini beneran downtrend serius, LSR whale tidak bisa justify entry
                         EmaVetoResult::Hard(format!(
                             "[FIX-C1-v2] BUY HARD blocked: EMA bear-align (9={:.2}<21={:.2}<50={:.2}) \
-                             + price={:.4} far below EMA50*0.975={:.4} ({:.2}% gap) — trend too strong",
+                             + price={:.4} far below EMA50*0.975={:.4} ({:.2}% gap)",
                             ema9, ema21, ema50, price, ema50 * 0.975,
                             (ema50 - price) / ema50 * 100.0
                         ))
                     } else if price < ema50 {
-                        // [FIX-C1-v2] SOFT VETO: harga sedikit di bawah EMA50 + bear align
-                        // Masih bisa entry tapi butuh lebih yakin (confidence dipotong 40%)
                         EmaVetoResult::Soft(0.60)
                     } else {
-                        // Harga di atas EMA50 meski EMA alignment bearish — valid untuk kontratrend
                         EmaVetoResult::Clear
                     }
                 } else {
@@ -412,15 +395,13 @@ impl ConsensusEngine {
             Direction::Sell => {
                 if ema_bull {
                     if price > ema50 * 1.025 {
-                        // [FIX-C1-v2] HARD VETO: harga 2.5%+ di atas EMA50 + bull align
                         EmaVetoResult::Hard(format!(
                             "[FIX-C1-v2] SELL HARD blocked: EMA bull-align (9={:.2}>21={:.2}>50={:.2}) \
-                             + price={:.4} far above EMA50*1.025={:.4} ({:.2}% gap) — uptrend too strong",
+                             + price={:.4} far above EMA50*1.025={:.4} ({:.2}% gap)",
                             ema9, ema21, ema50, price, ema50 * 1.025,
                             (price - ema50) / ema50 * 100.0
                         ))
                     } else if price > ema50 {
-                        // [FIX-C1-v2] SOFT VETO: harga sedikit di atas EMA50 + bull align
                         EmaVetoResult::Soft(0.60)
                     } else {
                         EmaVetoResult::Clear
@@ -434,7 +415,7 @@ impl ConsensusEngine {
     }
 
     // ═══════════════════════════════════════════════════════════════════════
-    // [FIX-C2] DYNAMIC WEIGHT DAMPENING — dipertahankan dari v1
+    // [FIX-C2] Dynamic weight dampening
     // ═══════════════════════════════════════════════════════════════════════
     fn calc_effective_weights(
         &self,
@@ -453,7 +434,6 @@ impl ConsensusEngine {
                         let conflicts = (ema_bear && vote.direction == Direction::Buy)
                             || (ema_bull && vote.direction == Direction::Sell);
                         if conflicts {
-                            // [FIX-C2] LSR fake signal: absurdist weight dikurangi 70%
                             let old_w = *weight;
                             *weight *= ABSURDIST_DAMP;
                             log::debug!(
@@ -464,7 +444,6 @@ impl ConsensusEngine {
                     }
                 }
                 "linguist" => {
-                    // [FIX-C2] Berita sedikit = noise tinggi, kurangi pengaruh
                     if snap.news_count < 3 {
                         *weight *= LINGUIST_DAMP;
                     }
@@ -475,7 +454,6 @@ impl ConsensusEngine {
         ew
     }
 
-    // VETO CHAIN lama: noise + volatility crisis — dipertahankan
     fn check_veto(&self, votes: &[AgentVote], cfg: &StyleConfig) -> Option<String> {
         if let Some(v) = votes.iter().find(|v| v.agent == "physicist") {
             if v.reasoning.contains("VOLATILITY CRISIS") {
@@ -506,9 +484,17 @@ impl ConsensusEngine {
             agent_convictions[i] = v.conviction;
         }
         SignalOutput {
-            action: Direction::Wait, confidence: 0.0,
-            entry: 0.0, take_profit: 0.0, stop_loss: 0.0, risk_reward: 0.0,
-            veto: true, veto_reason: reason, agent_dirs, agent_convictions, ts_ms,
+            action: Direction::Wait,
+            confidence: 0.0,
+            entry: 0.0,
+            take_profit: 0.0,
+            stop_loss: 0.0,
+            risk_reward: 0.0,
+            veto: true,
+            veto_reason: reason,
+            agent_dirs,
+            agent_convictions,
+            ts_ms,
         }
     }
 }
@@ -531,19 +517,22 @@ fn parse_f64_field(s: &str, field: &str) -> Option<f64> {
 fn liq_tp_above(snap: &MarketSnapshot, price: f64, atr: f64, look_mult: f64) -> Option<f64> {
     let look_range = atr * look_mult;
     let total_vol: f64 = snap.candles.iter().map(|c| c.vol).sum();
-    if total_vol < 1.0 { return None; }
-
+    if total_vol < 1.0 {
+        return None;
+    }
     let mut candidates: Vec<f64> = Vec::new();
     for candle in &snap.candles {
         let vwap = (candle.high + candle.low + candle.close) / 3.0;
         for &lev in &[10.0_f64, 20.0, 25.0] {
-            let short_liq = vwap * (1.0 + 1.0/lev - 0.004);
+            let short_liq = vwap * (1.0 + 1.0 / lev - 0.004);
             if short_liq > price && (short_liq - price) < look_range {
                 candidates.push(short_liq);
             }
         }
     }
-    if candidates.is_empty() { None } else {
+    if candidates.is_empty() {
+        None
+    } else {
         candidates.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
         Some(candidates[candidates.len() / 4])
     }
@@ -555,13 +544,15 @@ fn liq_tp_below(snap: &MarketSnapshot, price: f64, atr: f64, look_mult: f64) -> 
     for candle in &snap.candles {
         let vwap = (candle.high + candle.low + candle.close) / 3.0;
         for &lev in &[10.0_f64, 20.0, 25.0] {
-            let long_liq = vwap * (1.0 - 1.0/lev + 0.004);
+            let long_liq = vwap * (1.0 - 1.0 / lev + 0.004);
             if long_liq < price && (price - long_liq) < look_range {
                 candidates.push(long_liq);
             }
         }
     }
-    if candidates.is_empty() { None } else {
+    if candidates.is_empty() {
+        None
+    } else {
         candidates.sort_unstable_by(|a, b| b.partial_cmp(a).unwrap());
         Some(candidates[candidates.len() / 4])
     }
