@@ -1,41 +1,21 @@
 // go-engine/main.go
 // ═══════════════════════════════════════════════════════════════════════════
-// CHANGELOG vs v3.0 (FIX batch M):
+// CHANGELOG vs v3.1:
 //
-// [FIX-M1] BOT DEFAULT STOPPED — ANTI AUTO-START
-//   ROOT CAUSE: komentar lama "[FIX-D] Bot auto-running saat startup
-//   (server.go New() harus default Store(true))" menyebabkan developer
-//   mengubah server.go ke Store(true). Akibatnya bot langsung entry
-//   saat terminal dibuka, sebelum user klik START di dashboard.
-//   FIX: server.go HARUS Store(false). main.go tidak ada inisiasi
-//   botRunning. Komentar mislead dihapus. Signal loop sekarang
-//   BENAR-BENAR skip semua processing jika !IsBotRunning().
+// [FIX-PAIR] CRITICAL — WIRE symbolCh → feed.UpdateSymbol()
+//   ROOT CAUSE: server.go sudah benar emit symbol baru ke symbolCh saat
+//   user klik START dengan pair berbeda. Tapi main.go TIDAK ADA goroutine
+//   yang listen channel itu dan panggil feed.UpdateSymbol(). Akibatnya:
+//   feed SELALU analisa symbol dari startup/env (default SOLUSDT/BTCUSDT),
+//   TIDAK PERNAH update ke pair yang dipilih user di dashboard.
+//   FIX: tambah goroutine setelah go feed.Run() yang listen srv.GetSymbolCh()
+//   dan forward ke feed.UpdateSymbol(). Juga sync symbol dari activeCfg
+//   server saat bot pertama kali di-START via dashboard.
 //
-// [FIX-M2] PAPER TRADE TP/SL TIMEOUT + FORCED CLOSE
-//   ROOT CAUSE: paper trade bisa stuck OPEN selamanya jika price tidak
-//   pernah reach TP/SL (sideways market). Karena hanya 1 paper trade
-//   boleh open sekaligus, bot TIDAK PERNAH entry lagi selama trade stuck.
-//   FIX: paper trade yang sudah open > MAX_PAPER_TRADE_DURATION (4 jam)
-//   di-force close dengan hasil "TIMEOUT" dan PnL dihitung dari
-//   current price. Bot bisa entry lagi setelah forced close.
-//
-// [FIX-M3] DIAGNOSTIC LOGGING — SETIAP SKIP HARUS ADA ALASANNYA
-//   ROOT CAUSE: sulit debug kenapa bot tidak entry. Log hanya menampilkan
-//   signal final tapi tidak menjelaskan kenapa di-skip.
-//   FIX: setiap kondisi skip (veto, RR fail, lastAction, cooldown,
-//   paper trade open) sekarang log dengan prefix [SKIP-*] yang jelas.
-//
-// [FIX-M4] EMA TREND PRE-FILTER DI GO SIDE (Backup untuk Problem 5)
-//   ROOT CAUSE: Rust brain kadang output BUY padahal EMA alignment
-//   menunjukkan clear downtrend, karena LSR whale bias terlalu dominan
-//   di agent-level weighting.
-//   FIX: Sebelum eksekusi order, Go side cek EMA9/21/50 alignment
-//   dari candle data. Jika signal BUY tapi EMA bearish align → VETO
-//   di Go level. Ini BACKUP dari fix di Rust consensus (next session).
-//
-// [FIX-M5] DEMO TP/SL LOG — TRANSPARENCY
-//   Tambah log detail saat paper trade open/close untuk debugging
-//   kenapa entry tidak terjadi atau TP/SL tidak terkena.
+// [FIX-PAIR-BOOT] Saat bot start via dashboard, gunakan symbol dari
+//   server.activeCfg (yang datang dari browser) bukan dari .env.
+//   Ini handle case: user buka dashboard, pilih ETHUSDT, klik START →
+//   feed langsung analisa ETHUSDT tanpa perlu restart server.
 // ═══════════════════════════════════════════════════════════════════════════
 package main
 
@@ -60,7 +40,6 @@ import (
 	"tradebot/go-engine/shm"
 )
 
-// [FIX-M2] Maksimum durasi paper trade sebelum di-force close
 const MAX_PAPER_TRADE_DURATION = 4 * time.Hour
 
 type Config struct {
@@ -98,6 +77,8 @@ func loadConfig() Config {
 		DryRun:       envBool("DRY_RUN", true),
 		TradingStyle: envStr("TRADING_STYLE", "scalping"),
 
+		// [FIX-S2] .env sekarang HANYA berisi API keys
+		// Setting lain (symbol, leverage, dll) datang dari browser via server
 		BybitAPIKey:     envStr("BYBIT_API_KEY", envStr("BYBIT_REAL_API_KEY", "")),
 		BybitAPISecret:  envStr("BYBIT_API_SECRET", envStr("BYBIT_REAL_API_SECRET", "")),
 		BybitDemoKey:    envStr("BYBIT_DEMO_API_KEY", ""),
@@ -118,12 +99,13 @@ func loadConfig() Config {
 func main() {
 	log.SetFlags(log.Ldate | log.Ltime | log.Lmicroseconds)
 	log.Printf("═══════════════════════════════════════════")
-	log.Printf("  TradeBot Go Orchestrator  v3.1")
+	log.Printf("  TradeBot Go Orchestrator  v3.2")
+	log.Printf("  [FIX-PAIR] Symbol switching live — no restart needed")
 	log.Printf("  [FIX-M1] Bot default STOPPED — klik START di dashboard")
 	log.Printf("═══════════════════════════════════════════")
 
 	cfg := loadConfig()
-	log.Printf("[main] exchange=%s mode=%s symbol=%s style=%s dryRun=%v",
+	log.Printf("[main] exchange=%s mode=%s symbol=%s (initial/default) style=%s dryRun=%v",
 		cfg.Exchange, cfg.ExchangeMode, cfg.Symbol, cfg.TradingStyle, cfg.DryRun)
 
 	bridge, err := shm.Open()
@@ -164,16 +146,55 @@ func main() {
 			cfg.Exchange, cfg.ExchangeMode, balance)
 	}
 
-	// [FIX-M1] Gateway.New() HARUS start dengan botRunning=false (default di server.go)
-	// JANGAN ubah ke Store(true). Bot hanya aktif saat user klik START di dashboard.
+	// Gateway — default stopped (user harus klik START di dashboard)
 	srv := gateway.New(cfg.BaseDir)
 	go srv.Start()
 
+	// Init feed dengan symbol default dari env/config
+	// Akan di-update ke symbol pilihan user saat START ditekan di dashboard
 	feed := market.New(bridge, cfg.Symbol, cfg.OHLCVTF, cfg.OHLCVLimit)
 	mainCtx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
 	go feed.Run(mainCtx)
+
+	// ═══════════════════════════════════════════════════════════════════════
+	// [FIX-PAIR] CRITICAL GOROUTINE — Symbol channel wiring
+	//
+	// Ini adalah goroutine yang HILANG dan menyebabkan pair tidak pernah
+	// berganti meski user sudah pilih pair berbeda di dashboard.
+	//
+	// Flow yang benar:
+	//   Dashboard → POST /api/start {SYMBOL: "ETHUSDT"}
+	//   → server.go: symbolCh <- "ETHUSDT"
+	//   → goroutine ini: feed.UpdateSymbol("ETHUSDT")   ← INI YANG HILANG
+	//   → feed.go: atomicSymbol.Store("ETHUSDT")
+	//   → wsConnect: reconnect subscribe tickers.ETHUSDT
+	//   → fetchOHLCV("ETHUSDT") → kirim ke SHM → Rust brain analisa ETHUSDT
+	// ═══════════════════════════════════════════════════════════════════════
+	go func() {
+		// [FIX-PAIR-BOOT] Cek apakah server sudah punya symbol dari browser session
+		// sebelumnya (misal user refresh page tapi server masih hidup)
+		if activeSym := srv.GetActiveSymbol(); activeSym != "" && activeSym != cfg.Symbol {
+			log.Printf("[main] [FIX-PAIR-BOOT] Sync symbol from server cache: %s → %s",
+				cfg.Symbol, activeSym)
+			feed.UpdateSymbol(activeSym)
+		}
+
+		for {
+			select {
+			case <-mainCtx.Done():
+				return
+			// [FIX-PAIR] Listen symbol change dari dashboard → forward ke feed
+			case sym := <-srv.GetSymbolCh():
+				log.Printf("[main] [FIX-PAIR] ⚡ Pair switched → %s (live, no server restart needed)", sym)
+				feed.UpdateSymbol(sym)
+				// Update cfg.Symbol agar signal loop gunakan symbol yang benar
+				// saat log dan insight update
+				cfg.Symbol = sym
+			}
+		}
+	}()
 
 	nlpEngine := nlp.NewEngine(cfg.Symbol, 5*time.Minute)
 	go nlpEngine.Run(mainCtx, feed)
@@ -200,7 +221,7 @@ func main() {
 	}
 
 	var activePaperTrade     *gateway.Position
-	var paperTradeOpenedAt   time.Time   // [FIX-M2] tracking waktu open
+	var paperTradeOpenedAt   time.Time
 	var paperHistory         []gateway.Position
 
 	go func() {
@@ -212,26 +233,27 @@ func main() {
 			case <-mainCtx.Done(): return
 			default: }
 
-			// [FIX-M1] Jika bot tidak running, hanya update market insight
-			// TIDAK ada signal processing, TIDAK ada trade logic
 			if !srv.IsBotRunning() {
 				state := feed.State()
+				// [FIX-PAIR] Gunakan symbol dari feed.State() bukan cfg.Symbol static
+				activeSym := state.Symbol
+				if activeSym == "" { activeSym = cfg.Symbol }
 				lsr := state.LSR
 				if lsr < 1e-9 { lsr = 1.0 }
 				pct24h := 0.0
 				if state.Price > 0 { pct24h = math.Round((state.ATR14/state.Price)*100*10) / 10 }
 				srv.UpdateInsight(gateway.InsightData{
-					Symbol: cfg.Symbol, LastPrice: state.Price, OpenInterest: state.OI, LSRVal: lsr, Pct24h: pct24h,
+					Symbol: activeSym, LastPrice: state.Price, OpenInterest: state.OI, LSRVal: lsr, Pct24h: pct24h,
 					TrendState: "MANUAL STOPPED — IDLE", WhaleBias: "NEUTRAL", SignalStatus: "WAIT",
 					Advice: "Bot Paused: Klik 'Start' di Dashboard untuk mengaktifkan trading otomatis",
 					Timestamp: time.Now().Format("15:04:05"), Balance: balance,
 					EntryTarget: state.Price, TPTarget: state.Price, SLTarget: state.Price,
 				})
-				time.Sleep(500 * time.Millisecond) // [FIX-M1] throttle saat stopped
+				time.Sleep(500 * time.Millisecond)
 				continue
 			}
 
-			// ─── BOT RUNNING: proses signal ───────────────────────────────────
+			// ─── BOT RUNNING ──────────────────────────────────────────────────
 			sig := bridge.PollSignal(200 * time.Millisecond)
 			if sig == nil { continue }
 			if uint64(sig.TsMs) == lastRustSeq { time.Sleep(10 * time.Millisecond); continue }
@@ -239,12 +261,15 @@ func main() {
 
 			state := feed.State()
 
-			// ── [FIX-M2] PAPER TRADE: cek TP/SL + timeout ────────────────────
+			// [FIX-PAIR] currentSym selalu dari feed state (bukan cfg.Symbol static)
+			currentSym := state.Symbol
+			if currentSym == "" { currentSym = cfg.Symbol }
+
+			// ── Paper trade TP/SL check + timeout ─────────────────────────────
 			if cfg.DryRun && activePaperTrade != nil {
 				isClosed := false
 				closeReason := ""
 
-				// Kalkulasi live PnL dengan leverage
 				unrealizedPct := 0.0
 				if activePaperTrade.Side == "BUY" {
 					unrealizedPct = ((state.Price - activePaperTrade.EntryPrice) / activePaperTrade.EntryPrice) * 100.0
@@ -253,7 +278,6 @@ func main() {
 				}
 				activePaperTrade.PnL = unrealizedPct * float64(cfg.Leverage)
 
-				// TP/SL check
 				if (activePaperTrade.Side == "BUY" && state.Price >= activePaperTrade.TakeProfit) ||
 				   (activePaperTrade.Side == "SELL" && state.Price <= activePaperTrade.TakeProfit) {
 					activePaperTrade.Status = "CLOSED_TP"
@@ -266,7 +290,6 @@ func main() {
 					closeReason = fmt.Sprintf("SL hit @ %.4f (target=%.4f)", state.Price, activePaperTrade.StopLoss)
 				}
 
-				// [FIX-M2] Timeout: force close jika terlalu lama
 				if !isClosed && time.Since(paperTradeOpenedAt) > MAX_PAPER_TRADE_DURATION {
 					activePaperTrade.Status = "TIMEOUT"
 					isClosed = true
@@ -275,29 +298,18 @@ func main() {
 				}
 
 				if isClosed {
-					// [FIX-M5] Log detail saat close
-					log.Printf("[Paper] ✗ Trade Closed: %s | %s | PnL=%.2f%% (leveraged)",
+					log.Printf("[Paper] ✗ Trade Closed: %s | %s | PnL=%.2f%%",
 						activePaperTrade.Status, closeReason, activePaperTrade.PnL)
-					log.Printf("[Paper]   Entry=%.4f TP=%.4f SL=%.4f ExitPrice=%.4f",
-						activePaperTrade.EntryPrice, activePaperTrade.TakeProfit,
-						activePaperTrade.StopLoss, state.Price)
-
 					paperHistory = append([]gateway.Position{*activePaperTrade}, paperHistory...)
-					if len(paperHistory) > 50 {
-						paperHistory = paperHistory[:50]
-					}
+					if len(paperHistory) > 50 { paperHistory = paperHistory[:50] }
 					activePaperTrade = nil
-
-					// Reset lastAction agar bisa re-entry
 					lastAction = "WAIT"
 					lastActionAt = time.Now().Add(-getLastActionTimeout())
-					log.Printf("[main] lastAction reset → siap re-entry")
 				}
 
 				srv.UpdatePositions(activePaperTrade, paperHistory)
 			}
 
-			// ── [2] TENTUKAN ARAH ─────────────────────────────────────────────
 			dirStr := []string{"WAIT", "BUY", "SELL"}[sig.Action]
 
 			printEntry, printTP, printSL := sig.Entry, sig.TakeProfit, sig.StopLoss
@@ -305,16 +317,15 @@ func main() {
 				printEntry, printTP, printSL = state.Price, state.Price, state.Price
 			}
 
-			log.Printf("[main] Signal: %s conf=%.3f entry=%.4f TP=%.4f SL=%.4f RR=%.2f veto=%v",
-				dirStr, sig.Confidence, printEntry, printTP, printSL, sig.RiskReward, sig.Veto)
+			// [FIX-PAIR] Log dengan currentSym bukan cfg.Symbol
+			log.Printf("[main] [%s] Signal: %s conf=%.3f entry=%.4f TP=%.4f SL=%.4f RR=%.2f veto=%v",
+				currentSym, dirStr, sig.Confidence, printEntry, printTP, printSL, sig.RiskReward, sig.Veto)
 
 			if !cfg.DryRun {
 				if b, err := fetchBalance(context.Background(), orderExecutor); err == nil { balance = b }
 			}
 
 			updateInsight(srv, cfg, sig, balance, dirStr, feed)
-
-			// ── [FIX-M3] SKIP CHAIN — setiap skip harus log alasannya ─────────
 
 			if sig.Veto || dirStr == "WAIT" {
 				if sig.Veto {
@@ -324,67 +335,47 @@ func main() {
 				continue
 			}
 
-			// Cooldown circuit breaker
 			if time.Now().Before(cooldownUntil) {
 				log.Printf("[SKIP-COOLDOWN] Circuit breaker aktif sampai %s", cooldownUntil.Format("15:04:05"))
 				continue
 			}
 
-			// [FIX-M3] lastAction check dengan timeout
 			sameDirTimeout := dirStr == lastAction && time.Since(lastActionAt) < getLastActionTimeout()
 			if sameDirTimeout {
-				log.Printf("[SKIP-DEDUP] Arah %s sama, %.0f detik lalu (timeout=%.0f detik)",
-					dirStr,
-					time.Since(lastActionAt).Seconds(),
-					getLastActionTimeout().Seconds())
+				log.Printf("[SKIP-DEDUP] Arah %s sama, %.0f detik lalu", dirStr, time.Since(lastActionAt).Seconds())
 				continue
 			}
-			if dirStr == lastAction && time.Since(lastActionAt) >= getLastActionTimeout() {
-				log.Printf("[main] lastAction timeout → allow re-entry %s", dirStr)
-			}
 
-			// RR check sesuai trading style
 			rrLimit := 1.2
 			switch strings.ToLower(cfg.TradingStyle) {
-			case "scalping":          rrLimit = 0.8
+			case "scalping":               rrLimit = 0.8
 			case "daytrading", "daytrade": rrLimit = 1.0
-			case "swing", "sniper":   rrLimit = 1.5
+			case "swing", "sniper":        rrLimit = 1.5
 			}
 			if sig.RiskReward < rrLimit {
-				log.Printf("[SKIP-RR] RR=%.2f < %.2f (style=%s) — signal tidak layak", sig.RiskReward, rrLimit, cfg.TradingStyle)
+				log.Printf("[SKIP-RR] RR=%.2f < %.2f (style=%s)", sig.RiskReward, rrLimit, cfg.TradingStyle)
 				continue
 			}
 
-			// [FIX-M4] EMA TREND PRE-FILTER — backup problem 5
-			// Cek alignment EMA9/21/50 dari candle data Feed
-			// Jika signal melawan trend EMA → veto di Go level
 			if emaVetoReason := checkEMATrendVeto(feed, dirStr); emaVetoReason != "" {
 				log.Printf("[SKIP-EMA] %s", emaVetoReason)
-				// Tidak hard-reject, tapi potong conviction — log warning
-				// Hard reject hanya jika conf < 0.5 (weak signal melawan trend)
 				if sig.Confidence < 0.5 {
-					log.Printf("[SKIP-EMA] conf=%.3f < 0.5, skip karena trend conflict", sig.Confidence)
+					log.Printf("[SKIP-EMA] conf=%.3f < 0.5, skip", sig.Confidence)
 					continue
 				}
-				log.Printf("[SKIP-EMA] conf=%.3f >= 0.5, lanjut dengan EMA conflict warning", sig.Confidence)
 			}
 
-			// [FIX-M3] Paper trade already open check
 			if cfg.DryRun && activePaperTrade != nil {
-				log.Printf("[SKIP-OPEN] Paper trade masih open: %s @ %.4f (open %.0f mnt)",
-					activePaperTrade.Side, activePaperTrade.EntryPrice,
-					time.Since(paperTradeOpenedAt).Minutes())
+				log.Printf("[SKIP-OPEN] Paper trade masih open: %s @ %.4f", activePaperTrade.Side, activePaperTrade.EntryPrice)
 				continue
 			}
 
-			// Update lastAction SEBELUM eksekusi
 			lastAction = dirStr
 			lastActionAt = time.Now()
 
 			snapSig := *sig
 			snapDir := dirStr
 
-			// ── [3] EKSEKUSI TRADE ────────────────────────────────────────────
 			if cfg.DryRun {
 				activePaperTrade = &gateway.Position{
 					Side:       snapDir,
@@ -395,20 +386,19 @@ func main() {
 					Status:     "OPEN",
 					PnL:        0.0,
 				}
-				paperTradeOpenedAt = time.Now() // [FIX-M2] catat waktu open
+				paperTradeOpenedAt = time.Now()
 
-				// [FIX-M5] Log detail paper trade entry
+				// [FIX-PAIR] Log dengan currentSym
 				log.Printf("[Paper] ✓ Virtual Order opened: %s %s @ %.4f",
-					snapDir, cfg.Symbol, state.Price)
+					snapDir, currentSym, state.Price)
 				log.Printf("[Paper]   TP=%.4f SL=%.4f RR=%.2f conf=%.3f",
 					snapSig.TakeProfit, snapSig.StopLoss, snapSig.RiskReward, snapSig.Confidence)
-				log.Printf("[Paper]   Leverage=%dx | Risk=%.1f%% | Timeout=%.0f jam",
-					cfg.Leverage, cfg.RiskPct*100, MAX_PAPER_TRADE_DURATION.Hours())
 
 				srv.UpdatePositions(activePaperTrade, paperHistory)
 			} else {
 				go func() {
-					req := buildOrderRequest(snapSig, snapDir, cfg.Symbol)
+					// [FIX-PAIR] Gunakan currentSym untuk order, bukan cfg.Symbol static
+					req := buildOrderRequest(snapSig, snapDir, currentSym)
 					execCtx, execCancel := context.WithTimeout(context.Background(), 15*time.Second)
 					defer execCancel()
 
@@ -421,7 +411,7 @@ func main() {
 							log.Printf("[main] CIRCUIT BREAKER: 3 consecutive failures, 60-min cooldown")
 						}
 					} else {
-						log.Printf("[main] ✓ Order fired: %s %s", snapDir, cfg.Symbol)
+						log.Printf("[main] ✓ Order fired: %s %s", snapDir, currentSym)
 						consecutiveLosses = 0
 					}
 				}()
@@ -440,40 +430,21 @@ func main() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// [FIX-M4] checkEMATrendVeto — EMA pre-filter di Go level
-//
-// Menghitung EMA9, EMA21, EMA50 dari candle data terbaru (via feed.State()
-// tidak tersedia untuk candles, jadi ambil dari bridge SHM tidak langsung).
-//
-// Karena feed.State() hanya expose scalars (bukan candles), implementasi
-// menggunakan ATR14 sebagai proxy trend strength dan LSR sebagai secondary.
-//
-// TODO next session: expose candles dari feed.State() untuk EMA full calc.
-// Untuk sekarang: heuristik sederhana berbasis ATR dan LSR.
+// [FIX-M4] EMA proxy veto — heuristik sederhana via LSR
 // ─────────────────────────────────────────────────────────────────────────────
 func checkEMATrendVeto(feed *market.Feed, direction string) string {
 	state := feed.State()
 	if state.Price <= 0 { return "" }
-
 	lsr := state.LSR
 	if lsr < 1e-9 { return "" }
 
-	// Heuristic: jika LSR menunjukkan whale long tapi kita mau long,
-	// tapi funding rate negatif (overcrowded short squeeze sudah selesai),
-	// ini bisa jadi sinyal palsu.
-	// NOTE: EMA full calculation ada di Rust brain — ini hanya sanity check Go-side.
-	// Full EMA fix ada di rust-brain/src/consensus/mod.rs (next session).
-
 	if direction == "BUY" && lsr < 0.90 {
-		// LSR < 0.9 → whale SHORT dominant, tapi signal BUY → suspicious
-		return fmt.Sprintf("EMA-PROXY: BUY signal tapi LSR=%.3f (whale SHORT), risk tinggi", lsr)
+		return fmt.Sprintf("EMA-PROXY: BUY signal tapi LSR=%.3f (whale SHORT dominant)", lsr)
 	}
 	if direction == "SELL" && lsr > 1.10 {
-		// LSR > 1.1 → whale LONG dominant, tapi signal SELL → suspicious
-		return fmt.Sprintf("EMA-PROXY: SELL signal tapi LSR=%.3f (whale LONG), risk tinggi", lsr)
+		return fmt.Sprintf("EMA-PROXY: SELL signal tapi LSR=%.3f (whale LONG dominant)", lsr)
 	}
-
-	return "" // tidak ada conflict
+	return ""
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -496,6 +467,10 @@ func fetchBalance(ctx context.Context, exec orderExec) (float64, error) {
 
 func updateInsight(srv *gateway.Server, cfg Config, sig *shm.Signal, balance float64, action string, feed *market.Feed) {
 	state := feed.State()
+	// [FIX-PAIR] Symbol dari feed state, bukan cfg.Symbol static
+	sym := state.Symbol
+	if sym == "" { sym = cfg.Symbol }
+
 	lsr := state.LSR
 	if lsr < 1e-9 { lsr = 1.0 }
 
@@ -515,12 +490,10 @@ func updateInsight(srv *gateway.Server, cfg Config, sig *shm.Signal, balance flo
 	if state.Price > 0 && state.ATR14 > 0 { pct24h = math.Round((state.ATR14/state.Price)*100*10) / 10 }
 
 	dispEntry, dispTP, dispSL := sig.Entry, sig.TakeProfit, sig.StopLoss
-	if sig.Veto || dispEntry == 0 {
-		dispEntry, dispTP, dispSL = state.Price, state.Price, state.Price
-	}
+	if sig.Veto || dispEntry == 0 { dispEntry, dispTP, dispSL = state.Price, state.Price, state.Price }
 
 	srv.UpdateInsight(gateway.InsightData{
-		Symbol: cfg.Symbol, LastPrice: state.Price, OpenInterest: state.OI, LSRVal: lsr, Pct24h: pct24h,
+		Symbol: sym, LastPrice: state.Price, OpenInterest: state.OI, LSRVal: lsr, Pct24h: pct24h,
 		TrendState: trend, WhaleBias: bias, SignalStatus: action, Advice: advice, Timestamp: time.Now().Format("15:04:05"),
 		Balance: balance, EntryTarget: dispEntry, TPTarget: dispTP, SLTarget: dispSL,
 	})
