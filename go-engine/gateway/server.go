@@ -15,19 +15,22 @@
 //   Tulis bot_runtime.conf dengan semua non-key settings (TRADING_STYLE dll)
 //   setiap kali activeCfg diupdate. Rust brain baca dari bot_runtime.conf.
 //
-// [FIX-START-ALWAYS] ← BARU — ROOT CAUSE FIX pair salah dianalisa
+// [FIX-START-ALWAYS] Selalu emit symbol ke symbolCh setiap kali START ditekan.
+//   feed.UpdateSymbol() sudah handle no-op jika symbol sama.
+//
+// [FIX-SYMBOL-LIVE] ← BARU — ROOT CAUSE FIX pair selalu analisa BTC/default
 //   BUG LAMA:
-//     1. Page load → 500ms timer → saveConfig() → POST /api/save-env
-//        → handleSaveEnv → activeCfg["SYMBOL"] = "ETHUSDT"
-//     2. User klik START → POST /api/start {SYMBOL:"ETHUSDT"}
-//        → handleStart: oldSym = activeCfg["SYMBOL"] = "ETHUSDT"
-//        → newSym = "ETHUSDT" = oldSym
-//        → kondisi `newSym != oldSym` FALSE → symbolCh TIDAK DIKIRIM
-//        → feed TETAP analisa pair dari .env default (SOLUSDT/BTCUSDT)
+//     symbolCh HANYA dikirim dari handleStart. Artinya feed tidak pernah
+//     ganti pair sampai user klik START. Padahal browser sudah kirim pair
+//     yang dipilih 500ms setelah load (timer di dashboard.js loadConfig()).
+//     Akibat: feed tetap analisa symbol dari .env default (SOLUSDT/BTCUSDT)
+//     bahkan setelah user pilih pair lain di dropdown — karena START belum
+//     diklik, atau karena timing race di [FIX-PAIR-BOOT] di main.go.
 //   FIX:
-//     Hapus kondisi `newSym != oldSym`. Selalu emit ke symbolCh setiap
-//     START ditekan. feed.UpdateSymbol() sudah handle no-op jika symbol
-//     benar-benar sama di level feed (atomic compare), jadi aman.
+//     Emit symbolCh JUGA dari handleSaveEnv saat SYMBOL berubah.
+//     Ini memastikan feed langsung ganti pair begitu browser save config
+//     (500ms setelah load, atau setiap kali user ganti dropdown).
+//     handleStart tetap emit juga sebagai safety net saat user klik START.
 // ═══════════════════════════════════════════════════════════════════════════════
 package gateway
 
@@ -121,13 +124,13 @@ func New(baseDir string) *Server {
 		baseDir:   baseDir,
 		insight:   InsightData{SignalStatus: "WAIT", TrendState: "RANGING"},
 		history:   make([]Position, 0),
-		// [FIX-START-ALWAYS] Buffer 2 agar emit dua kali cepat tidak block
-		symbolCh:  make(chan string, 2),
+		// Buffer 4: handleSaveEnv + handleStart bisa emit tanpa block
+		symbolCh:  make(chan string, 4),
 		activeCfg: make(map[string]string),
 	}
 	s.botRunning.Store(false)
 
-	// [FIX-S4] Seed activeCfg dari .env lama (backward compat, API keys filtered out)
+	// [FIX-S4] Seed activeCfg dari .env — hanya non-API-key fields
 	existing := parseEnvFile(filepath.Join(baseDir, EnvFile))
 	for k, v := range existing {
 		if !apiKeyNames[k] && v != "" {
@@ -325,6 +328,8 @@ func (s *Server) handleGetEnv(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleSaveEnv — [FIX-S2] HANYA tulis API keys ke .env file.
+// [FIX-SYMBOL-LIVE] Emit symbolCh saat SYMBOL berubah agar feed langsung update
+// tanpa menunggu user klik START.
 func (s *Server) handleSaveEnv(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", 405)
@@ -341,16 +346,58 @@ func (s *Server) handleSaveEnv(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// ═══════════════════════════════════════════════════════════════════════
+	// [FIX-SYMBOL-LIVE] Capture oldSym sebelum update untuk deteksi perubahan
+	// ═══════════════════════════════════════════════════════════════════════
 	s.mu.Lock()
+	oldSym := s.activeCfg["SYMBOL"] // capture SEBELUM update
 	for k, v := range data {
 		if !apiKeyNames[k] && v != "" {
 			s.activeCfg[k] = v
 		}
 	}
+	newSym := s.activeCfg["SYMBOL"] // capture SESUDAH update
 	s.mu.Unlock()
 
 	s.writeRuntimeConfig()
 
+	// ═══════════════════════════════════════════════════════════════════════
+	// [FIX-SYMBOL-LIVE] Emit ke symbolCh segera jika SYMBOL berubah.
+	//
+	// KENAPA INI FIX KRITIS:
+	//   Sebelumnya, symbolCh HANYA dikirim dari handleStart (saat user klik START).
+	//   Akibatnya, feed tidak pernah ganti pair walau user sudah pilih pair baru
+	//   di dropdown — karena START belum diklik.
+	//
+	//   dashboard.js loadConfig() punya 500ms timer yang auto-POST /api/save-env
+	//   dengan pair dari localStorage saat browser load. Dengan fix ini, timer
+	//   tersebut langsung trigger feed.UpdateSymbol() via main.go goroutine,
+	//   tanpa perlu klik START dulu.
+	//
+	//   Setiap kali user ganti dropdown pair → saveConfig() → handleSaveEnv
+	//   → symbolCh emitted → feed.UpdateSymbol() → WS subscribe ke pair baru.
+	// ═══════════════════════════════════════════════════════════════════════
+	if newSym != "" && newSym != oldSym {
+		// Drain semua stale event (pakai loop, bukan single drain)
+		for {
+			select {
+			case <-s.symbolCh:
+			default:
+				goto drained
+			}
+		}
+	drained:
+		// Kirim pair baru — guaranteed karena buffer baru saja dikosongkan
+		select {
+		case s.symbolCh <- newSym:
+			log.Printf("[Gateway] [FIX-SYMBOL-LIVE] Pair changed %s → %s (feed update immediate, no START needed)", oldSym, newSym)
+		default:
+			// Seharusnya tidak terjadi setelah drain, tapi jangan sampai panic
+			log.Printf("[Gateway] [FIX-SYMBOL-LIVE] WARNING: symbolCh still full after drain, pair=%s", newSym)
+		}
+	}
+
+	// [FIX-S2] Simpan API keys ke .env jika ada dalam request
 	path := filepath.Join(s.baseDir, EnvFile)
 	existing := parseEnvFile(path)
 	for k, v := range data {
@@ -395,38 +442,27 @@ func (s *Server) handleStart(w http.ResponseWriter, r *http.Request) {
 		s.writeRuntimeConfig()
 
 		// ═══════════════════════════════════════════════════════════════════
-		// [FIX-START-ALWAYS] CRITICAL FIX — selalu emit symbol ke feed saat START.
-		//
-		// BUG SEBELUMNYA:
-		//   if newSym != "" && newSym != oldSym { symbolCh <- newSym }
-		//
-		// MASALAH:
-		//   500ms setelah dashboard load, saveConfig() auto-fire → handleSaveEnv
-		//   → activeCfg["SYMBOL"] = "ETHUSDT" (pair pilihan user dari localStorage).
-		//   Saat user klik START → handleStart menerima SYMBOL="ETHUSDT".
-		//   Di sini: oldSym = activeCfg["SYMBOL"] = "ETHUSDT" (sudah di-set oleh saveConfig).
-		//   newSym = "ETHUSDT" = oldSym → kondisi `newSym != oldSym` = FALSE
-		//   → symbolCh TIDAK DIKIRIM → feed.UpdateSymbol() TIDAK DIPANGGIL
-		//   → feed tetap analisa pair dari cfg.Symbol (.env default, e.g. SOLUSDT).
-		//
-		// FIX:
-		//   Selalu emit newSym ke symbolCh setiap START ditekan.
-		//   feed.UpdateSymbol() sudah punya guard internal:
-		//     if oldSymbol == newSymbol { return } (atomic compare di feed level)
-		//   Jadi kalau feed memang sudah analisa pair yang benar, no-op. Aman.
+		// [FIX-START-ALWAYS] Selalu emit symbol ke feed saat START ditekan.
+		// feed.UpdateSymbol() punya guard internal (no-op jika symbol sama).
+		// Ini safety net: bahkan jika [FIX-SYMBOL-LIVE] sudah update pair,
+		// START tetap memastikan feed.UpdateSymbol dipanggil.
 		// ═══════════════════════════════════════════════════════════════════
 		if newSym != "" {
-			// Drain stale entry jika ada
-			select {
-			case <-s.symbolCh:
-			default:
+			// Drain semua stale event
+			for {
+				select {
+				case <-s.symbolCh:
+				default:
+					goto startDrained
+				}
 			}
-			// Emit ke feed — SELALU, bukan hanya saat berubah
+		startDrained:
 			select {
 			case s.symbolCh <- newSym:
-				log.Printf("[Dashboard] [FIX-START-ALWAYS] START → feed.UpdateSymbol(%s) forced", newSym)
+				log.Printf("[Gateway] [FIX-START-ALWAYS] START → feed.UpdateSymbol(%s) forced", newSym)
 			default:
-				log.Printf("[Dashboard] [FIX-START-ALWAYS] symbolCh full, symbol=%s queued", newSym)
+				// Buffer penuh setelah drain — tidak mungkin, tapi log saja
+				log.Printf("[Gateway] [FIX-START-ALWAYS] symbolCh full setelah drain, pair=%s (mungkin race)", newSym)
 			}
 		}
 
@@ -458,13 +494,13 @@ func (s *Server) handleStart(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.botRunning.Store(true)
-	log.Printf("[Dashboard] Engine START — pair=%s", s.GetActiveSymbol())
+	log.Printf("[Gateway] Engine START — pair=%s", s.GetActiveSymbol())
 	s.jsonOK(w, map[string]interface{}{"ok": true, "message": "Bot trading engine started."})
 }
 
 func (s *Server) handleStop(w http.ResponseWriter, _ *http.Request) {
 	s.botRunning.Store(false)
-	log.Printf("[Dashboard] Engine STOP activated via web UI.")
+	log.Printf("[Gateway] Engine STOP activated via web UI.")
 	s.jsonOK(w, map[string]interface{}{"ok": true, "message": "Bot trading engine stopped."})
 }
 
