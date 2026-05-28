@@ -1,4 +1,37 @@
 // go-engine/gateway/server.go
+// ═══════════════════════════════════════════════════════════════════════════════
+// CHANGELOG:
+//
+// [FIX-S1] DYNAMIC SYMBOL — handleStart baca SYMBOL dari request body.
+//          Kirim ke main.go via GetSymbolCh() → feed.UpdateSymbol().
+//          Brain sekarang analisa pair yang dipilih di dashboard, BUKAN dari env.
+//          Pair adalah browser-driven, restart server TIDAK diperlukan.
+//
+// [FIX-S2] ENV FILE HANYA SIMPAN API KEYS.
+//          SYMBOL, LEVERAGE, EXCHANGE, dll = browser-only (localStorage).
+//          handleSaveEnv filter field non-key sebelum tulis ke disk .env.
+//          Ini menghapus keharusan config di env untuk non-credential settings.
+//
+// [FIX-S3] handleGetEnv merge .env (API keys) + in-memory activeCfg,
+//          supaya dashboard restore config dengan benar setelah page refresh.
+//
+// ────────────────────────────────────────────────────────────────────────────
+// WIRING YANG HARUS DITAMBAH DI main.go (setelah `go feed.Run(mainCtx)`):
+//
+//   // [FIX-S1] Listen symbol changes dari dashboard → update feed
+//   go func() {
+//       for {
+//           select {
+//           case <-mainCtx.Done():
+//               return
+//           case sym := <-srv.GetSymbolCh():
+//               feed.UpdateSymbol(sym)
+//               log.Printf("[main] Symbol dynamically updated → %s (browser-driven)", sym)
+//           }
+//       }
+//   }()
+//
+// ═══════════════════════════════════════════════════════════════════════════════
 package gateway
 
 import (
@@ -22,6 +55,19 @@ const (
 	EnvFile     = ".env"
 	MaxLogLines = 500
 )
+
+// [FIX-S2] HANYA key-key ini yang ditulis ke file .env di disk.
+// Semua setting lain (SYMBOL, LEVERAGE, EXCHANGE, dll) = browser-only.
+var apiKeyNames = map[string]bool{
+	"BYBIT_API_KEY":         true,
+	"BYBIT_API_SECRET":      true,
+	"BYBIT_REAL_API_KEY":    true,
+	"BYBIT_REAL_API_SECRET": true,
+	"BYBIT_DEMO_API_KEY":    true,
+	"BYBIT_DEMO_API_SECRET": true,
+	"MEXC_API_KEY":          true,
+	"MEXC_API_SECRET":       true,
+}
 
 type InsightData struct {
 	Symbol       string  `json:"symbol"`
@@ -47,14 +93,13 @@ type LogLine struct {
 	Msg   string `json:"msg"`
 }
 
-// Data model untuk Live Paper Trading
 type Position struct {
 	Side       string  `json:"side"`
 	EntryPrice float64 `json:"entry_price"`
 	TakeProfit float64 `json:"take_profit"`
 	StopLoss   float64 `json:"stop_loss"`
 	Time       string  `json:"time"`
-	Status     string  `json:"status"` // OPEN, CLOSED_TP, CLOSED_SL
+	Status     string  `json:"status"`
 	PnL        float64 `json:"pnl"`
 }
 
@@ -66,20 +111,41 @@ type Server struct {
 	stop       chan struct{}
 	baseDir    string
 
-	// Storage in-memory untuk Paper Trading
+	// Paper trading state
 	activePos *Position
 	history   []Position
+
+	// [FIX-S1] Browser-driven config — pair & settings datang dari dashboard, bukan .env
+	symbolCh  chan string        // emit symbol baru setiap kali user klik START dengan pair berbeda
+	activeCfg map[string]string // config non-key aktif dari browser (symbol, leverage, dll)
 }
 
 func New(baseDir string) *Server {
 	s := &Server{
-		stop:    make(chan struct{}),
-		baseDir: baseDir,
-		insight: InsightData{SignalStatus: "WAIT", TrendState: "RANGING"},
-		history: make([]Position, 0),
+		stop:      make(chan struct{}),
+		baseDir:   baseDir,
+		insight:   InsightData{SignalStatus: "WAIT", TrendState: "RANGING"},
+		history:   make([]Position, 0),
+		symbolCh:  make(chan string, 1),        // [FIX-S1] buffer 1 cukup
+		activeCfg: make(map[string]string),    // [FIX-S1] in-memory config dari browser
 	}
 	s.botRunning.Store(false)
 	return s
+}
+
+// GetSymbolCh returns receive-only channel yang emit symbol baru saat user START
+// dengan pair berbeda. main.go harus listen ini dan panggil feed.UpdateSymbol().
+// [FIX-S1]
+func (s *Server) GetSymbolCh() <-chan string {
+	return s.symbolCh
+}
+
+// GetActiveSymbol returns pair yang sedang aktif dipilih di dashboard.
+// [FIX-S1]
+func (s *Server) GetActiveSymbol() string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.activeCfg["SYMBOL"]
 }
 
 func (s *Server) UpdateInsight(d InsightData) {
@@ -221,11 +287,27 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	s.jsonOK(w, map[string]bool{"running": s.botRunning.Load()})
 }
 
+// handleGetEnv — [FIX-S3] merge .env (API keys only) + in-memory activeCfg
+// Dashboard restore config: API keys dari file, setting lain dari activeCfg (atau localStorage).
 func (s *Server) handleGetEnv(w http.ResponseWriter, r *http.Request) {
+	// Baca .env — sekarang hanya berisi API keys
 	env := parseEnvFile(filepath.Join(s.baseDir, EnvFile))
+
+	// [FIX-S3] Merge dengan in-memory activeCfg (symbol, leverage, dll dari browser)
+	s.mu.RLock()
+	for k, v := range s.activeCfg {
+		if v != "" {
+			env[k] = v
+		}
+	}
+	s.mu.RUnlock()
+
 	s.jsonOK(w, map[string]interface{}{"env": env})
 }
 
+// handleSaveEnv — [FIX-S2] HANYA tulis API keys ke .env file.
+// Setting non-key (SYMBOL, LEVERAGE, dll) disimpan di activeCfg (in-memory).
+// Browser sudah handle persistence via localStorage — tidak perlu di env.
 func (s *Server) handleSaveEnv(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", 405)
@@ -242,11 +324,36 @@ func (s *Server) handleSaveEnv(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	path := filepath.Join(s.baseDir, EnvFile)
-	var sb strings.Builder
+	// [FIX-S2] Simpan non-key settings ke in-memory activeCfg
+	s.mu.Lock()
 	for k, v := range data {
-		sb.WriteString(fmt.Sprintf("%s=\"%s\"\n", k, v))
+		if !apiKeyNames[k] && v != "" {
+			s.activeCfg[k] = v
+		}
 	}
+	s.mu.Unlock()
+
+	// [FIX-S2] Baca existing .env, update API keys, tulis ulang — HANYA API keys
+	path := filepath.Join(s.baseDir, EnvFile)
+	existing := parseEnvFile(path)
+
+	// Update existing API keys dengan nilai baru
+	for k, v := range data {
+		if apiKeyNames[k] && v != "" {
+			existing[k] = v
+		}
+	}
+
+	// Tulis HANYA API keys ke file
+	var sb strings.Builder
+	sb.WriteString("# TradeBot API Keys\n")
+	sb.WriteString("# Semua setting lain (symbol, leverage, dll) disimpan di browser localStorage\n\n")
+	for k, v := range existing {
+		if apiKeyNames[k] {
+			sb.WriteString(fmt.Sprintf("%s=\"%s\"\n", k, v))
+		}
+	}
+
 	if err := os.WriteFile(path, []byte(sb.String()), 0o600); err != nil {
 		s.jsonErr(w, err.Error())
 		return
@@ -254,9 +361,74 @@ func (s *Server) handleSaveEnv(w http.ResponseWriter, r *http.Request) {
 	s.jsonOK(w, map[string]interface{}{"ok": true, "message": "Config saved"})
 }
 
-func (s *Server) handleStart(w http.ResponseWriter, _ *http.Request) {
+// handleStart — [FIX-S1] Baca SYMBOL dari request body, update feed via channel.
+// Ini adalah entry point untuk dynamic pair switching tanpa restart server.
+func (s *Server) handleStart(w http.ResponseWriter, r *http.Request) {
+	// [FIX-S1] Parse config dari dashboard (termasuk SYMBOL yang dipilih user)
+	var incomingCfg map[string]string
+	if body, err := io.ReadAll(r.Body); err == nil && len(body) > 2 {
+		_ = json.Unmarshal(body, &incomingCfg)
+	}
+
+	if incomingCfg != nil {
+		s.mu.Lock()
+		oldSym := s.activeCfg["SYMBOL"]
+
+		// Update activeCfg dengan semua non-key settings dari browser
+		for k, v := range incomingCfg {
+			if !apiKeyNames[k] && v != "" {
+				s.activeCfg[k] = v
+			}
+		}
+		newSym := s.activeCfg["SYMBOL"]
+		s.mu.Unlock()
+
+		// [FIX-S1] Notify feed jika symbol berubah
+		// Feed.UpdateSymbol() akan trigger WS reconnect + OHLCV refetch untuk pair baru
+		if newSym != "" && newSym != oldSym {
+			// Non-blocking drain + send supaya tidak stuck
+			select {
+			case <-s.symbolCh:
+			default:
+			}
+			select {
+			case s.symbolCh <- newSym:
+				log.Printf("[Dashboard] [FIX-S1] Symbol: %s → %s (browser-driven, no restart needed)", oldSym, newSym)
+			default:
+			}
+		} else if newSym != "" {
+			log.Printf("[Dashboard] START: symbol=%s (unchanged)", newSym)
+		}
+
+		// [FIX-S2] Simpan API keys ke .env jika ada dalam request
+		hasKeys := false
+		for k := range incomingCfg {
+			if apiKeyNames[k] {
+				hasKeys = true
+				break
+			}
+		}
+		if hasKeys {
+			path := filepath.Join(s.baseDir, EnvFile)
+			existing := parseEnvFile(path)
+			for k, v := range incomingCfg {
+				if apiKeyNames[k] && v != "" {
+					existing[k] = v
+				}
+			}
+			var sb strings.Builder
+			sb.WriteString("# TradeBot API Keys\n\n")
+			for k, v := range existing {
+				if apiKeyNames[k] {
+					sb.WriteString(fmt.Sprintf("%s=\"%s\"\n", k, v))
+				}
+			}
+			_ = os.WriteFile(path, []byte(sb.String()), 0o600)
+		}
+	}
+
 	s.botRunning.Store(true)
-	log.Printf("[Dashboard] Engine START activated via web UI.")
+	log.Printf("[Dashboard] Engine START — pair=%s", s.GetActiveSymbol())
 	s.jsonOK(w, map[string]interface{}{"ok": true, "message": "Bot trading engine started."})
 }
 
@@ -300,16 +472,12 @@ func (s *Server) jsonErr(w http.ResponseWriter, msg string) {
 }
 
 // parseLogLine normalises both Go and Rust log lines to a consistent LogLine.
-//
-// Go  log format : 2026/05/26 13:14:07.123456 [module] message   (already local time)
-// Rust log format: [2026-05-26T06:14:07.123Z INFO module::path] message (UTC → convert to local)
 func parseLogLine(line string) LogLine {
 	if strings.HasPrefix(line, "[MONITOR]") {
 		return LogLine{Ts: time.Now().Format("15:04:05"), Level: "WARN", Name: "monitor", Msg: line}
 	}
 
-	// ── Rust env_logger ───────────────────────────────────────────────────────
-	// [2026-05-26T06:14:07.123456Z INFO tradebot_brain::consensus::mod] message
+	// Rust env_logger format: [2026-05-26T06:14:07.123456Z INFO module::path] message
 	if strings.HasPrefix(line, "[202") {
 		end := strings.IndexByte(line, ']')
 		if end > 1 {
@@ -319,12 +487,11 @@ func parseLogLine(line string) LogLine {
 				msg = strings.TrimSpace(line[end+1:])
 			}
 			if len(meta) >= 2 {
-				// UTC timestamp → local (WIB / device timezone)
 				ts := meta[0]
 				if t, err := time.Parse(time.RFC3339Nano, ts); err == nil {
 					ts = t.Local().Format("15:04:05")
 				} else if len(ts) >= 19 {
-					ts = ts[11:19] // fallback: raw HH:MM:SS from UTC string
+					ts = ts[11:19]
 				}
 
 				level := "INFO"
@@ -337,7 +504,6 @@ func parseLogLine(line string) LogLine {
 					level = "DEBUG"
 				}
 
-				// "tradebot_brain::consensus::mod" → "consensus"
 				name := "rust"
 				if len(meta) >= 3 {
 					mod := meta[2]
@@ -355,14 +521,13 @@ func parseLogLine(line string) LogLine {
 		}
 	}
 
-	// ── Go log package ────────────────────────────────────────────────────────
-	// 2026/05/26 13:14:07.123456 [module] message
+	// Go log format: 2026/05/26 13:14:07.123456 [module] message
 	if strings.HasPrefix(line, "202") {
 		parts := strings.Fields(line)
 		if len(parts) >= 4 {
 			ts := parts[1]
 			if len(ts) >= 8 {
-				ts = ts[:8] // HH:MM:SS — already local time
+				ts = ts[:8]
 			}
 			name := strings.Trim(parts[2], "[]")
 			msg := strings.Join(parts[3:], " ")
@@ -373,7 +538,6 @@ func parseLogLine(line string) LogLine {
 	return LogLine{Ts: time.Now().Format("15:04:05"), Level: "INFO", Name: "sys", Msg: line}
 }
 
-// detectLogLevel infers level from Go log message content.
 func detectLogLevel(msg string) string {
 	upper := strings.ToUpper(msg)
 	switch {
