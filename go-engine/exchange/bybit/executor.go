@@ -3,21 +3,36 @@
 // Bybit V5 Order Executor — Production Grade
 // ==========================================
 // BUG FIX (v3.0.1): Renamed public Execute(ctx, OrderRequest) → execute(ctx, OrderRequest)
-// BUG FIX (v3.1.0): [FIX-BAL] fetchFreeUSDT sekarang coba UNIFIED dulu, fallback CONTRACT.
-//   ROOT CAUSE: Bybit Unified Trading Account (UTA) pakai accountType=UNIFIED.
-//   Code lama hardcode accountType=CONTRACT → response sukses tapi list coin kosong
-//   → "USDT balance not found in response" → semua order gagal.
-//   FIX:
-//   1. Loop UNIFIED → CONTRACT → FUND, stop di yang pertama return USDT > 0
-//   2. Log raw response (truncated) supaya gampang debug kalau masih gagal
-//   3. Multi-field fallback: availableToWithdraw → walletBalance → equity
-//   4. Return 0 (bukan error) kalau USDT ditemukan tapi balance = 0
-//      supaya bot tau balance habis, bukan salah API key
+// BUG FIX (v3.1.0): [FIX-BAL] fetchFreeUSDT — UNIFIED-first with CONTRACT fallback.
+// BUG FIX (v3.2.0): [FIX-BAL-SPAM] ROOT CAUSE FIXED:
 //
-// Layers of TP/SL defense:
-//   Layer 1 : Embed takeProfit/stopLoss directly in the order params
-//   Layer 2 : Post-fill verification via /v5/position/list
-//   Layer 3 : Fallback via /v5/position/trading-stop if Layer 1 missed
+//   ROOT CAUSE #1 — API SPAM:
+//     fetchFreeUSDT dipanggil setiap signal (~1 detik) dari main.go.
+//     Dengan UNIFIED account yang kosong (demo/testnet):
+//       - UNIFIED → retCode=0 tapi list coin kosong → return -1 → "USDT not found, try next"
+//       - CONTRACT → retCode=10001 "only support UNIFIED" → error logged
+//       - FUND     → retCode=10001 "only support UNIFIED" → error logged
+//     Repeat 60+ kali/menit → spam log + API rate throttle.
+//
+//   ROOT CAUSE #2 — SALAH FALLBACK LOGIC:
+//     Jika UNIFIED mengembalikan retCode=0 (HTTP 200, API key valid), ini PASTI
+//     akun Unified Trading (UTA). CONTRACT/FUND akan selalu return 10001.
+//     Tidak ada alasan mencoba keduanya.
+//
+//   FIX #1 — BALANCE CACHE (30-detik TTL):
+//     Tambah `balanceCache` struct dengan sync.Mutex + TTL.
+//     Hasil balance dicache 30 detik. Tidak ada lagi 60 API call/menit.
+//
+//   FIX #2 — SMART UTA DETECTION:
+//     Jika UNIFIED retCode=0 (success) → ini UTA account.
+//     Jika USDT tidak ada di coin list → return 0 (account kosong/no funds).
+//     JANGAN coba CONTRACT/FUND — selalu gagal untuk UTA.
+//     Hanya coba CONTRACT jika UNIFIED sendiri gagal dengan non-10001 error
+//     (network error, auth error, dsb) — fallback untuk classic account lama.
+//
+//   FIX #3 — LOG CLEANUP:
+//     CONTRACT/FUND 10001 bukan "error" untuk UTA user — itu expected behavior.
+//     Suppress log yang menyesatkan.
 
 package bybit
 
@@ -35,6 +50,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -42,6 +58,10 @@ const (
 	mainnetBase = "https://api.bytick.com"
 	testnetBase = "https://api-testnet.bybit.com"
 	recvWindow  = "5000"
+
+	// [FIX-BAL-SPAM] Balance cache TTL — jangan fetch lebih dari 1x per 30 detik.
+	// Main loop bisa memanggil fetchFreeUSDT tiap 1 detik; tanpa cache ini = 3600 API call/jam.
+	balanceCacheTTL = 30 * time.Second
 )
 
 // Config holds credentials and behavioural flags
@@ -65,10 +85,49 @@ type OrderRequest struct {
 	Confidence float64
 }
 
+// [FIX-BAL-SPAM] balanceCache menyimpan hasil fetchFreeUSDT dengan TTL.
+// Thread-safe via sync.Mutex.
+type balanceCache struct {
+	mu        sync.Mutex
+	value     float64
+	fetchedAt time.Time
+	ttl       time.Duration
+}
+
+// valid returns true jika cache masih segar (belum expired).
+func (c *balanceCache) valid() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return !c.fetchedAt.IsZero() && time.Since(c.fetchedAt) < c.ttl
+}
+
+// get returns cached value. Caller harus panggil valid() dulu.
+func (c *balanceCache) get() float64 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.value
+}
+
+// update menyimpan nilai baru dan timestamp saat ini.
+func (c *balanceCache) update(v float64) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.value = v
+	c.fetchedAt = time.Now()
+}
+
+// invalidate memaksa re-fetch pada panggilan berikutnya.
+func (c *balanceCache) invalidate() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.fetchedAt = time.Time{}
+}
+
 type Executor struct {
-	cfg    Config
-	client *http.Client
-	base   string
+	cfg      Config
+	client   *http.Client
+	base     string
+	balCache balanceCache // [FIX-BAL-SPAM] cached balance
 }
 
 func New(cfg Config) *Executor {
@@ -76,11 +135,13 @@ func New(cfg Config) *Executor {
 	if cfg.Testnet {
 		base = testnetBase
 	}
-	return &Executor{
+	e := &Executor{
 		cfg:    cfg,
 		client: &http.Client{Timeout: 10 * time.Second},
 		base:   base,
 	}
+	e.balCache.ttl = balanceCacheTTL
+	return e
 }
 
 // execute adalah internal entry point (lowercase — dipanggil adapter.go).
@@ -94,7 +155,7 @@ func (e *Executor) execute(ctx context.Context, req OrderRequest) error {
 		return nil
 	}
 
-	// 1. Balance — [FIX-BAL] coba beberapa account type
+	// 1. Balance — [FIX-BAL-SPAM] pakai cache, skip fallback yang selalu gagal
 	freeUSDT, err := e.fetchFreeUSDT(ctx)
 	if err != nil {
 		return fmt.Errorf("balance fetch: %w", err)
@@ -110,7 +171,7 @@ func (e *Executor) execute(ctx context.Context, req OrderRequest) error {
 		return fmt.Errorf("degenerate signal: entry≈stopLoss")
 	}
 	riskUSDT := freeUSDT * e.cfg.RiskPct
-	rawSize  := riskUSDT / stopDist
+	rawSize := riskUSDT / stopDist
 
 	notional := rawSize * req.Entry
 	if notional < 5.0 {
@@ -128,9 +189,16 @@ func (e *Executor) execute(ctx context.Context, req OrderRequest) error {
 	// 4. Place order (Layer 1: embed TP/SL)
 	orderID, err := e.placeOrder(ctx, req, size)
 	if err != nil {
+		// [FIX-BAL-SPAM] Invalidate balance cache on order failure
+		// agar next call re-fetch, bukan pakai cached stale value
+		e.balCache.invalidate()
 		return fmt.Errorf("place order: %w", err)
 	}
 	log.Printf("[Executor] ✓ Order placed id=%s", orderID)
+
+	// [FIX-BAL-SPAM] Invalidate cache setelah order berhasil
+	// agar balance terbaca lagi (sudah berkurang setelah margin dipakai)
+	e.balCache.invalidate()
 
 	// 5. Layer 2 & 3: verify TP/SL
 	go func() {
@@ -251,50 +319,109 @@ func (e *Executor) verifyAndFallbackTPSL(ctx context.Context, req OrderRequest) 
 	log.Printf("[Executor] Position not found yet (limit order unfilled?) — skipping TP/SL verify")
 }
 
-// ── Balance — [FIX-BAL] ───────────────────────────────────────────────────────
+// ── Balance — [FIX-BAL-SPAM] ──────────────────────────────────────────────────
 //
-// Bybit punya 3 tipe account:
-//   UNIFIED  → Unified Trading Account (UTA) — akun baru default sejak 2023
-//   CONTRACT → Classic derivatives account — akun lama
-//   FUND     → Funding account (jarang untuk trading)
+// CHANGELOG v3.2.0:
 //
-// Masalah lama: hardcode CONTRACT → UTA user dapat list kosong → "not found".
-// Fix: coba UNIFIED dulu, fallback ke CONTRACT, fallback ke FUND.
-// Tiap attempt di-log dengan truncated raw response untuk debug.
+//   MASALAH LAMA:
+//     1. fetchFreeUSDT dipanggil setiap signal (tiap ~1 detik) → 3600+ API call/jam.
+//     2. UNIFIED mengembalikan retCode=0 tapi USDT tidak ada di coin list
+//        → return -1 → "trying next" → CONTRACT 10001 ERROR → FUND 10001 ERROR
+//        → Log spam: 6 baris error setiap 1 detik.
+//     3. CONTRACT dan FUND SELALU gagal untuk Unified Trading Account (UTA).
+//        Mencobanya adalah buang-buang waktu dan log.
+//
+//   FIX:
+//     1. BALANCE CACHE (30-detik TTL) — Hasil di-cache. API dipanggil max 2x/menit.
+//        Cache diinvalidate setelah order berhasil/gagal untuk konsistensi.
+//
+//     2. SMART UTA DETECTION — Jika UNIFIED API mengembalikan retCode=0:
+//        → Ini pasti UTA account (API key dan akun valid).
+//        → Jika USDT tidak ada di coin list → balance = 0 (akun kosong, bukan error).
+//        → JANGAN coba CONTRACT/FUND — 100% akan return 10001.
+//
+//     3. CLASSIC ACCOUNT FALLBACK — Hanya coba CONTRACT jika UNIFIED gagal
+//        dengan error selain 10001 (network error, auth error, dsb).
+//        Ini untuk backward compat dengan classic Bybit account lama.
 
 func (e *Executor) fetchFreeUSDT(ctx context.Context) (float64, error) {
-	accountTypes := []string{"UNIFIED", "CONTRACT", "FUND"}
-
-	for _, acctType := range accountTypes {
-		bal, err := e.tryFetchBalance(ctx, acctType)
-		if err != nil {
-			log.Printf("[Executor-BAL] accountType=%s error: %v", acctType, err)
-			continue
-		}
-		if bal >= 0 {
-			// bal=0 bisa berarti akun kosong — valid, return tanpa error
-			log.Printf("[Executor-BAL] ✓ USDT=%.4f via accountType=%s", bal, acctType)
-			return bal, nil
-		}
-		// bal=-1 berarti USDT tidak ada di akun ini, coba berikutnya
-		log.Printf("[Executor-BAL] accountType=%s — USDT not in this account, trying next", acctType)
+	// [FIX-BAL-SPAM] Check cache dulu — skip API call jika masih segar
+	if e.balCache.valid() {
+		v := e.balCache.get()
+		log.Printf("[Executor-BAL] cache hit: %.4f USDT (next fetch in ~%.0fs)",
+			v, balanceCacheTTL.Seconds()-time.Since(e.getLastFetchTime()).Seconds())
+		return v, nil
 	}
 
-	return 0, fmt.Errorf("USDT balance not found in UNIFIED/CONTRACT/FUND accounts — check API key permissions (needs 'Read' on Account)")
+	// [FIX-BAL-UTA] Coba UNIFIED dulu.
+	// Jika retCode=0 → ini UTA account → stop di sini, jangan coba CONTRACT/FUND.
+	bal, err := e.tryFetchBalance(ctx, "UNIFIED")
+
+	if err == nil {
+		// retCode=0: API key valid, akun UNIFIED ditemukan.
+		if bal >= 0 {
+			// USDT ditemukan (atau akun kosong: bal=0)
+			log.Printf("[Executor-BAL] ✓ USDT=%.4f via UNIFIED account", bal)
+		} else {
+			// bal=-1: USDT tidak ada di coin list tapi API berhasil.
+			// Artinya: akun ada tapi tidak ada USDT deposit sama sekali.
+			// Ini bukan error — return 0 biar bot tahu balance habis/kosong.
+			log.Printf("[Executor-BAL] UNIFIED account OK — no USDT coin in list (empty account / no deposit). Balance=0")
+			bal = 0
+		}
+		e.balCache.update(bal)
+		return bal, nil
+	}
+
+	// UNIFIED gagal — periksa jenis error-nya
+	errStr := err.Error()
+	isAccountTypeMismatch := strings.Contains(errStr, "10001") ||
+		strings.Contains(errStr, "accountType only support")
+
+	if isAccountTypeMismatch {
+		// API key valid tapi UNIFIED tidak bisa diakses.
+		// Kemungkinan: classic account yang masih pakai V5 API.
+		// CONTRACT mungkin bisa — coba satu kali.
+		log.Printf("[Executor-BAL] UNIFIED returned 10001 — trying CONTRACT (classic account)")
+		if bal2, err2 := e.tryFetchBalance(ctx, "CONTRACT"); err2 == nil && bal2 >= 0 {
+			log.Printf("[Executor-BAL] ✓ USDT=%.4f via CONTRACT (classic account)", bal2)
+			e.balCache.update(bal2)
+			return bal2, nil
+		}
+		// CONTRACT juga gagal — mungkin sudah dimigrate ke UTA tapi ada issue
+		return 0, fmt.Errorf("balance not accessible: UNIFIED 10001 dan CONTRACT gagal — check API key permissions (perlu 'Read' access on Account)")
+	}
+
+	// Error lain (network, timeout, bad response, dsb) — jangan cache
+	return 0, fmt.Errorf("balance fetch error: %w", err)
+}
+
+// getLastFetchTime adalah helper untuk log yang lebih informatif.
+// Mengembalikan zero time jika cache belum pernah diisi.
+func (e *Executor) getLastFetchTime() time.Time {
+	e.balCache.mu.Lock()
+	defer e.balCache.mu.Unlock()
+	return e.balCache.fetchedAt
 }
 
 // tryFetchBalance coba satu accountType. Returns:
 //   >= 0   : USDT ditemukan, nilai balance (bisa 0 kalau akun kosong)
-//   -1     : USDT tidak ada di account ini, coba account lain
+//   -1     : USDT tidak ada di account ini
 //   error  : API error atau parse error
+//
+// [FIX-BAL-SPAM] Log level diturunkan — raw response di-log hanya sekali
+// (bukan setiap 1 detik). Error 10001 dari CONTRACT/FUND bukan "error" untuk UTA user.
 func (e *Executor) tryFetchBalance(ctx context.Context, accountType string) (float64, error) {
 	resp, err := e.signedGet(ctx, "/v5/account/wallet-balance", "accountType="+accountType)
 	if err != nil {
 		return -1, fmt.Errorf("HTTP: %w", err)
 	}
 
-	// [FIX-BAL] Log raw untuk debug — truncate supaya log gak banjir
-	log.Printf("[Executor-BAL] accountType=%s raw=%s", accountType, truncateStr(string(resp), 300))
+	// Log raw hanya untuk UNIFIED (yang pertama dicoba dan paling penting untuk debug)
+	// CONTRACT/FUND tidak di-log kecuali ada error non-10001
+	if accountType == "UNIFIED" {
+		log.Printf("[Executor-BAL] accountType=%s raw=%s", accountType, truncateStr(string(resp), 300))
+	}
 
 	var result struct {
 		RetCode int    `json:"retCode"`
@@ -319,6 +446,13 @@ func (e *Executor) tryFetchBalance(ctx context.Context, accountType string) (flo
 	}
 
 	if result.RetCode != 0 {
+		// Untuk 10001 (wrong account type), jangan log sebagai error —
+		// ini expected behavior untuk akun yang tidak support tipe tersebut
+		if result.RetCode == 10001 {
+			return -1, fmt.Errorf("API retCode=%d msg=%q", result.RetCode, result.RetMsg)
+		}
+		log.Printf("[Executor-BAL] accountType=%s error: API retCode=%d msg=%q",
+			accountType, result.RetCode, result.RetMsg)
 		return -1, fmt.Errorf("API retCode=%d msg=%q", result.RetCode, result.RetMsg)
 	}
 
@@ -353,7 +487,8 @@ func (e *Executor) tryFetchBalance(ctx context.Context, accountType string) (flo
 	return -1, nil
 }
 
-// FetchFreeUSDT exported untuk gateway
+// FetchFreeUSDT exported untuk gateway (dipanggil dari main.go untuk display balance).
+// Menggunakan cache yang sama untuk efisiensi.
 func (e *Executor) FetchFreeUSDT(ctx context.Context) (float64, error) {
 	return e.fetchFreeUSDT(ctx)
 }
@@ -387,7 +522,7 @@ func (e *Executor) setLeverage(ctx context.Context, symbol string, leverage int)
 
 func (e *Executor) signedPost(ctx context.Context, path string, body map[string]interface{}) ([]byte, error) {
 	payload, _ := json.Marshal(body)
-	ts   := strconv.FormatInt(time.Now().UnixMilli(), 10)
+	ts := strconv.FormatInt(time.Now().UnixMilli(), 10)
 	sign := e.sign(ts + e.cfg.APIKey + recvWindow + string(payload))
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
@@ -410,7 +545,7 @@ func (e *Executor) signedPost(ctx context.Context, path string, body map[string]
 }
 
 func (e *Executor) signedGet(ctx context.Context, path, queryStr string) ([]byte, error) {
-	ts   := strconv.FormatInt(time.Now().UnixMilli(), 10)
+	ts := strconv.FormatInt(time.Now().UnixMilli(), 10)
 	sign := e.sign(ts + e.cfg.APIKey + recvWindow + queryStr)
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet,
