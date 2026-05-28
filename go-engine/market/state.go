@@ -2,6 +2,11 @@
 //
 // Exported snapshot of the Feed's internal state for use by the orchestrator.
 // Kept in a separate file to avoid polluting feed.go with orchestrator concerns.
+//
+// [FIX-STATE] Symbol field dihapus dari State struct di feed.go (FIX-F1):
+//   f.state.Symbol → TIDAK ADA → compile error
+//   FIX: gunakan f.getSymbol() (atomic.Value, thread-safe) untuk mengisi
+//   StateSnapshot.Symbol saat State() dipanggil dari main.go.
 
 package market
 
@@ -20,11 +25,18 @@ type StateSnapshot struct {
 
 // State returns a safe copy of the current feed state.
 // Acquires a read-lock; safe to call from any goroutine.
+//
+// [FIX-STATE] Symbol TIDAK lagi ada di f.state (sudah dipindah ke
+// f.atomicSymbol di FIX-F1). Gunakan f.getSymbol() yang thread-safe
+// via atomic.Value — tidak perlu masuk ke dalam read-lock State.
 func (f *Feed) State() StateSnapshot {
+	// [FIX-STATE] Ambil symbol SEBELUM lock (atomic, tidak butuh mutex)
+	sym := f.getSymbol()
+
 	f.state.mu.RLock()
 	defer f.state.mu.RUnlock()
 	return StateSnapshot{
-		Symbol:         f.state.Symbol,
+		Symbol:         sym, // [FIX-STATE] WAS: f.state.Symbol → compile error
 		Price:          f.state.Price,
 		OI:             f.state.OI,
 		LSR:            f.state.LSR,
