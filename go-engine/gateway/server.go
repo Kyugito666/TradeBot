@@ -3,34 +3,24 @@
 // CHANGELOG:
 //
 // [FIX-S1] DYNAMIC SYMBOL — handleStart baca SYMBOL dari request body.
-//          Kirim ke main.go via GetSymbolCh() → feed.UpdateSymbol().
-//
 // [FIX-S2] ENV FILE HANYA SIMPAN API KEYS.
-//          SYMBOL, LEVERAGE, EXCHANGE, dll = browser-only (localStorage).
-//          handleSaveEnv filter field non-key sebelum tulis ke disk .env.
-//
 // [FIX-S3] handleGetEnv merge .env (API keys only) + in-memory activeCfg.
-//
-// [FIX-S4] writeRuntimeConfig
-//   Tulis bot_runtime.conf dengan semua non-key settings (TRADING_STYLE dll)
-//   setiap kali activeCfg diupdate. Rust brain baca dari bot_runtime.conf.
-//
+// [FIX-S4] writeRuntimeConfig — tulis bot_runtime.conf tiap activeCfg update.
 // [FIX-START-ALWAYS] Selalu emit symbol ke symbolCh setiap kali START ditekan.
-//   feed.UpdateSymbol() sudah handle no-op jika symbol sama.
+// [FIX-SYMBOL-LIVE] Emit symbolCh dari handleSaveEnv saat SYMBOL berubah.
 //
-// [FIX-SYMBOL-LIVE] ← BARU — ROOT CAUSE FIX pair selalu analisa BTC/default
+// [FIX-CLEAN-ENV] ← BARU — ROOT CAUSE FIX settings tidak berubah (#1,#3,#4)
 //   BUG LAMA:
-//     symbolCh HANYA dikirim dari handleStart. Artinya feed tidak pernah
-//     ganti pair sampai user klik START. Padahal browser sudah kirim pair
-//     yang dipilih 500ms setelah load (timer di dashboard.js loadConfig()).
-//     Akibat: feed tetap analisa symbol dari .env default (SOLUSDT/BTCUSDT)
-//     bahkan setelah user pilih pair lain di dropdown — karena START belum
-//     diklik, atau karena timing race di [FIX-PAIR-BOOT] di main.go.
+//     .env lama (dari template atau install awal) masih berisi EXCHANGE_MODE,
+//     DRY_RUN, LEVERAGE, SYMBOL, dll. main.go loadEnvFile() baca .env DULU,
+//     jadi env var sudah ter-set. Ketika loadEnvFile("bot_runtime.conf") jalan,
+//     semua key sudah ada → di-SKIP total (first-set-wins semantic).
+//     Akibat: user ganti Exchange Mode/DryRun/Leverage di dashboard → disave ke
+//     bot_runtime.conf → tapi TIDAK PERNAH terbaca karena .env lama menang.
 //   FIX:
-//     Emit symbolCh JUGA dari handleSaveEnv saat SYMBOL berubah.
-//     Ini memastikan feed langsung ganti pair begitu browser save config
-//     (500ms setelah load, atau setiap kali user ganti dropdown).
-//     handleStart tetap emit juga sebagai safety net saat user klik START.
+//     sanitizeEnvFile() dipanggil di New() saat server init. Fungsi ini hapus
+//     semua non-API-key entry dari .env, jadi bot_runtime.conf bisa override.
+//     Idempotent: kalau .env sudah bersih, tidak ada operasi tulis.
 // ═══════════════════════════════════════════════════════════════════════════════
 package gateway
 
@@ -124,13 +114,27 @@ func New(baseDir string) *Server {
 		baseDir:   baseDir,
 		insight:   InsightData{SignalStatus: "WAIT", TrendState: "RANGING"},
 		history:   make([]Position, 0),
-		// Buffer 4: handleSaveEnv + handleStart bisa emit tanpa block
 		symbolCh:  make(chan string, 4),
 		activeCfg: make(map[string]string),
 	}
 	s.botRunning.Store(false)
 
+	// ═══════════════════════════════════════════════════════════════════════
+	// [FIX-CLEAN-ENV] Bersihkan .env dari non-API-key settings SEBELUM seed activeCfg.
+	//
+	// KENAPA INI CRITICAL:
+	//   main.go loadEnvFile() first-set-wins. Jika .env punya EXCHANGE_MODE=demo
+	//   (dari template .env.example atau install lama), env var itu ter-set duluan.
+	//   Ketika loadEnvFile("bot_runtime.conf") jalan, EXCHANGE_MODE sudah ada →
+	//   di-SKIP → semua perubahan dari dashboard diabaikan total.
+	//
+	//   sanitizeEnvFile() hapus EXCHANGE_MODE, DRY_RUN, LEVERAGE, SYMBOL, dll dari
+	//   .env, sehingga bot_runtime.conf bisa properly override di restart berikutnya.
+	// ═══════════════════════════════════════════════════════════════════════
+	s.sanitizeEnvFile(filepath.Join(baseDir, EnvFile))
+
 	// [FIX-S4] Seed activeCfg dari .env — hanya non-API-key fields
+	// (setelah sanitize, .env sudah tidak punya non-key settings)
 	existing := parseEnvFile(filepath.Join(baseDir, EnvFile))
 	for k, v := range existing {
 		if !apiKeyNames[k] && v != "" {
@@ -138,8 +142,68 @@ func New(baseDir string) *Server {
 		}
 	}
 
+	// Seed dari bot_runtime.conf jika ada (override .env seeds)
+	runtime := parseEnvFile(filepath.Join(baseDir, RuntimeConfigFile))
+	for k, v := range runtime {
+		if !apiKeyNames[k] && v != "" {
+			s.activeCfg[k] = v
+		}
+	}
+
 	s.writeRuntimeConfigLocked()
 	return s
+}
+
+// ── [FIX-CLEAN-ENV] sanitizeEnvFile ─────────────────────────────────────────
+
+// sanitizeEnvFile menghapus non-API-key settings dari .env file.
+// Idempotent: jika .env sudah bersih (hanya berisi API keys), tidak ada perubahan.
+//
+// CONTOH:
+//   SEBELUM .env:
+//     EXCHANGE=bybit
+//     EXCHANGE_MODE=demo        ← akan dihapus
+//     DRY_RUN=1                 ← akan dihapus
+//     BYBIT_API_KEY=xxx         ← DIPERTAHANKAN
+//   SESUDAH .env:
+//     BYBIT_API_KEY=xxx         ← hanya API keys
+func (s *Server) sanitizeEnvFile(path string) {
+	existing := parseEnvFile(path)
+	if len(existing) == 0 {
+		return // file tidak ada atau kosong
+	}
+
+	// Cek apakah ada non-API-key entries
+	dirty := false
+	for k := range existing {
+		if !apiKeyNames[k] {
+			dirty = true
+			break
+		}
+	}
+	if !dirty {
+		return // already clean, no-op
+	}
+
+	// Tulis ulang hanya API keys
+	var sb strings.Builder
+	sb.WriteString("# TradeBot API Keys\n")
+	sb.WriteString("# [FIX-CLEAN-ENV] Non-key settings di-move ke bot_runtime.conf\n")
+	sb.WriteString("# Jangan tambahkan EXCHANGE_MODE/DRY_RUN/dll di sini — pakai dashboard\n\n")
+	count := 0
+	for k, v := range existing {
+		if apiKeyNames[k] && v != "" {
+			sb.WriteString(fmt.Sprintf("%s=\"%s\"\n", k, v))
+			count++
+		}
+	}
+
+	if err := os.WriteFile(path, []byte(sb.String()), 0o600); err != nil {
+		log.Printf("[Gateway] [FIX-CLEAN-ENV] WARNING: gagal sanitize %s: %v", EnvFile, err)
+		return
+	}
+	log.Printf("[Gateway] [FIX-CLEAN-ENV] %s dibersihkan — %d API keys dipertahankan, non-key settings dihapus", EnvFile, count)
+	log.Printf("[Gateway] [FIX-CLEAN-ENV] Setting seperti EXCHANGE_MODE/DRY_RUN/LEVERAGE sekarang dibaca dari bot_runtime.conf (disimpan via dashboard Save Config)")
 }
 
 // ── [FIX-S4] writeRuntimeConfig ──────────────────────────────────────────────
@@ -153,7 +217,7 @@ func (s *Server) writeRuntimeConfig() {
 func (s *Server) writeRuntimeConfigLocked() {
 	var sb strings.Builder
 	sb.WriteString("# bot_runtime.conf — auto-generated by Go server\n")
-	sb.WriteString("# DO NOT EDIT MANUALLY\n\n")
+	sb.WriteString("# DO NOT EDIT MANUALLY — semua perubahan via dashboard\n\n")
 	for k, v := range s.activeCfg {
 		if v != "" && !apiKeyNames[k] {
 			sb.WriteString(fmt.Sprintf("%s=%s\n", k, v))
@@ -164,10 +228,15 @@ func (s *Server) writeRuntimeConfigLocked() {
 		log.Printf("[Gateway] WARNING: failed to write %s: %v", RuntimeConfigFile, err)
 	} else {
 		style := s.activeCfg["TRADING_STYLE"]
+		mode := s.activeCfg["EXCHANGE_MODE"]
+		dryrun := s.activeCfg["DRY_RUN"]
 		if style == "" {
 			style = "(default/scalping)"
 		}
-		log.Printf("[Gateway] bot_runtime.conf updated — TRADING_STYLE=%s", style)
+		if mode == "" {
+			mode = "(default/demo)"
+		}
+		log.Printf("[Gateway] bot_runtime.conf updated — TRADING_STYLE=%s EXCHANGE_MODE=%s DRY_RUN=%s", style, mode, dryrun)
 	}
 }
 
@@ -328,8 +397,7 @@ func (s *Server) handleGetEnv(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleSaveEnv — [FIX-S2] HANYA tulis API keys ke .env file.
-// [FIX-SYMBOL-LIVE] Emit symbolCh saat SYMBOL berubah agar feed langsung update
-// tanpa menunggu user klik START.
+// [FIX-SYMBOL-LIVE] Emit symbolCh saat SYMBOL berubah.
 func (s *Server) handleSaveEnv(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", 405)
@@ -346,39 +414,20 @@ func (s *Server) handleSaveEnv(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// ═══════════════════════════════════════════════════════════════════════
-	// [FIX-SYMBOL-LIVE] Capture oldSym sebelum update untuk deteksi perubahan
-	// ═══════════════════════════════════════════════════════════════════════
 	s.mu.Lock()
-	oldSym := s.activeCfg["SYMBOL"] // capture SEBELUM update
+	oldSym := s.activeCfg["SYMBOL"]
 	for k, v := range data {
 		if !apiKeyNames[k] && v != "" {
 			s.activeCfg[k] = v
 		}
 	}
-	newSym := s.activeCfg["SYMBOL"] // capture SESUDAH update
+	newSym := s.activeCfg["SYMBOL"]
 	s.mu.Unlock()
 
 	s.writeRuntimeConfig()
 
-	// ═══════════════════════════════════════════════════════════════════════
 	// [FIX-SYMBOL-LIVE] Emit ke symbolCh segera jika SYMBOL berubah.
-	//
-	// KENAPA INI FIX KRITIS:
-	//   Sebelumnya, symbolCh HANYA dikirim dari handleStart (saat user klik START).
-	//   Akibatnya, feed tidak pernah ganti pair walau user sudah pilih pair baru
-	//   di dropdown — karena START belum diklik.
-	//
-	//   dashboard.js loadConfig() punya 500ms timer yang auto-POST /api/save-env
-	//   dengan pair dari localStorage saat browser load. Dengan fix ini, timer
-	//   tersebut langsung trigger feed.UpdateSymbol() via main.go goroutine,
-	//   tanpa perlu klik START dulu.
-	//
-	//   Setiap kali user ganti dropdown pair → saveConfig() → handleSaveEnv
-	//   → symbolCh emitted → feed.UpdateSymbol() → WS subscribe ke pair baru.
-	// ═══════════════════════════════════════════════════════════════════════
 	if newSym != "" && newSym != oldSym {
-		// Drain semua stale event (pakai loop, bukan single drain)
 		for {
 			select {
 			case <-s.symbolCh:
@@ -387,17 +436,15 @@ func (s *Server) handleSaveEnv(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	drained:
-		// Kirim pair baru — guaranteed karena buffer baru saja dikosongkan
 		select {
 		case s.symbolCh <- newSym:
-			log.Printf("[Gateway] [FIX-SYMBOL-LIVE] Pair changed %s → %s (feed update immediate, no START needed)", oldSym, newSym)
+			log.Printf("[Gateway] [FIX-SYMBOL-LIVE] Pair changed %s → %s", oldSym, newSym)
 		default:
-			// Seharusnya tidak terjadi setelah drain, tapi jangan sampai panic
 			log.Printf("[Gateway] [FIX-SYMBOL-LIVE] WARNING: symbolCh still full after drain, pair=%s", newSym)
 		}
 	}
 
-	// [FIX-S2] Simpan API keys ke .env jika ada dalam request
+	// [FIX-S2] Simpan API keys ke .env
 	path := filepath.Join(s.baseDir, EnvFile)
 	existing := parseEnvFile(path)
 	for k, v := range data {
@@ -408,7 +455,7 @@ func (s *Server) handleSaveEnv(w http.ResponseWriter, r *http.Request) {
 
 	var sb strings.Builder
 	sb.WriteString("# TradeBot API Keys\n")
-	sb.WriteString("# Semua setting lain disimpan di browser localStorage\n\n")
+	sb.WriteString("# Semua setting lain disimpan di bot_runtime.conf via dashboard\n\n")
 	for k, v := range existing {
 		if apiKeyNames[k] {
 			sb.WriteString(fmt.Sprintf("%s=\"%s\"\n", k, v))
@@ -441,14 +488,7 @@ func (s *Server) handleStart(w http.ResponseWriter, r *http.Request) {
 
 		s.writeRuntimeConfig()
 
-		// ═══════════════════════════════════════════════════════════════════
-		// [FIX-START-ALWAYS] Selalu emit symbol ke feed saat START ditekan.
-		// feed.UpdateSymbol() punya guard internal (no-op jika symbol sama).
-		// Ini safety net: bahkan jika [FIX-SYMBOL-LIVE] sudah update pair,
-		// START tetap memastikan feed.UpdateSymbol dipanggil.
-		// ═══════════════════════════════════════════════════════════════════
 		if newSym != "" {
-			// Drain semua stale event
 			for {
 				select {
 				case <-s.symbolCh:
@@ -459,10 +499,9 @@ func (s *Server) handleStart(w http.ResponseWriter, r *http.Request) {
 		startDrained:
 			select {
 			case s.symbolCh <- newSym:
-				log.Printf("[Gateway] [FIX-START-ALWAYS] START → feed.UpdateSymbol(%s) forced", newSym)
+				log.Printf("[Gateway] [FIX-START-ALWAYS] START → feed.UpdateSymbol(%s)", newSym)
 			default:
-				// Buffer penuh setelah drain — tidak mungkin, tapi log saja
-				log.Printf("[Gateway] [FIX-START-ALWAYS] symbolCh full setelah drain, pair=%s (mungkin race)", newSym)
+				log.Printf("[Gateway] [FIX-START-ALWAYS] symbolCh full setelah drain, pair=%s", newSym)
 			}
 		}
 
@@ -494,7 +533,19 @@ func (s *Server) handleStart(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.botRunning.Store(true)
-	log.Printf("[Gateway] Engine START — pair=%s", s.GetActiveSymbol())
+	log.Printf("[Gateway] Engine START — pair=%s mode=%s dry=%s",
+		s.GetActiveSymbol(),
+		func() string {
+			s.mu.RLock()
+			defer s.mu.RUnlock()
+			return s.activeCfg["EXCHANGE_MODE"]
+		}(),
+		func() string {
+			s.mu.RLock()
+			defer s.mu.RUnlock()
+			return s.activeCfg["DRY_RUN"]
+		}(),
+	)
 	s.jsonOK(w, map[string]interface{}{"ok": true, "message": "Bot trading engine started."})
 }
 
