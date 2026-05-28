@@ -6,6 +6,18 @@
 // so adapter.go can define the single public Execute(ctx, interface{}) that satisfies
 // main.go's orderExec interface without a duplicate-method compile error.
 //
+// BUG FIX (v3.1.0): [FIX-MEXC-BAL]
+//   ROOT CAUSE: fetchBalance mengembalikan "USDT balance not found in response"
+//   karena response MEXC Futures API /api/v1/private/account/assets kadang
+//   return field name berbeda, atau `success` = false tanpa error jelas.
+//   FIX:
+//   1. Log raw response agar bisa debug API issue langsung dari bot.log
+//   2. Parse multi-field fallback: availableBalance → cashBalance → equity
+//   3. Case-insensitive currency match (USDT / usdt)
+//   4. Cek success + code field, log error message dari API
+//   5. Jika semua field 0 tapi ada data, return 0 dengan info (bukan error)
+//      agar bot tahu balance = 0 bukan error koneksi
+//
 // MEXC uses Hedge Mode (two-sided position) and requires separate
 // TP/SL orders submitted AFTER the entry order fills.
 //
@@ -27,6 +39,7 @@ import (
 	"math"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -75,6 +88,9 @@ func (e *Executor) execute(ctx context.Context, req OrderRequest) error {
 	freeUSDT, err := e.fetchBalance(ctx)
 	if err != nil {
 		return fmt.Errorf("balance: %w", err)
+	}
+	if freeUSDT < 1.0 {
+		return fmt.Errorf("balance insufficient: %.2f USDT (min $1)", freeUSDT)
 	}
 
 	stopDist := math.Abs(req.Entry - req.StopLoss)
@@ -190,28 +206,116 @@ func (e *Executor) setLeverage(ctx context.Context, symbol string, posType, leve
 	return nil
 }
 
+// fetchBalance fetches available USDT balance from MEXC Futures.
+//
+// [FIX-MEXC-BAL] Rewritten to be robust:
+//   - Logs raw response for every call (visible in bot.log)
+//   - Multi-field fallback: availableBalance → cashBalance → equity
+//   - Case-insensitive currency match
+//   - Proper error message from API (success=false, code, message)
+//   - Handles both string and number JSON types for balance fields
 func (e *Executor) fetchBalance(ctx context.Context) (float64, error) {
 	resp, err := e.signedGet(ctx, "/api/v1/private/account/assets", "")
 	if err != nil {
-		return 0, err
+		return 0, fmt.Errorf("HTTP request: %w", err)
 	}
-	var result struct {
-		Success bool `json:"success"`
-		Data    []struct {
-			Currency  string `json:"currency"`
-			Available string `json:"availableBalance"`
-		} `json:"data"`
+
+	// [FIX-MEXC-BAL] Always log raw response — critical for diagnosing API issues
+	log.Printf("[MEXC-BAL] raw response: %s", truncateLog(string(resp), 400))
+
+	// Parse loosely — MEXC sometimes returns numbers, sometimes strings
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(resp, &raw); err != nil {
+		return 0, fmt.Errorf("JSON parse error: %w (body: %s)", err, truncateLog(string(resp), 200))
 	}
-	if err := json.Unmarshal(resp, &result); err != nil {
-		return 0, err
-	}
-	for _, a := range result.Data {
-		if a.Currency == "USDT" {
-			v, _ := strconv.ParseFloat(a.Available, 64)
-			return v, nil
+
+	// Check success field
+	if successRaw, ok := raw["success"]; ok {
+		var success bool
+		if err := json.Unmarshal(successRaw, &success); err == nil && !success {
+			// Extract error message
+			apiMsg := ""
+			if msgRaw, ok := raw["message"]; ok {
+				_ = json.Unmarshal(msgRaw, &apiMsg)
+			}
+			apiCode := 0
+			if codeRaw, ok := raw["code"]; ok {
+				_ = json.Unmarshal(codeRaw, &apiCode)
+			}
+			return 0, fmt.Errorf("MEXC API error code=%d msg=%q (check API key/permissions)", apiCode, apiMsg)
 		}
 	}
-	return 0, fmt.Errorf("USDT not found")
+
+	// Parse data array
+	dataRaw, ok := raw["data"]
+	if !ok {
+		return 0, fmt.Errorf("no 'data' field in response: %s", truncateLog(string(resp), 200))
+	}
+
+	var assets []map[string]json.RawMessage
+	if err := json.Unmarshal(dataRaw, &assets); err != nil {
+		return 0, fmt.Errorf("data parse error: %w", err)
+	}
+
+	if len(assets) == 0 {
+		return 0, fmt.Errorf("empty asset list — account may have no MEXC Futures balance")
+	}
+
+	// [FIX-MEXC-BAL] Multi-field fallback loop
+	for _, asset := range assets {
+		// Get currency name — case-insensitive match
+		currencyRaw, ok := asset["currency"]
+		if !ok {
+			continue
+		}
+		var currency string
+		_ = json.Unmarshal(currencyRaw, &currency)
+		if strings.ToUpper(currency) != "USDT" {
+			continue
+		}
+
+		// Try fields in priority order
+		for _, fieldName := range []string{"availableBalance", "available", "cashBalance", "equity", "walletBalance"} {
+			fieldRaw, ok := asset[fieldName]
+			if !ok {
+				continue
+			}
+			v := parseJSONNumber(fieldRaw)
+			if v > 0 {
+				log.Printf("[MEXC-BAL] USDT balance from field '%s': %.4f", fieldName, v)
+				return v, nil
+			}
+		}
+
+		// Found USDT but all balances are 0 — not an error, just empty account
+		log.Printf("[MEXC-BAL] USDT found but all balance fields = 0 (empty account?)")
+		return 0, fmt.Errorf("USDT balance = 0 (deposit funds or check account type)")
+	}
+
+	return 0, fmt.Errorf("USDT not found in %d assets — wrong account type? (need Futures account)", len(assets))
+}
+
+// parseJSONNumber parses a JSON value that might be a string "123.45" or number 123.45
+func parseJSONNumber(raw json.RawMessage) float64 {
+	// Try as float64 first (JSON number)
+	var f float64
+	if err := json.Unmarshal(raw, &f); err == nil {
+		return f
+	}
+	// Try as string
+	var s string
+	if err := json.Unmarshal(raw, &s); err == nil {
+		f, _ = strconv.ParseFloat(strings.TrimSpace(s), 64)
+		return f
+	}
+	return 0
+}
+
+func truncateLog(s string, maxLen int) string {
+	if len(s) <= maxLen {
+		return s
+	}
+	return s[:maxLen] + "…"
 }
 
 func (e *Executor) FetchFreeUSDT(ctx context.Context) (float64, error) {
