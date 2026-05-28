@@ -1,10 +1,39 @@
 // go-engine/market/feed.go
 //
-// FIX v3.0.2:
-//   - fetchSpecificFloat() menggantikan fetchSingleFloat() yang asal-asalan pick field
-//     dari JSON map (non-deterministic order → kadang dapet "timestamp" bukan "openInterest")
-//   - OI, LSR, FundingRate sekarang masing-masing pick field by name, bukan random
-//   - Log OI sudah include unit jelas (contracts) supaya tidak salah interpret
+// ═══════════════════════════════════════════════════════════════════════════
+// CHANGELOG FIX-F BATCH:
+//
+// [FIX-F1] DYNAMIC SYMBOL SWITCHING — Root Fix Problem 1
+//   ROOT CAUSE: Feed di-init sekali dengan symbol dari startup config.
+//   Saat user ganti pair di dashboard lalu klik START, Go engine masih
+//   pakai symbol lama karena:
+//     (a) wsConnect() hardcode subscribe ke symbol awal
+//     (b) fetchOHLCV/fetchAux pakai f.state.Symbol yang di-set sekali
+//     (c) Tidak ada mekanisme restart WS/REST saat symbol berubah
+//   FIX: Ganti f.state.Symbol (protected by mutex) dengan atomic.Value
+//   sehingga UpdateSymbol() bisa dipanggil dari main.go tanpa race.
+//   WS loop membaca symbol via getSymbol() setiap reconnect cycle.
+//   OHLCV + Aux juga membaca via getSymbol() bukan cache stale.
+//
+// [FIX-F2] WS RECONNECT ON SYMBOL CHANGE
+//   ROOT CAUSE: Saat symbol ganti, WS masih subscribe ke pair lama.
+//   FIX: wsConnect() sekarang listen ke f.symChangeCh. Jika dapat signal,
+//   tutup koneksi WS saat ini (return error) → wsTickerLoop reconnect
+//   otomatis dengan symbol baru dari getSymbol().
+//
+// [FIX-F3] OHLCV/AUX CACHE INVALIDATION SAAT SYMBOL GANTI
+//   ROOT CAUSE: Setelah symbol ganti, candle lama (pair lama) masih ada
+//   di f.state.Candles dan bisa menyebabkan analisa salah untuk beberapa
+//   siklus pertama.
+//   FIX: UpdateSymbol() reset Candles + ATR14 ke zero sebelum symbol
+//   diupdate, sehingga SHM flush tidak mengirim data lama ke Rust brain.
+//
+// [FIX-F4] GOROUTINE LEAK PREVENTION
+//   ROOT CAUSE: Jika Run() dipanggil berkali-kali (misalnya restart),
+//   goroutine lama bisa tetap jalan karena tidak ada mekanisme shutdown.
+//   FIX: Run() sekarang terima context dan semua goroutine di-select
+//   pada ctx.Done() dengan benar (sudah ada, diperkuat).
+// ═══════════════════════════════════════════════════════════════════════════
 
 package market
 
@@ -60,7 +89,8 @@ type State struct {
 	SentimentScore float32
 	NewsCount      uint32
 
-	Symbol string
+	// [FIX-F1] Symbol DIHAPUS dari State — dipindah ke atomic.Value di Feed
+	// agar UpdateSymbol() tidak perlu lock State mutex
 }
 
 // Feed mengorkestrasi semua data source dan menulis ke SHM setiap price update.
@@ -70,28 +100,85 @@ type Feed struct {
 	client  *http.Client
 	ohlcvTF string
 	limit   int
+
+	// [FIX-F1] Symbol disimpan sebagai atomic.Value agar UpdateSymbol()
+	// bisa dipanggil dari goroutine manapun (termasuk main.go signal loop)
+	// tanpa menyentuh State mutex yang bisa deadlock dengan WS goroutine.
+	atomicSymbol atomic.Value // stores string
+
+	// [FIX-F2] Channel untuk trigger WS reconnect saat symbol berubah.
+	// Buffer=1 agar UpdateSymbol() tidak block jika WS sedang reconnect.
+	symChangeCh chan struct{}
 }
 
+// New membuat Feed baru. Symbol awal dari parameter, bisa diganti via UpdateSymbol().
 func New(bridge *shm.Bridge, symbol, ohlcvTF string, limit int) *Feed {
-	return &Feed{
-		bridge:  bridge,
-		client:  &http.Client{Timeout: 10 * time.Second},
-		ohlcvTF: ohlcvTF,
-		limit:   limit,
-		state:   State{Symbol: symbol},
+	f := &Feed{
+		bridge:      bridge,
+		client:      &http.Client{Timeout: 10 * time.Second},
+		ohlcvTF:     ohlcvTF,
+		limit:       limit,
+		symChangeCh: make(chan struct{}, 1),
+	}
+	// [FIX-F1] Init atomic symbol
+	f.atomicSymbol.Store(symbol)
+	return f
+}
+
+// getSymbol returns current trading symbol (thread-safe).
+// [FIX-F1] Semua internal caller pakai ini, bukan f.state.Symbol.
+func (f *Feed) getSymbol() string {
+	if s, ok := f.atomicSymbol.Load().(string); ok && s != "" {
+		return s
+	}
+	return "BTCUSDT" // fallback
+}
+
+// UpdateSymbol switches the active trading pair.
+// [FIX-F1] Dipanggil dari main.go ketika user klik START dengan symbol baru.
+// [FIX-F3] Reset OHLCV cache agar candle lama tidak kontaminasi analisa baru.
+// [FIX-F2] Trigger WS reconnect untuk subscribe ke pair baru.
+func (f *Feed) UpdateSymbol(newSymbol string) {
+	oldSymbol := f.getSymbol()
+	if oldSymbol == newSymbol {
+		return // tidak ada perubahan, skip
+	}
+
+	log.Printf("[Feed] ⚡ Symbol change: %s → %s", oldSymbol, newSymbol)
+
+	// [FIX-F3] Clear candle cache SEBELUM ganti symbol
+	// Ini mencegah Rust brain menerima candle BTCUSDT saat sudah di-set ke SOLUSDT
+	f.state.mu.Lock()
+	f.state.Candles = nil
+	f.state.ATR14   = 0
+	f.state.Price   = 0
+	f.state.OI      = 0
+	f.state.LSR     = 0
+	f.state.mu.Unlock()
+
+	// [FIX-F1] Update atomic symbol (tidak perlu lock, atomic.Value thread-safe)
+	f.atomicSymbol.Store(newSymbol)
+
+	// [FIX-F2] Signal WS goroutine untuk reconnect dengan symbol baru
+	// Non-blocking: jika channel sudah ada pesan, skip (WS sudah akan reconnect)
+	select {
+	case f.symChangeCh <- struct{}{}:
+		log.Printf("[Feed] WS reconnect triggered for %s", newSymbol)
+	default:
+		// Channel sudah ada pending reconnect, tidak perlu kirim lagi
 	}
 }
 
 // Run menjalankan semua goroutine; block sampai ctx cancel.
 func (f *Feed) Run(ctx context.Context) {
-	sym := f.state.Symbol
+	sym := f.getSymbol() // [FIX-F1] pakai getSymbol()
 	log.Printf("[Feed] Starting for %s tf=%s limit=%d", sym, f.ohlcvTF, f.limit)
 
 	// Prime OHLCV synchronously sebelum WS start
-	if err := f.fetchOHLCV(sym); err != nil {
+	if err := f.fetchOHLCV(f.getSymbol()); err != nil {
 		log.Printf("[Feed] Initial OHLCV fetch failed: %v", err)
 	}
-	_ = f.fetchAux(sym)
+	_ = f.fetchAux(f.getSymbol())
 
 	var wg sync.WaitGroup
 
@@ -99,7 +186,7 @@ func (f *Feed) Run(ctx context.Context) {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		f.wsTickerLoop(ctx, sym)
+		f.wsTickerLoop(ctx)
 	}()
 
 	// OHLCV refresh tiap 60 detik
@@ -113,7 +200,8 @@ func (f *Feed) Run(ctx context.Context) {
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				if err := f.fetchOHLCV(sym); err != nil {
+				// [FIX-F1] Baca symbol saat refresh, bukan cache stale
+				if err := f.fetchOHLCV(f.getSymbol()); err != nil {
 					log.Printf("[Feed] OHLCV refresh error: %v", err)
 				}
 			}
@@ -131,7 +219,38 @@ func (f *Feed) Run(ctx context.Context) {
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				_ = f.fetchAux(sym)
+				// [FIX-F1] Baca symbol saat refresh
+				_ = f.fetchAux(f.getSymbol())
+			}
+		}
+	}()
+
+	// [FIX-F1] Goroutine watcher: saat symbol berubah, trigger OHLCV refetch
+	// (WS reconnect sudah di-handle oleh wsTickerLoop via symChangeCh)
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-f.symChangeCh:
+				newSym := f.getSymbol()
+				log.Printf("[Feed] Symbol changed to %s — refetching OHLCV+Aux", newSym)
+				// Fetch OHLCV untuk symbol baru
+				if err := f.fetchOHLCV(newSym); err != nil {
+					log.Printf("[Feed] OHLCV fetch for new symbol %s failed: %v", newSym, err)
+				}
+				_ = f.fetchAux(newSym)
+				// Drain symChangeCh jika ada pesan duplikat
+				for {
+					select {
+					case <-f.symChangeCh:
+					default:
+						goto drained
+					}
+				}
+			drained:
 			}
 		}
 	}()
@@ -141,7 +260,9 @@ func (f *Feed) Run(ctx context.Context) {
 
 // ── WebSocket Ticker ──────────────────────────────────────────────────────────
 
-func (f *Feed) wsTickerLoop(ctx context.Context, symbol string) {
+// [FIX-F2] wsTickerLoop tidak lagi pass symbol sebagai parameter tetap.
+// Setiap reconnect cycle membaca symbol terbaru dari getSymbol().
+func (f *Feed) wsTickerLoop(ctx context.Context) {
 	backoff := time.Second
 	for {
 		select {
@@ -149,7 +270,18 @@ func (f *Feed) wsTickerLoop(ctx context.Context, symbol string) {
 			return
 		default:
 		}
-		if err := f.wsConnect(ctx, symbol); err != nil {
+		// [FIX-F1] Baca symbol terbaru setiap reconnect
+		sym := f.getSymbol()
+		if err := f.wsConnect(ctx, sym); err != nil {
+			// [FIX-F2] Jika error karena symbol change, reconnect langsung (backoff=0)
+			select {
+			case <-f.symChangeCh:
+				// Symbol berubah saat WS connect — reconnect segera
+				log.Printf("[Feed] WS reconnecting for new symbol %s", f.getSymbol())
+				backoff = time.Second // reset backoff untuk symbol change
+				continue
+			default:
+			}
 			log.Printf("[Feed] WS error: %v — reconnect in %s", err, backoff)
 		}
 		select {
@@ -190,6 +322,23 @@ func (f *Feed) wsConnect(ctx context.Context, symbol string) error {
 				return
 			case <-tick.C:
 				_ = conn.WriteJSON(map[string]string{"op": "ping"})
+			}
+		}
+	}()
+
+	// [FIX-F2] Goroutine watcher: jika symbol berubah saat WS aktif,
+	// tutup koneksi agar wsTickerLoop reconnect dengan symbol baru
+	go func() {
+		select {
+		case <-pingCtx.Done():
+			return
+		case <-f.symChangeCh:
+			log.Printf("[Feed] Symbol change detected — closing WS for %s", symbol)
+			conn.Close() // trigger ReadMessage error → wsConnect return
+			// Kembalikan event ke channel agar wsTickerLoop bisa handle
+			select {
+			case f.symChangeCh <- struct{}{}:
+			default:
 			}
 		}
 	}()
@@ -235,7 +384,8 @@ func (f *Feed) wsConnect(ctx context.Context, symbol string) error {
 		}
 		f.state.mu.Unlock()
 
-		f.flushToSHM(symbol)
+		// [FIX-F1] Flush SHM dengan symbol terbaru, bukan symbol parameter lama
+		f.flushToSHM(f.getSymbol())
 	}
 }
 
@@ -267,7 +417,6 @@ func (f *Feed) fetchOHLCV(symbol string) error {
 	}
 
 	rows := payload.Result.List
-	// Bybit returns newest-first → reverse to oldest-first for Rust
 	candles := make([]shm.Candle, 0, len(rows))
 	for i := len(rows) - 1; i >= 0; i-- {
 		r := rows[i]
@@ -287,29 +436,31 @@ func (f *Feed) fetchOHLCV(symbol string) error {
 
 	atr := wilderATR(candles, 14)
 
+	// [FIX-F3] Hanya update jika symbol masih sama (cegah race condition)
+	// jika symbol sudah berubah lagi saat fetch berlangsung, drop data ini
+	if f.getSymbol() != symbol {
+		log.Printf("[Feed] OHLCV for %s dropped — symbol changed to %s", symbol, f.getSymbol())
+		return nil
+	}
+
 	f.state.mu.Lock()
 	f.state.Candles = candles
 	f.state.ATR14 = atr
 	f.state.mu.Unlock()
 
-	log.Printf("[Feed] OHLCV refreshed: %d candles ATR14=%.4f", len(candles), atr)
+	log.Printf("[Feed] OHLCV refreshed: %s %d candles ATR14=%.4f", symbol, len(candles), atr)
 	return nil
 }
 
-// fetchAux mengambil OI, LSR, dan Funding Rate.
-// FIX: setiap field sekarang di-parse by name, bukan random dari map iteration.
 func (f *Feed) fetchAux(symbol string) error {
-	// ── Open Interest ─────────────────────────────────────────────────────────
-	// Bybit response: {"result":{"list":[{"openInterest":"2847291.00","timestamp":"1748xxx"}]}}
-	// BUG LAMA: fetchSingleFloat ambil field pertama dari map (random order di Go) →
-	//   kadang dapet "timestamp" (1.748e12) bukan "openInterest" (2.847e6)
-	// FIX: fetchSpecificFloat("openInterest") → always correct field
 	oiURL := fmt.Sprintf("%s/v5/market/open-interest?category=linear&symbol=%s&intervalTime=5min&limit=1",
 		bybitRESTMain, symbol)
 	if oi, err := fetchSpecificFloat(f.client, oiURL, "openInterest"); err == nil && oi > 0 {
-		// Sanity check: OI dalam contracts tidak akan > 1 miliar untuk crypto biasa
-		// Jika > 1e10 kemungkinan besar timestamp terselip
 		if oi < 1e10 {
+			// [FIX-F3] Drop jika symbol sudah berubah
+			if f.getSymbol() != symbol {
+				return nil
+			}
 			f.state.mu.Lock()
 			f.state.OI = oi
 			f.state.mu.Unlock()
@@ -319,22 +470,25 @@ func (f *Feed) fetchAux(symbol string) error {
 		}
 	}
 
-	// ── Long/Short Ratio ──────────────────────────────────────────────────────
 	lsrURL := fmt.Sprintf("%s/v5/market/account-ratio?category=linear&symbol=%s&period=5min&limit=1",
 		bybitRESTMain, symbol)
 	if buy, sell, err := fetchLSR(f.client, lsrURL); err == nil && sell > 0 {
 		lsr := buy / sell
+		if f.getSymbol() != symbol {
+			return nil
+		}
 		f.state.mu.Lock()
 		f.state.LSR = lsr
 		f.state.mu.Unlock()
 		log.Printf("[WHALE] %s LSR=%.4f bias=%s", symbol, lsr, lsrBiasLabel(lsr))
 	}
 
-	// ── Funding Rate ──────────────────────────────────────────────────────────
-	// Bybit response: {"result":{"list":[{"fundingRate":"0.0001","fundingRateTimestamp":"..."}]}}
 	frURL := fmt.Sprintf("%s/v5/market/funding/history?category=linear&symbol=%s&limit=1",
 		bybitRESTMain, symbol)
 	if fr, err := fetchSpecificFloat(f.client, frURL, "fundingRate"); err == nil {
+		if f.getSymbol() != symbol {
+			return nil
+		}
 		f.state.mu.Lock()
 		f.state.FundingRate = fr
 		f.state.mu.Unlock()
@@ -343,7 +497,6 @@ func (f *Feed) fetchAux(symbol string) error {
 	return nil
 }
 
-// lsrBiasLabel returns a human-readable label for log output.
 func lsrBiasLabel(lsr float64) string {
 	if lsr > 1.05 {
 		return "LONG_HEAVY"
@@ -366,6 +519,7 @@ func (f *Feed) flushToSHM(symbol string) {
 		return
 	}
 
+	// [FIX-F1] Encode symbol terbaru ke SHM (bukan symbol stale dari state)
 	var sym [16]byte
 	copy(sym[:], symbol)
 
@@ -426,12 +580,6 @@ func wilderATR(candles []shm.Candle, period int) float64 {
 
 // ── REST parsers ──────────────────────────────────────────────────────────────
 
-// fetchSpecificFloat mengambil satu field by name dari Bybit REST response.
-//
-// FIX menggantikan fetchSingleFloat yang lama. fetchSingleFloat yang lama mengabaikan
-// parameter fieldName (pakai `_`) dan iterate map dengan random order — kadang
-// mendapatkan field "timestamp" (nilai ~1.748e12) alih-alih "openInterest" (~2.8e6).
-// Hasilnya OI tampil sebagai "1779.78B" di dashboard.
 func fetchSpecificFloat(client *http.Client, url string, fieldName string) (float64, error) {
 	resp, err := client.Get(url)
 	if err != nil {
@@ -462,15 +610,13 @@ func fetchSpecificFloat(client *http.Client, url string, fieldName string) (floa
 		return 0, fmt.Errorf("field '%s' not found in response", fieldName)
 	}
 
-	// Bybit selalu mengirim angka sebagai string JSON
 	var s string
 	if err := json.Unmarshal(raw, &s); err != nil {
-		// Mungkin angka langsung (bukan string)
-		var f float64
-		if err2 := json.Unmarshal(raw, &f); err2 != nil {
+		var fv float64
+		if err2 := json.Unmarshal(raw, &fv); err2 != nil {
 			return 0, fmt.Errorf("cannot parse field '%s': %w", fieldName, err)
 		}
-		return f, nil
+		return fv, nil
 	}
 	return strconv.ParseFloat(s, 64)
 }
@@ -510,7 +656,7 @@ func (f *Feed) UpdateSentiment(score float32, count uint32) {
 	f.state.mu.Unlock()
 }
 
-// UpdateMacro mengupdate field macro Absurdist (dipanggil dari goroutine terpisah).
+// UpdateMacro mengupdate field macro Absurdist.
 func (f *Feed) UpdateMacro(usdtDelta, kimchi, whaleInflow, longLiq, shortLiq float64) {
 	f.state.mu.Lock()
 	f.state.USDTDeltaPct = usdtDelta
