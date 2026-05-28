@@ -4,33 +4,31 @@
 //
 // [FIX-S1] DYNAMIC SYMBOL — handleStart baca SYMBOL dari request body.
 //          Kirim ke main.go via GetSymbolCh() → feed.UpdateSymbol().
-//          Brain sekarang analisa pair yang dipilih di dashboard, BUKAN dari env.
-//          Pair adalah browser-driven, restart server TIDAK diperlukan.
 //
 // [FIX-S2] ENV FILE HANYA SIMPAN API KEYS.
 //          SYMBOL, LEVERAGE, EXCHANGE, dll = browser-only (localStorage).
 //          handleSaveEnv filter field non-key sebelum tulis ke disk .env.
-//          Ini menghapus keharusan config di env untuk non-credential settings.
 //
-// [FIX-S3] handleGetEnv merge .env (API keys) + in-memory activeCfg,
-//          supaya dashboard restore config dengan benar setelah page refresh.
+// [FIX-S3] handleGetEnv merge .env (API keys only) + in-memory activeCfg.
 //
-// ────────────────────────────────────────────────────────────────────────────
-// WIRING YANG HARUS DITAMBAH DI main.go (setelah `go feed.Run(mainCtx)`):
+// [FIX-S4] ← NEW — writeRuntimeConfig
+//   ROOT CAUSE: consensus/mod.rs (Rust) baca TRADING_STYLE dari .env via
+//   OnceLock. Tapi setelah FIX-S2, .env HANYA berisi API keys — sehingga
+//   Rust tidak pernah nemu TRADING_STYLE dan selalu fallback ke "scalping".
+//   Akibatnya: bot selalu pakai scalping config (tp_atr_mult=1.2, min_conf=0.18)
+//   meski user set ke daytrade atau sniper di dashboard.
 //
-//   // [FIX-S1] Listen symbol changes dari dashboard → update feed
-//   go func() {
-//       for {
-//           select {
-//           case <-mainCtx.Done():
-//               return
-//           case sym := <-srv.GetSymbolCh():
-//               feed.UpdateSymbol(sym)
-//               log.Printf("[main] Symbol dynamically updated → %s (browser-driven)", sym)
-//           }
-//       }
-//   }()
+//   FIX: Tulis bot_runtime.conf dengan semua non-key settings (TRADING_STYLE,
+//   LEVERAGE, SYMBOL, dll) setiap kali activeCfg diupdate. Rust brain baca
+//   dari bot_runtime.conf — bukan .env.
 //
+//   Dipanggil dari:
+//   - New()          → tulis defaults dari .env lama (backward compat)
+//   - handleSaveEnv  → tiap user ubah setting di dashboard (auto-save)
+//   - handleStart    → saat START ditekan (pastikan style terupdate)
+//
+//   File berikutnya yang perlu diupdate: rust-brain/src/consensus/mod.rs
+//   → ubah baca dari "bot_runtime.conf" bukan ".env"
 // ═══════════════════════════════════════════════════════════════════════════════
 package gateway
 
@@ -49,15 +47,15 @@ import (
 )
 
 const (
-	Port        = 8765
-	LogFile     = "bot.log"
-	InsightFile = "bot_insight.json"
-	EnvFile     = ".env"
-	MaxLogLines = 500
+	Port              = 8765
+	LogFile           = "bot.log"
+	InsightFile       = "bot_insight.json"
+	EnvFile           = ".env"
+	RuntimeConfigFile = "bot_runtime.conf" // [FIX-S4] non-key settings untuk Rust brain
+	MaxLogLines       = 500
 )
 
 // [FIX-S2] HANYA key-key ini yang ditulis ke file .env di disk.
-// Semua setting lain (SYMBOL, LEVERAGE, EXCHANGE, dll) = browser-only.
 var apiKeyNames = map[string]bool{
 	"BYBIT_API_KEY":         true,
 	"BYBIT_API_SECRET":      true,
@@ -115,9 +113,9 @@ type Server struct {
 	activePos *Position
 	history   []Position
 
-	// [FIX-S1] Browser-driven config — pair & settings datang dari dashboard, bukan .env
-	symbolCh  chan string        // emit symbol baru setiap kali user klik START dengan pair berbeda
-	activeCfg map[string]string // config non-key aktif dari browser (symbol, leverage, dll)
+	// [FIX-S1] Browser-driven config
+	symbolCh  chan string
+	activeCfg map[string]string
 }
 
 func New(baseDir string) *Server {
@@ -126,22 +124,75 @@ func New(baseDir string) *Server {
 		baseDir:   baseDir,
 		insight:   InsightData{SignalStatus: "WAIT", TrendState: "RANGING"},
 		history:   make([]Position, 0),
-		symbolCh:  make(chan string, 1),        // [FIX-S1] buffer 1 cukup
-		activeCfg: make(map[string]string),    // [FIX-S1] in-memory config dari browser
+		symbolCh:  make(chan string, 1),
+		activeCfg: make(map[string]string),
 	}
 	s.botRunning.Store(false)
+
+	// [FIX-S4] Seed activeCfg dari .env lama (backward compat).
+	// Kalau user punya .env lama yang masih ada TRADING_STYLE dll,
+	// load ke activeCfg supaya bot_runtime.conf langsung ada isinya
+	// sebelum user buka dashboard.
+	existing := parseEnvFile(filepath.Join(baseDir, EnvFile))
+	for k, v := range existing {
+		if !apiKeyNames[k] && v != "" {
+			s.activeCfg[k] = v
+		}
+	}
+
+	// [FIX-S4] Tulis bot_runtime.conf awal — Rust brain baca ini saat startup.
+	// Kalau .env lama punya TRADING_STYLE, Rust langsung pakai itu.
+	// Kalau kosong, Rust fallback ke default "scalping" (sama seperti sebelumnya
+	// tapi sekarang lewat file yang bisa diupdate tanpa restart).
+	s.writeRuntimeConfigLocked()
+
 	return s
 }
 
+// ── [FIX-S4] writeRuntimeConfig ──────────────────────────────────────────────
+//
+// writeRuntimeConfig adalah PUBLIC wrapper yang acquire RLock sebelum nulis.
+// Dipanggil dari handleSaveEnv dan handleStart (di luar mutex context).
+func (s *Server) writeRuntimeConfig() {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	s.writeRuntimeConfigLocked()
+}
+
+// writeRuntimeConfigLocked nulis bot_runtime.conf TANPA acquire lock.
+// Dipanggil dari New() (sebelum goroutine lain jalan) dan dari dalam Lock context.
+// [FIX-S4] File ini dibaca Rust brain (consensus/mod.rs) untuk TRADING_STYLE dll.
+func (s *Server) writeRuntimeConfigLocked() {
+	var sb strings.Builder
+	sb.WriteString("# bot_runtime.conf — auto-generated by Go server\n")
+	sb.WriteString("# DO NOT EDIT MANUALLY — diupdate otomatis saat settings berubah di dashboard\n")
+	sb.WriteString("# Dibaca oleh: rust-brain/src/consensus/mod.rs untuk TRADING_STYLE\n\n")
+
+	// [FIX-S4] Tulis semua non-key settings dari activeCfg
+	for k, v := range s.activeCfg {
+		if v != "" && !apiKeyNames[k] {
+			sb.WriteString(fmt.Sprintf("%s=%s\n", k, v))
+		}
+	}
+
+	path := filepath.Join(s.baseDir, RuntimeConfigFile)
+	if err := os.WriteFile(path, []byte(sb.String()), 0o644); err != nil {
+		log.Printf("[Gateway] [FIX-S4] WARNING: failed to write %s: %v", RuntimeConfigFile, err)
+	} else {
+		style := s.activeCfg["TRADING_STYLE"]
+		if style == "" {
+			style = "(default/scalping)"
+		}
+		log.Printf("[Gateway] [FIX-S4] bot_runtime.conf updated — TRADING_STYLE=%s", style)
+	}
+}
+
 // GetSymbolCh returns receive-only channel yang emit symbol baru saat user START
-// dengan pair berbeda. main.go harus listen ini dan panggil feed.UpdateSymbol().
-// [FIX-S1]
 func (s *Server) GetSymbolCh() <-chan string {
 	return s.symbolCh
 }
 
 // GetActiveSymbol returns pair yang sedang aktif dipilih di dashboard.
-// [FIX-S1]
 func (s *Server) GetActiveSymbol() string {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -288,12 +339,9 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleGetEnv — [FIX-S3] merge .env (API keys only) + in-memory activeCfg
-// Dashboard restore config: API keys dari file, setting lain dari activeCfg (atau localStorage).
 func (s *Server) handleGetEnv(w http.ResponseWriter, r *http.Request) {
-	// Baca .env — sekarang hanya berisi API keys
 	env := parseEnvFile(filepath.Join(s.baseDir, EnvFile))
 
-	// [FIX-S3] Merge dengan in-memory activeCfg (symbol, leverage, dll dari browser)
 	s.mu.RLock()
 	for k, v := range s.activeCfg {
 		if v != "" {
@@ -306,8 +354,7 @@ func (s *Server) handleGetEnv(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleSaveEnv — [FIX-S2] HANYA tulis API keys ke .env file.
-// Setting non-key (SYMBOL, LEVERAGE, dll) disimpan di activeCfg (in-memory).
-// Browser sudah handle persistence via localStorage — tidak perlu di env.
+// [FIX-S4] Tulis bot_runtime.conf dengan non-key settings untuk Rust.
 func (s *Server) handleSaveEnv(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", 405)
@@ -333,18 +380,20 @@ func (s *Server) handleSaveEnv(w http.ResponseWriter, r *http.Request) {
 	}
 	s.mu.Unlock()
 
+	// [FIX-S4] Tulis bot_runtime.conf setelah activeCfg diupdate.
+	// Rust brain baca ini untuk TRADING_STYLE dan setting lainnya.
+	s.writeRuntimeConfig()
+
 	// [FIX-S2] Baca existing .env, update API keys, tulis ulang — HANYA API keys
 	path := filepath.Join(s.baseDir, EnvFile)
 	existing := parseEnvFile(path)
 
-	// Update existing API keys dengan nilai baru
 	for k, v := range data {
 		if apiKeyNames[k] && v != "" {
 			existing[k] = v
 		}
 	}
 
-	// Tulis HANYA API keys ke file
 	var sb strings.Builder
 	sb.WriteString("# TradeBot API Keys\n")
 	sb.WriteString("# Semua setting lain (symbol, leverage, dll) disimpan di browser localStorage\n\n")
@@ -362,9 +411,8 @@ func (s *Server) handleSaveEnv(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleStart — [FIX-S1] Baca SYMBOL dari request body, update feed via channel.
-// Ini adalah entry point untuk dynamic pair switching tanpa restart server.
+// [FIX-S4] Tulis bot_runtime.conf setelah activeCfg diupdate.
 func (s *Server) handleStart(w http.ResponseWriter, r *http.Request) {
-	// [FIX-S1] Parse config dari dashboard (termasuk SYMBOL yang dipilih user)
 	var incomingCfg map[string]string
 	if body, err := io.ReadAll(r.Body); err == nil && len(body) > 2 {
 		_ = json.Unmarshal(body, &incomingCfg)
@@ -374,7 +422,6 @@ func (s *Server) handleStart(w http.ResponseWriter, r *http.Request) {
 		s.mu.Lock()
 		oldSym := s.activeCfg["SYMBOL"]
 
-		// Update activeCfg dengan semua non-key settings dari browser
 		for k, v := range incomingCfg {
 			if !apiKeyNames[k] && v != "" {
 				s.activeCfg[k] = v
@@ -383,10 +430,12 @@ func (s *Server) handleStart(w http.ResponseWriter, r *http.Request) {
 		newSym := s.activeCfg["SYMBOL"]
 		s.mu.Unlock()
 
+		// [FIX-S4] Tulis bot_runtime.conf dengan config terbaru (termasuk TRADING_STYLE).
+		// Dipanggil SETELAH mutex unlock — no deadlock.
+		s.writeRuntimeConfig()
+
 		// [FIX-S1] Notify feed jika symbol berubah
-		// Feed.UpdateSymbol() akan trigger WS reconnect + OHLCV refetch untuk pair baru
 		if newSym != "" && newSym != oldSym {
-			// Non-blocking drain + send supaya tidak stuck
 			select {
 			case <-s.symbolCh:
 			default:
@@ -471,13 +520,11 @@ func (s *Server) jsonErr(w http.ResponseWriter, msg string) {
 	w.Write(b)
 }
 
-// parseLogLine normalises both Go and Rust log lines to a consistent LogLine.
 func parseLogLine(line string) LogLine {
 	if strings.HasPrefix(line, "[MONITOR]") {
 		return LogLine{Ts: time.Now().Format("15:04:05"), Level: "WARN", Name: "monitor", Msg: line}
 	}
 
-	// Rust env_logger format: [2026-05-26T06:14:07.123456Z INFO module::path] message
 	if strings.HasPrefix(line, "[202") {
 		end := strings.IndexByte(line, ']')
 		if end > 1 {
@@ -521,7 +568,6 @@ func parseLogLine(line string) LogLine {
 		}
 	}
 
-	// Go log format: 2026/05/26 13:14:07.123456 [module] message
 	if strings.HasPrefix(line, "202") {
 		parts := strings.Fields(line)
 		if len(parts) >= 4 {
