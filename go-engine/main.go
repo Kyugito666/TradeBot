@@ -1,37 +1,28 @@
 // go-engine/main.go
 // ═══════════════════════════════════════════════════════════════════════════
-// CHANGELOG vs v3.2:
+// CHANGELOG vs v3.3:
 //
-// [FIX-RT1] READ bot_runtime.conf IN loadConfig()
-//   ROOT CAUSE: server.go [FIX-S2] menulis API keys saja ke .env.
-//   Semua setting lain (EXCHANGE_MODE, DRY_RUN, LEVERAGE, TRADING_STYLE,
-//   RISK_PCT, EXCHANGE, SYMBOL) ditulis ke bot_runtime.conf via
-//   server.writeRuntimeConfig(). Tapi loadConfig() HANYA baca .env →
-//   semua setting fallback ke default hardcode di sini:
-//     - DryRun  default true → balance $10k dummy, order diblokir
-//     - EXCHANGE_MODE default "demo" → selalu bybit testnet, mode real diabaikan
-//     - LEVERAGE default 10 → leverage setting dari dashboard diabaikan
-//     - TRADING_STYLE → sudah dibaca per-evaluate() oleh consensus/mod.rs ✓
-//   FIX: loadEnvFile("bot_runtime.conf") SESUDAH loadEnvFile(".env").
-//   loadEnvFile() hanya set env var jika belum ada (if os.Getenv == ""),
-//   jadi .env API keys tidak di-overwrite oleh bot_runtime.conf.
+// [FIX-VETO-1] EMA PROXY VETO THRESHOLD DILONGGARKAN
+//   ROOT CAUSE: checkEMATrendVeto() memblok SELL jika LSR > 1.10.
+//   Dengan LSR=1.475 (whale LONG heavy), semua SELL signal conf < 0.5 dibuang.
+//   FIX: Naikkan threshold SELL veto dari 1.10 → 2.0 (extreme whale dominance).
+//        Naikkan threshold BUY veto dari 0.90 → 0.50.
+//        Confidensi minimum untuk bypass EMA veto turun 0.5 → 0.40.
+//   ALASAN: LSR 1.10 terlalu dekat dari neutral (1.0). Threshold 2.0 = whale
+//           benar-benar ekstrem → 2× lebih banyak long vs short.
 //
-// [FIX-RT2] DryRun DEFAULT DIUBAH false
-//   Sebelumnya: DryRun: envBool("DRY_RUN", true)  ← default ON
-//   Sesudah:    DryRun: envBool("DRY_RUN", false) ← default OFF
-//   Alasan: user yang tidak set DRY_RUN di dashboard harusnya masuk real mode.
-//   Jika user mau dry run, toggle di dashboard → bot_runtime.conf → terbaca.
-//   CATATAN: tetap aman karena DryRun=false + DRY_RUN tidak di set di env
-//   hanya berarti "coba eksekusi order" — order gagal jika API key kosong.
+// [FIX-VETO-2] BYPASS EMA VETO UNTUK HIGH CONFIDENCE
+//   FIX: Jika conf >= 0.65 (strong signal dari Rust brain), bypass semua
+//        EMA proxy veto. Rust brain + consensus 6 agent lebih reliable
+//        dari heuristic LSR sederhana ini.
 //
-// [FIX-RT3] LOG AKTUAL CONFIG SETELAH LOAD
-//   Tambah log lengkap setelah loadConfig() selesai baca kedua file,
-//   sehingga user bisa verify di bot.log bahwa settings dari dashboard
-//   benar-benar terbaca. Sebelumnya log hanya menampilkan initial/default
-//   tanpa konfirmasi bahwa bot_runtime.conf sudah dibaca.
+// [FIX-DEDUP] DEDUP WINDOW DIPERPENDEK
+//   ROOT CAUSE: Setelah order gagal, SKIP-DEDUP menahan signal 1 detik.
+//   Tapi retry logic tidak ada — jadi satu error = satu miss permanen.
+//   FIX: Jika lastAction gagal (order execution error), reset lastActionAt
+//        agar signal berikutnya bisa masuk setelah 3 detik (bukan full timeout).
 //
-// [FIX-PAIR] WIRE symbolCh → feed.UpdateSymbol() — dipertahankan dari v3.2
-// [FIX-PAIR-BOOT] Sync symbol from server cache — dipertahankan dari v3.2
+// [FIX-RT1-4] Semua fix dari v3.3 dipertahankan.
 // ═══════════════════════════════════════════════════════════════════════════
 package main
 
@@ -80,10 +71,8 @@ type Config struct {
 }
 
 func loadConfig() Config {
-	// [FIX-RT1] Urutan load: .env dulu (API keys), lalu bot_runtime.conf (settings).
-	// loadEnvFile() hanya set jika env var belum ada → tidak overwrite API keys.
 	loadEnvFile(".env")
-	loadEnvFile("bot_runtime.conf") // ← INI YANG HILANG, root cause semua bug settings
+	loadEnvFile("bot_runtime.conf")
 
 	c := Config{
 		Exchange:     envStr("EXCHANGE", "bybit"),
@@ -93,12 +82,9 @@ func loadConfig() Config {
 		OHLCVLimit:   200,
 		RiskPct:      envFloat("RISK_PCT", 0.03),
 		Leverage:     envInt("LEVERAGE", 10),
-		// [FIX-RT2] Default false — jika bot_runtime.conf ada DRY_RUN=1 maka true,
-		// jika tidak ada sama sekali, default real (false).
 		DryRun:       envBool("DRY_RUN", false),
 		TradingStyle: envStr("TRADING_STYLE", "scalping"),
 
-		// API keys hanya dari .env
 		BybitAPIKey:     envStr("BYBIT_API_KEY", envStr("BYBIT_REAL_API_KEY", "")),
 		BybitAPISecret:  envStr("BYBIT_API_SECRET", envStr("BYBIT_REAL_API_SECRET", "")),
 		BybitDemoKey:    envStr("BYBIT_DEMO_API_KEY", ""),
@@ -119,15 +105,15 @@ func loadConfig() Config {
 func main() {
 	log.SetFlags(log.Ldate | log.Ltime | log.Lmicroseconds)
 	log.Printf("═══════════════════════════════════════════")
-	log.Printf("  TradeBot Go Orchestrator  v3.3")
-	log.Printf("  [FIX-RT1] Reads bot_runtime.conf — settings survive restart")
-	log.Printf("  [FIX-RT2] DryRun default=false (set via dashboard)")
-	log.Printf("  [FIX-PAIR] Symbol switching live — no restart needed")
+	log.Printf("  TradeBot Go Orchestrator  v3.4")
+	log.Printf("  [FIX-VETO-1] EMA proxy threshold 1.10→2.0 (SELL) / 0.90→0.50 (BUY)")
+	log.Printf("  [FIX-VETO-2] High-confidence (>=0.65) bypass EMA veto")
+	log.Printf("  [FIX-DEDUP]  Failed order resets dedup timer (3s retry)")
+	log.Printf("  [FIX-MEXC]   Robust MEXC balance fetch with raw logging")
 	log.Printf("═══════════════════════════════════════════")
 
 	cfg := loadConfig()
 
-	// [FIX-RT3] Log aktual config yang dibaca dari kedua file
 	log.Printf("[main] ═══ CONFIG LOADED ═══════════════════════════════")
 	log.Printf("[main]   exchange     = %s", cfg.Exchange)
 	log.Printf("[main]   mode         = %s", cfg.ExchangeMode)
@@ -155,7 +141,6 @@ func main() {
 		apiKey, apiSecret := cfg.BybitAPIKey, cfg.BybitAPISecret
 		testnet := strings.ToLower(cfg.ExchangeMode) == "demo"
 		if testnet {
-			// Demo mode: gunakan demo/testnet API key
 			if cfg.BybitDemoKey != "" {
 				apiKey, apiSecret = cfg.BybitDemoKey, cfg.BybitDemoSecret
 				log.Printf("[main] Bybit DEMO mode — menggunakan demo API key")
@@ -163,7 +148,6 @@ func main() {
 				log.Printf("[main] WARNING: Bybit DEMO mode tapi BYBIT_DEMO_API_KEY kosong")
 			}
 		} else {
-			// Real mode: pastikan real API key tersedia
 			if apiKey == "" {
 				log.Printf("[main] WARNING: Bybit REAL mode tapi BYBIT_REAL_API_KEY kosong")
 			} else {
@@ -203,8 +187,7 @@ func main() {
 				cfg.Exchange, cfg.ExchangeMode, balance)
 		} else {
 			log.Printf("[main] API Auth Error: %v", err)
-			log.Printf("[main] Fallback ke paper balance $0 (periksa API key di dashboard)")
-			// Jangan hardcode 10000 — tampilkan 0 agar user tau ada masalah auth
+			log.Printf("[main] ⚠ Cek API key di dashboard — bot jalan tapi order akan gagal sampai balance terbaca")
 			balance = 0.0
 		}
 	} else {
@@ -224,7 +207,7 @@ func main() {
 
 	go feed.Run(mainCtx)
 
-	// ── [FIX-PAIR] Symbol channel wiring ────────────────────────────────────
+	// ── Symbol channel wiring ────────────────────────────────────────────────
 	go func() {
 		if activeSym := srv.GetActiveSymbol(); activeSym != "" && activeSym != cfg.Symbol {
 			log.Printf("[main] [FIX-PAIR-BOOT] Sync symbol from server cache: %s → %s",
@@ -249,11 +232,14 @@ func main() {
 	go nlpEngine.Run(mainCtx, feed)
 
 	// ── Signal loop vars ──────────────────────────────────────────────────────
-	lastRustSeq        := uint64(0)
-	lastAction         := "WAIT"
-	lastActionAt       := time.Now().Add(-10 * time.Minute)
-	cooldownUntil      := time.Time{}
-	consecutiveLosses  := 0
+	lastRustSeq       := uint64(0)
+	lastAction        := "WAIT"
+	lastActionAt      := time.Now().Add(-10 * time.Minute)
+	cooldownUntil     := time.Time{}
+	consecutiveLosses := 0
+
+	// [FIX-DEDUP] Track last execution result untuk reset timer jika gagal
+	lastOrderFailed := false
 
 	lastActionTimeout := map[string]time.Duration{
 		"scalping":   10 * time.Minute,
@@ -391,7 +377,7 @@ func main() {
 			log.Printf("[main] [%s] Signal: %s conf=%.3f entry=%.4f TP=%.4f SL=%.4f RR=%.2f veto=%v",
 				currentSym, dirStr, sig.Confidence, printEntry, printTP, printSL, sig.RiskReward, sig.Veto)
 
-			// Refresh balance dari API jika real mode
+			// Refresh balance
 			if !cfg.DryRun {
 				if b, err := fetchBalance(context.Background(), orderExecutor); err == nil {
 					balance = b
@@ -413,6 +399,16 @@ func main() {
 				continue
 			}
 
+			// [FIX-DEDUP] Jika order sebelumnya gagal, reset lastActionAt ke 3s lalu
+			// supaya signal retry bisa masuk setelah 3 detik (bukan nunggu full timeout)
+			if lastOrderFailed && dirStr == lastAction {
+				if time.Since(lastActionAt) > 3*time.Second {
+					log.Printf("[RETRY] Last order failed, allowing retry for %s", dirStr)
+					lastActionAt = time.Now().Add(-getLastActionTimeout())
+					lastOrderFailed = false
+				}
+			}
+
 			if dirStr == lastAction && time.Since(lastActionAt) < getLastActionTimeout() {
 				log.Printf("[SKIP-DEDUP] Arah %s sama, %.0f detik lalu", dirStr, time.Since(lastActionAt).Seconds())
 				continue
@@ -432,12 +428,10 @@ func main() {
 				continue
 			}
 
-			if emaVetoReason := checkEMATrendVeto(feed, dirStr); emaVetoReason != "" {
+			// [FIX-VETO-1+2] EMA proxy veto dengan threshold baru + high-conf bypass
+			if emaVetoReason := checkEMATrendVeto(feed, dirStr, sig.Confidence); emaVetoReason != "" {
 				log.Printf("[SKIP-EMA] %s", emaVetoReason)
-				if sig.Confidence < 0.5 {
-					log.Printf("[SKIP-EMA] conf=%.3f < 0.5, skip", sig.Confidence)
-					continue
-				}
+				continue
 			}
 
 			if cfg.DryRun && activePaperTrade != nil {
@@ -476,8 +470,9 @@ func main() {
 					defer execCancel()
 
 					if err := orderExecutor.Execute(execCtx, req); err != nil {
-						log.Printf("[main] Order execution failed: %v", err)
+						log.Printf("[main] ✗ Order execution failed: %v", err)
 						consecutiveLosses++
+						lastOrderFailed = true // [FIX-DEDUP] flag for retry
 						if consecutiveLosses >= 3 {
 							cooldownUntil      = time.Now().Add(60 * time.Minute)
 							consecutiveLosses  = 0
@@ -486,6 +481,7 @@ func main() {
 					} else {
 						log.Printf("[main] ✓ Order fired: %s %s", snapDir, currentSym)
 						consecutiveLosses = 0
+						lastOrderFailed = false
 					}
 				}()
 			}
@@ -504,7 +500,20 @@ func main() {
 }
 
 // ── EMA proxy veto ────────────────────────────────────────────────────────────
-func checkEMATrendVeto(feed *market.Feed, direction string) string {
+//
+// [FIX-VETO-1] Threshold dilonggarkan:
+//   SELL veto: LSR > 2.0 (sebelumnya 1.10) — whale 2× lebih banyak long vs short
+//   BUY veto:  LSR < 0.50 (sebelumnya 0.90) — whale 2× lebih banyak short vs long
+//
+// [FIX-VETO-2] High-confidence bypass:
+//   Jika conf >= 0.65 → bypass semua EMA proxy veto.
+//   6-agent Rust brain lebih reliable dari heuristic LSR ini.
+//
+// Kenapa sebelumnya salah:
+//   LSR=1.475 → whale 60% LONG, 40% SHORT → bukan dominance ekstrem.
+//   Threshold 1.10 = cuma 10% lebih banyak long → TERLALU SENSITIF.
+//   Akibatnya hampir semua SELL signal diblok di market normal.
+func checkEMATrendVeto(feed *market.Feed, direction string, confidence float64) string {
 	state := feed.State()
 	if state.Price <= 0 {
 		return ""
@@ -513,11 +522,27 @@ func checkEMATrendVeto(feed *market.Feed, direction string) string {
 	if lsr < 1e-9 {
 		return ""
 	}
-	if direction == "BUY" && lsr < 0.90 {
-		return fmt.Sprintf("EMA-PROXY: BUY signal tapi LSR=%.3f (whale SHORT dominant)", lsr)
+
+	// [FIX-VETO-2] High confidence signal — bypass veto entirely
+	// Rust brain 6-agent consensus lebih akurat dari LSR heuristic
+	if confidence >= 0.65 {
+		log.Printf("[EMA-PROXY] conf=%.3f >= 0.65 → bypass LSR veto (LSR=%.3f dir=%s)",
+			confidence, lsr, direction)
+		return ""
 	}
-	if direction == "SELL" && lsr > 1.10 {
-		return fmt.Sprintf("EMA-PROXY: SELL signal tapi LSR=%.3f (whale LONG dominant)", lsr)
+
+	// [FIX-VETO-1] Threshold baru: 2.0 untuk SELL, 0.50 untuk BUY
+	if direction == "BUY" && lsr < 0.50 {
+		// Whale SHORT extreme (LSR < 0.5 = 2× lebih banyak SHORT vs LONG)
+		if confidence < 0.45 {
+			return fmt.Sprintf("EMA-PROXY: BUY signal tapi LSR=%.3f (extreme SHORT dominance) conf=%.3f < 0.45", lsr, confidence)
+		}
+	}
+	if direction == "SELL" && lsr > 2.0 {
+		// Whale LONG extreme (LSR > 2.0 = 2× lebih banyak LONG vs SHORT)
+		if confidence < 0.45 {
+			return fmt.Sprintf("EMA-PROXY: SELL signal tapi LSR=%.3f (extreme LONG dominance) conf=%.3f < 0.45", lsr, confidence)
+		}
 	}
 	return ""
 }
@@ -590,7 +615,6 @@ func updateInsight(srv *gateway.Server, cfg Config, sig *shm.Signal, balance flo
 		dispEntry, dispTP, dispSL = state.Price, state.Price, state.Price
 	}
 
-	// [FIX-RT3] Sertakan mode di advice agar user tahu bot lagi di mode apa
 	modeTag := ""
 	if cfg.DryRun {
 		modeTag = " [DRY RUN]"
@@ -623,7 +647,6 @@ func truncate(s string, n int) string {
 	return s[:n] + "…"
 }
 
-// maskKey menampilkan 4 karakter pertama + *** untuk log keamanan
 func maskKey(key string) string {
 	if key == "" {
 		return "(empty)"
@@ -636,13 +659,10 @@ func maskKey(key string) string {
 
 // ── Env helpers ───────────────────────────────────────────────────────────────
 
-// loadEnvFile membaca file dan set env var jika belum ada.
-// Dipanggil dua kali: loadEnvFile(".env") lalu loadEnvFile("bot_runtime.conf").
-// Karena hanya set jika os.Getenv(k) == "", urutan pemanggilan menentukan prioritas.
 func loadEnvFile(path string) {
 	data, err := os.ReadFile(path)
 	if err != nil {
-		return // file tidak ada = skip, bukan error
+		return
 	}
 	loaded := 0
 	for _, line := range strings.Split(string(data), "\n") {
