@@ -1,35 +1,24 @@
-// dashboard.js — TradeBot v3.1.0
+// dashboard.js — TradeBot v3.2.0
 // ─────────────────────────────────────────────────────────────────────────────
-// CHANGELOG vs v3.0.5:
+// CHANGELOG vs v3.1.0:
 //
-// [FIX-1] startBot() sekarang auto-save config DULU sebelum send /api/start
-//         sehingga symbol yg dipilih user tersimpan ke .env sebelum engine baca.
-//         NOTE: Go engine tetap perlu restart manual untuk symbol change mid-run.
-//         Warning toast ditambahkan jika symbol berubah saat bot running.
+// [AI-FIX-1] Signal history tracking — WIN/LOSS outcome per signal, saved to
+//            localStorage. Survive page refresh. Max 100 entries.
 //
-// [FIX-3-ENHANCED] switchTab():
-//         ROOT CAUSE: LightweightCharts canvas mempertahankan pixel dimensinya
-//         meski parent di-set display:none → canvas tetap "render" di stacking
-//         context dan tembus ke tab lain.
-//         FIX: (1) set position:absolute + width:0 + height:0 + clip:rect(0,0,0,0)
-//              pada semua pane non-aktif (keluar dari grid flow sepenuhnya)
-//              (2) _lwChart.resize(1,1) saat meninggalkan chart tab
-//              (3) _lwChart.resize(w,h) restore saat kembali ke chart tab
+// [AI-FIX-2] Remove TF selector from AI Signal pane — hardcode 15m. User said
+//            selector is pointless and confusing. Auto-scan still works.
 //
-// [FIX-4-ENHANCED] initTradesTab():
-//         Pane dynamically injected sekarang mendapatkan grid containment styling
-//         yang sama dengan pane lainnya agar tidak overflow.
+// [AI-FIX-3] Full-width AI Signal pane — removed side padding/gaps. Grid now
+//            fills entire pane width properly.
 //
-// [FIX-5-NEW] _analyzeSignal():
-//         EMA Trend Filter — jika EMA9 < EMA21 < EMA50 (bearish aligned) tapi
-//         signal adalah LONG, bullScore dipotong -3. Jika harga < EMA50 by >1%,
-//         tambahan -2 penalty. Mencegah bot entry LONG hanya karena LSR tinggi
-//         padahal trend teknikal jelas downtrend.
+// [AI-FIX-4] Auto-track open signal outcomes — priceHistory poll checks if
+//            open AI signals hit TP or SL and marks them WIN/LOSS.
 //
-// [FIX-5-VISUAL] _renderAISignals():
-//         Kartu signal menampilkan badge "⚠ TREND CONFLICT" jika arah signal
-//         berlawanan dengan EMA alignment. User bisa lihat langsung mana yang
-//         rawan fake signal.
+// [PAIR-FIX] loadConfig() pushes symbol to server via saveConfig() 500ms after
+//            load. This ensures server activeCfg["SYMBOL"] is set BEFORE user
+//            clicks START, so brain never falls back to .env default symbol.
+//
+// (All previous fixes FIX-1..FIX-5 retained as-is)
 // ─────────────────────────────────────────────────────────────────────────────
 'use strict';
 
@@ -49,6 +38,9 @@ const MAX_CHART_POINTS = 150;
 
 let _lastAIScanResults = [];
 
+// [AI-FIX-1] Signal history for AI Scanner (persisted in localStorage)
+let _aiSignalHistory = [];
+
 let stats = {
   price: null, prevPrice: null, atr: null, oi: null, oiTime: null,
   lsr: null, bias: 'NEUTRAL', balance: null, initBalance: null, risk_pct: 0.03
@@ -60,7 +52,6 @@ let signalCount = 0;
 let totalPnl = 0;
 let isChartHidden = false;
 
-// [FIX-1] Track symbol at bot-start time untuk deteksi perubahan
 let _symbolAtBotStart = '';
 
 // ── Safe Storage Wrapper ──────────────────────────────────────────────────────
@@ -85,6 +76,120 @@ const Storage = {
     }
 };
 
+// ══════════════════════════════════════════════════════════════════════════════
+// [AI-FIX-1] AI Signal History — load/save/track
+// ══════════════════════════════════════════════════════════════════════════════
+
+function _loadAISignalHistory() {
+    _aiSignalHistory = Storage.get('aiSignalHistory', []);
+}
+
+function _saveAISignalHistory() {
+    Storage.set('aiSignalHistory', _aiSignalHistory.slice(0, 100));
+}
+
+// [AI-FIX-4] Called every price update — checks if any OPEN AI signal hit TP/SL
+function _trackAISignalOutcomes() {
+    if (!_aiSignalHistory.length || !stats.price) return;
+    let changed = false;
+    _aiSignalHistory = _aiSignalHistory.map(sig => {
+        if (sig.status !== 'OPEN') return sig;
+        const price = stats.price;
+        const updated = { ...sig };
+        if (sig.direction === 'LONG') {
+            if (price >= sig.tp) {
+                updated.status = 'WIN';
+                updated.pnl = '+' + ((sig.tp - sig.entry) / sig.entry * 100).toFixed(2) + '%';
+                updated.closeTime = new Date().toLocaleTimeString();
+                changed = true;
+            } else if (price <= sig.sl) {
+                updated.status = 'LOSS';
+                updated.pnl = ((sig.sl - sig.entry) / sig.entry * 100).toFixed(2) + '%';
+                updated.closeTime = new Date().toLocaleTimeString();
+                changed = true;
+            }
+        } else { // SHORT
+            if (price <= sig.tp) {
+                updated.status = 'WIN';
+                updated.pnl = '+' + ((sig.entry - sig.tp) / sig.entry * 100).toFixed(2) + '%';
+                updated.closeTime = new Date().toLocaleTimeString();
+                changed = true;
+            } else if (price >= sig.sl) {
+                updated.status = 'LOSS';
+                updated.pnl = ((sig.entry - sig.sl) / sig.entry * 100).toFixed(2) + '%';
+                updated.closeTime = new Date().toLocaleTimeString();
+                changed = true;
+            }
+        }
+        return updated;
+    });
+    if (changed) {
+        _saveAISignalHistory();
+        renderAISignalHistory();
+    }
+}
+
+// [AI-FIX-1] Render history panel inside AI Signal pane
+function renderAISignalHistory() {
+    const el = document.getElementById('ai-signal-history-body');
+    if (!el) return;
+
+    const wins   = _aiSignalHistory.filter(s => s.status === 'WIN').length;
+    const losses = _aiSignalHistory.filter(s => s.status === 'LOSS').length;
+    const opens  = _aiSignalHistory.filter(s => s.status === 'OPEN').length;
+    const total  = wins + losses;
+    const wr     = total ? (wins / total * 100).toFixed(1) + '%' : '--';
+
+    // Update summary bar
+    const sumEl = document.getElementById('ai-hist-summary');
+    if (sumEl) {
+        sumEl.innerHTML = `
+            <span style="color:var(--text2)">Total: <strong style="color:var(--text)">${_aiSignalHistory.length}</strong></span>
+            <span style="color:var(--accent)">WIN: <strong>${wins}</strong></span>
+            <span style="color:var(--danger)">LOSS: <strong>${losses}</strong></span>
+            <span style="color:var(--warn)">OPEN: <strong>${opens}</strong></span>
+            <span style="color:var(--text2)">WinRate: <strong style="color:${total && wins/total >= 0.5 ? 'var(--accent)' : 'var(--danger)'}">${wr}</strong></span>
+        `;
+    }
+
+    if (!_aiSignalHistory.length) {
+        el.innerHTML = `<tr><td colspan="8" style="text-align:center;padding:20px;color:var(--text2);font-family:var(--mono);font-size:11px;">Klik kartu signal untuk mulai tracking</td></tr>`;
+        return;
+    }
+
+    el.innerHTML = _aiSignalHistory.map(s => {
+        const isWin  = s.status === 'WIN';
+        const isLoss = s.status === 'LOSS';
+        const isOpen = s.status === 'OPEN';
+        const dec    = s.entry < 1 ? 6 : s.entry < 10 ? 4 : s.entry < 1000 ? 3 : 2;
+        const statusColor = isWin ? 'var(--accent)' : isLoss ? 'var(--danger)' : 'var(--warn)';
+        const statusBg    = isWin ? 'rgba(0,229,160,0.12)' : isLoss ? 'rgba(239,68,68,0.1)' : 'rgba(245,158,11,0.12)';
+        const dirColor    = s.direction === 'LONG' ? 'var(--accent)' : 'var(--danger)';
+        return `<tr onmouseenter="this.style.background='rgba(255,255,255,0.02)'" onmouseleave="this.style.background=''">
+            <td style="padding:8px 12px;border-bottom:1px solid var(--border);color:var(--text2);font-size:11px;">${s.time}</td>
+            <td style="padding:8px 12px;border-bottom:1px solid var(--border);font-weight:700;color:var(--text);font-size:11px;">${s.symbol.replace('USDT','/USDT')}</td>
+            <td style="padding:8px 12px;border-bottom:1px solid var(--border);color:${dirColor};font-weight:700;font-size:11px;">${s.direction}</td>
+            <td style="padding:8px 12px;border-bottom:1px solid var(--border);color:var(--blue);font-size:11px;">${s.entry.toFixed(dec)}</td>
+            <td style="padding:8px 12px;border-bottom:1px solid var(--border);color:var(--accent);font-size:11px;">${s.tp.toFixed(dec)}</td>
+            <td style="padding:8px 12px;border-bottom:1px solid var(--border);color:var(--danger);font-size:11px;">${s.sl.toFixed(dec)}</td>
+            <td style="padding:8px 12px;border-bottom:1px solid var(--border);">
+                <span style="background:${statusBg};color:${statusColor};padding:2px 8px;border-radius:3px;font-size:10px;font-weight:700;">${s.status}</span>
+            </td>
+            <td style="padding:8px 12px;border-bottom:1px solid var(--border);color:${isWin ? 'var(--accent)' : isLoss ? 'var(--danger)' : 'var(--text2)'};font-weight:${isOpen ? '400' : '700'};font-size:11px;">${s.pnl || (isOpen ? '...' : '--')}</td>
+        </tr>`;
+    }).join('');
+}
+
+function clearAISignalHistory() {
+    if (confirm('Reset semua history AI Signal?')) {
+        _aiSignalHistory = [];
+        _saveAISignalHistory();
+        renderAISignalHistory();
+    }
+}
+
+// ── Chart Init & Utils (unchanged) ───────────────────────────────────────────
+
 function toggleChart() {
   isChartHidden = !isChartHidden;
   const wrap = document.getElementById('chart-wrapper');
@@ -95,7 +200,6 @@ function toggleChart() {
   if (toolbar) toolbar.style.display = isChartHidden ? 'none' : 'flex';
   if (legend) legend.style.display = (!isChartHidden && _pendingMarkers.length > 0) ? 'flex' : 'none';
   if (btn) btn.textContent = isChartHidden ? '👁 Show Chart' : '👁 Hide Chart';
-  // [FIX-3-ENHANCED] Resize chart saat di-show kembali
   if (!isChartHidden && _lwChart) {
     setTimeout(() => {
       const c = document.getElementById('chart-container');
@@ -283,6 +387,8 @@ function updatePriceStats() {
     if (el) el.className = cls;
     if (hdrEl) hdrEl.className = 'live-price ' + (up ? 'up' : 'down');
   }
+  // [AI-FIX-4] Track AI signal outcomes on every price update
+  _trackAISignalOutcomes();
 }
 
 function updateOIStats() {
@@ -567,7 +673,7 @@ async function startChart() {
 }
 startChart();
 
-// ── Chart price lines dari Go engine API ──────────────────────────────────────
+// ── Chart price lines from Go engine API ─────────────────────────────────────
 let _chartLines = [];
 
 async function fetchPositions() {
@@ -659,31 +765,16 @@ function renderTradesTable() {
   tbody.innerHTML = rows;
 }
 
-// ════════════════════════════════════════════════════════════════════════════
-// [FIX-3-ENHANCED] switchTab — NUCLEAR chart containment
-// ════════════════════════════════════════════════════════════════════════════
-// ROOT CAUSE ANALYSIS:
-//   LightweightCharts menginject canvas ke dalam #chart-container dengan
-//   position:absolute. Saat pane di-hide dengan display:none saja, canvas
-//   MASIH mempertahankan pixel dimensions-nya di memory. Dalam stacking
-//   context grid, canvas element ini bisa "bleeding" ke sibling panes.
-//
-//   FIX 1: set position:absolute + width:0 + height:0 + clip:rect(0,0,0,0)
-//          pada SEMUA non-active pane → keluar dari grid flow sepenuhnya
-//   FIX 2: _lwChart.resize(1,1) saat meninggalkan chart tab → canvas
-//          dikecilkan ke 1px sehingga tidak bisa tembus ke mana-mana
-//   FIX 3: visibility:hidden + pointerEvents:none sebagai belt-and-suspenders
-// ════════════════════════════════════════════════════════════════════════════
+// ── switchTab — nuclear chart containment ─────────────────────────────────────
 function switchTab(name, btn) {
   document.querySelectorAll('.tab').forEach(b => b.classList.remove('active'));
 
-  // [FIX-3-ENHANCED] Nuclear hide — keluar dari grid flow + semua visibility tricks
   document.querySelectorAll('.tab-pane').forEach(p => {
     p.classList.remove('active');
     p.style.display = 'none';
     p.style.visibility = 'hidden';
     p.style.pointerEvents = 'none';
-    p.style.position = 'absolute';   // [FIX-3-ENHANCED] keluar dari grid flow
+    p.style.position = 'absolute';
     p.style.width = '0';
     p.style.height = '0';
     p.style.overflow = 'hidden';
@@ -691,8 +782,6 @@ function switchTab(name, btn) {
     p.style.zIndex = '-999';
   });
 
-  // [FIX-3-ENHANCED] Shrink chart canvas ke 1x1 saat TIDAK di chart tab
-  // Ini mencegah LightweightCharts canvas tembus ke pane lain
   if (name !== 'chart' && _lwChart) {
     try { _lwChart.resize(1, 1); } catch(e) {}
   }
@@ -701,14 +790,13 @@ function switchTab(name, btn) {
   const target = document.getElementById('pane-' + name);
   if (!target) return;
 
-  // [FIX-3-ENHANCED] Restore active pane ke dalam grid flow
   target.classList.add('active');
   target.style.display = 'flex';
   target.style.visibility = 'visible';
   target.style.pointerEvents = 'auto';
   target.style.flexDirection = 'column';
   target.style.overflow = 'hidden';
-  target.style.position = 'relative';  // [FIX-3-ENHANCED] kembali ke grid flow
+  target.style.position = 'relative';
   target.style.width = '100%';
   target.style.height = '100%';
   target.style.clip = 'auto';
@@ -718,14 +806,12 @@ function switchTab(name, btn) {
   if (logFilter) logFilter.style.display = name === 'logs' ? 'flex' : 'none';
 
   if (name === 'chart') {
-    // [FIX-3-ENHANCED] Restore chart size setelah pane visible kembali
     setTimeout(() => {
       if (_lwChart && !isChartHidden) {
         const wrapper = document.getElementById('chart-wrapper');
         if (wrapper && wrapper.clientWidth > 10) {
           try { _lwChart.resize(wrapper.clientWidth, wrapper.clientHeight); } catch(e) {}
         }
-        // Re-apply markers setelah resize
         _applyMarkers();
       }
     }, 50);
@@ -815,23 +901,12 @@ function updateStatus(running) {
   document.querySelectorAll('#config-form input, #config-form select').forEach(el => { el.disabled = running; });
 }
 
-// ════════════════════════════════════════════════════════════════════════════
-// [FIX-1] startBot — save config DULU, baru start
-// Memastikan symbol yang dipilih user tersimpan ke .env sebelum bot start.
-// NOTE: Go engine tetap perlu RESTART untuk benar-benar ganti symbol mid-run.
-// Tampilkan warning jika symbol berubah sejak terakhir kali start.
-// ════════════════════════════════════════════════════════════════════════════
 async function startBot() {
   const currentSym = document.getElementById('cfg-symbol')?.value || '';
-
-  // [FIX-1] Warn jika symbol berubah dari sesi sebelumnya
   if (_symbolAtBotStart && _symbolAtBotStart !== currentSym) {
     toast(`⚠ Symbol berubah ${_symbolAtBotStart}→${currentSym}. Restart binary untuk efektif.`, false);
-    // Delay agar user bisa baca toast, tapi tetap lanjut
     await new Promise(r => setTimeout(r, 1200));
   }
-
-  // [FIX-1] Save config ke .env DULU sebelum start
   try {
     const saveR = await fetch('/api/save-env', {
       method: 'POST',
@@ -844,7 +919,6 @@ async function startBot() {
     toast('Config save gagal: ' + e.message, false);
     return;
   }
-
   try {
     const r = await fetch('/api/start', {
       method: 'POST',
@@ -853,7 +927,7 @@ async function startBot() {
     });
     const d = await r.json();
     toast(d.message, d.ok);
-    if (d.ok) _symbolAtBotStart = currentSym; // [FIX-1] catat symbol saat start
+    if (d.ok) _symbolAtBotStart = currentSym;
   } catch(e) { toast('Koneksi gagal', false); }
 }
 
@@ -927,7 +1001,7 @@ async function loadConfig() {
       else { sel.dataset.pendingSymbol = sym; }
       const hdrSym = document.getElementById('hdr-symbol');
       if (hdrSym) hdrSym.textContent = sym;
-      _symbolAtBotStart = sym; // [FIX-1] track initial symbol
+      _symbolAtBotStart = sym;
     }
 
     if (local.LEVERAGE || e.LEVERAGE) {
@@ -974,6 +1048,20 @@ async function loadConfig() {
     loadKey('key-mexc-secret',       e.MEXC_API_SECRET);
 
     updateLeverageLimits();
+
+    // [PAIR-FIX] Push loaded symbol/config to server immediately so brain
+    // knows the correct pair BEFORE user clicks START. Without this, server
+    // activeCfg["SYMBOL"] is empty and feed falls back to .env default.
+    setTimeout(() => {
+        try {
+            fetch('/api/save-env', {
+                method: 'POST',
+                headers: {'Content-Type':'application/json'},
+                body: JSON.stringify(collectEnv())
+            });
+        } catch(e) {}
+    }, 500);
+
   } catch(e) {}
 }
 
@@ -1111,9 +1199,9 @@ async function fetchAIInsight() {
   } catch(e) {}
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
+// ══════════════════════════════════════════════════════════════════════════════
 // AI SIGNAL SCANNER
-// ═══════════════════════════════════════════════════════════════════════════════
+// ══════════════════════════════════════════════════════════════════════════════
 
 const AI_SIGNAL_PAIRS = [
   'BTCUSDT','ETHUSDT','SOLUSDT','BNBUSDT','XRPUSDT',
@@ -1123,6 +1211,7 @@ const AI_SIGNAL_PAIRS = [
 let _aiSignalTimer = null;
 let _aiSignalPaneReady = false;
 
+// [AI-FIX-2] ensureSignalPaneReady — FULL WIDTH, NO TF SELECT, + HISTORY PANEL
 function ensureSignalPaneReady() {
   if (_aiSignalPaneReady) return;
   _aiSignalPaneReady = true;
@@ -1131,33 +1220,68 @@ function ensureSignalPaneReady() {
 
   pane.style.padding = '0';
   pane.style.background = 'var(--bg)';
+
+  // [AI-FIX-3] Removed TF selector — hardcoded to 15m in runAISignalScan()
+  // [AI-FIX-3] Removed max-width constraint — full width grid
   pane.innerHTML = `
-    <div style="padding:16px;height:100%;overflow-y:auto;box-sizing:border-box;">
-      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px;flex-wrap:wrap;gap:8px;border-bottom:1px solid var(--border);padding-bottom:12px;">
+    <div style="height:100%;overflow-y:auto;box-sizing:border-box;display:flex;flex-direction:column;">
+
+      <!-- Header bar — compact, no TF select -->
+      <div style="display:flex;align-items:center;justify-content:space-between;padding:12px 16px;flex-shrink:0;border-bottom:1px solid var(--border);background:var(--bg2);flex-wrap:wrap;gap:8px;">
         <div>
           <div style="font-family:var(--mono);color:var(--accent);font-size:13px;font-weight:600;letter-spacing:2px;">🎯 AI SIGNAL SCANNER</div>
-          <div style="font-family:var(--mono);font-size:9px;color:var(--text2);margin-top:3px;">Independent · Langsung ke Bybit · Tanpa bot · Klik signal → tampil di chart</div>
+          <div style="font-family:var(--mono);font-size:9px;color:var(--text2);margin-top:2px;">TF: 15m · ${AI_SIGNAL_PAIRS.length} pairs · Klik kartu → chart</div>
         </div>
         <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
           <span id="ai-scan-status" style="font-family:var(--mono);font-size:10px;color:var(--text2);">⟳ idle</span>
-          <select id="ai-signal-tf" style="width:auto;padding:4px 8px;font-size:11px;background:var(--panel);border:1px solid var(--border2);color:var(--text);border-radius:4px;">
-            <option value="5" selected>5m</option>
-            <option value="15">15m</option>
-            <option value="60">1h</option>
-            <option value="240">4h</option>
-          </select>
           <button onclick="runAISignalScan()" style="padding:6px 14px;background:var(--accent);color:#000;border:none;border-radius:4px;font-family:var(--mono);font-size:11px;font-weight:700;cursor:pointer;letter-spacing:1px;">⚡ SCAN</button>
           <button onclick="toggleAutoScan()" id="btn-auto-scan" style="padding:6px 10px;background:var(--panel);border:1px solid var(--border2);color:var(--text2);border-radius:4px;font-family:var(--mono);font-size:10px;cursor:pointer;">AUTO: OFF</button>
         </div>
       </div>
-      <div id="ai-signal-stats" style="display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin-bottom:14px;"></div>
-      <div id="ai-signal-grid" style="display:grid;gap:8px;grid-template-columns:repeat(auto-fill,minmax(290px,1fr));">
-        <div style="color:var(--text2);font-family:var(--mono);font-size:12px;padding:30px;text-align:center;grid-column:1/-1;border:1px dashed var(--border);border-radius:6px;">
-          Klik <strong style="color:var(--accent)">⚡ SCAN</strong> untuk analisa ${AI_SIGNAL_PAIRS.length} pair sekaligus<br>
-          <span style="font-size:10px;opacity:0.6;margin-top:6px;display:block;">Klik kartu signal → tampil di chart + entry/TP/SL lines</span>
+
+      <!-- Scan stats bar -->
+      <div id="ai-signal-stats" style="display:grid;grid-template-columns:repeat(5,1fr);border-bottom:1px solid var(--border);flex-shrink:0;"></div>
+
+      <!-- Signal cards grid — full width -->
+      <div id="ai-signal-grid" style="padding:12px 16px;display:grid;gap:8px;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));flex-shrink:0;">
+        <div style="color:var(--text2);font-family:var(--mono);font-size:12px;padding:24px;text-align:center;grid-column:1/-1;border:1px dashed var(--border);border-radius:6px;">
+          Klik <strong style="color:var(--accent)">⚡ SCAN</strong> untuk analisa ${AI_SIGNAL_PAIRS.length} pair<br>
+          <span style="font-size:10px;opacity:0.6;margin-top:4px;display:block;">Klik kartu → chart + entry/TP/SL lines · History dicatat otomatis</span>
         </div>
       </div>
+
+      <!-- [AI-FIX-1] Signal History panel -->
+      <div style="flex-shrink:0;border-top:1px solid var(--border);background:var(--bg2);">
+        <div style="display:flex;align-items:center;justify-content:space-between;padding:10px 16px;border-bottom:1px solid var(--border);">
+          <span style="font-family:var(--mono);font-size:10px;font-weight:600;letter-spacing:2px;color:var(--text2);text-transform:uppercase;">📊 SIGNAL HISTORY</span>
+          <div style="display:flex;gap:12px;align-items:center;">
+            <div id="ai-hist-summary" style="display:flex;gap:14px;font-family:var(--mono);font-size:11px;"></div>
+            <button onclick="clearAISignalHistory()" style="padding:4px 10px;background:var(--panel);border:1px solid var(--border2);color:var(--danger);border-radius:4px;font-family:var(--mono);font-size:10px;cursor:pointer;">🗑 Reset</button>
+          </div>
+        </div>
+        <div style="max-height:220px;overflow-y:auto;">
+          <table style="width:100%;border-collapse:collapse;font-family:var(--mono);font-size:11px;">
+            <thead>
+              <tr style="background:var(--panel);position:sticky;top:0;z-index:1;">
+                <th style="text-align:left;padding:7px 12px;color:var(--text2);font-weight:600;font-size:9px;letter-spacing:1.5px;border-bottom:1px solid var(--border);text-transform:uppercase;">Time</th>
+                <th style="text-align:left;padding:7px 12px;color:var(--text2);font-weight:600;font-size:9px;letter-spacing:1.5px;border-bottom:1px solid var(--border);text-transform:uppercase;">Pair</th>
+                <th style="text-align:left;padding:7px 12px;color:var(--text2);font-weight:600;font-size:9px;letter-spacing:1.5px;border-bottom:1px solid var(--border);text-transform:uppercase;">Dir</th>
+                <th style="text-align:left;padding:7px 12px;color:var(--text2);font-weight:600;font-size:9px;letter-spacing:1.5px;border-bottom:1px solid var(--border);text-transform:uppercase;">Entry</th>
+                <th style="text-align:left;padding:7px 12px;color:var(--text2);font-weight:600;font-size:9px;letter-spacing:1.5px;border-bottom:1px solid var(--border);text-transform:uppercase;">TP</th>
+                <th style="text-align:left;padding:7px 12px;color:var(--text2);font-weight:600;font-size:9px;letter-spacing:1.5px;border-bottom:1px solid var(--border);text-transform:uppercase;">SL</th>
+                <th style="text-align:left;padding:7px 12px;color:var(--text2);font-weight:600;font-size:9px;letter-spacing:1.5px;border-bottom:1px solid var(--border);text-transform:uppercase;">Status</th>
+                <th style="text-align:left;padding:7px 12px;color:var(--text2);font-weight:600;font-size:9px;letter-spacing:1.5px;border-bottom:1px solid var(--border);text-transform:uppercase;">P&L</th>
+              </tr>
+            </thead>
+            <tbody id="ai-signal-history-body"></tbody>
+          </table>
+        </div>
+      </div>
+
     </div>`;
+
+  // Render existing history immediately
+  renderAISignalHistory();
 }
 
 let _autoScanActive = false;
@@ -1179,7 +1303,7 @@ function toggleAutoScan() {
   }
 }
 
-// ── Indikator teknikal (client-side) ──────────────────────────────────────────
+// ── Technical indicators (client-side) ───────────────────────────────────────
 
 function _calcRSI(closes, period = 14) {
   if (closes.length < period + 2) return 50;
@@ -1221,19 +1345,7 @@ function _calcATR(candles, period = 14) {
   return atr;
 }
 
-// ════════════════════════════════════════════════════════════════════════════
-// [FIX-5-NEW] _analyzeSignal — EMA Trend Filter
-// ════════════════════════════════════════════════════════════════════════════
-// ROOT CAUSE: Bot sering LONG padahal downtrend karena LSR tinggi (whale long).
-// LSR adalah data dari luar candle — bisa misleading karena whales juga hedge.
-// FIX: Setelah semua scoring, terapkan EMA trend penalty:
-//   - emaBearAlign (EMA9 < EMA21 < EMA50) + bullScore > bearScore
-//     → potong bullScore -3 (trend berlawanan signal)
-//   - price < EMA50 * 0.99 → potong bullScore -2 (harga di bawah medium trend)
-//   - Berlaku sebaliknya untuk short signal dalam uptrend
-// Ini tidak 100% menghilangkan LSR influence, tapi memberikan veto kuat
-// dari trend teknikal sehingga bot tidak masuk melawan arus.
-// ════════════════════════════════════════════════════════════════════════════
+// [FIX-5] _analyzeSignal with EMA Trend Filter
 function _analyzeSignal(symbol, candles) {
   if (candles.length < 35) return null;
   const closes   = candles.map(c => c.c);
@@ -1286,36 +1398,26 @@ function _analyzeSignal(symbol, candles) {
   if (prev2.c < prev2.o && Math.abs(prev.c - prev.o) < atr * 0.3 && last.c > last.o && last.c > (prev2.o + prev2.c) / 2) { bullScore += 2; reasons.push('Morning star'); }
   if (prev2.c > prev2.o && Math.abs(prev.c - prev.o) < atr * 0.3 && last.c < last.o && last.c < (prev2.o + prev2.c) / 2) { bearScore += 2; reasons.push('Evening star'); }
 
-  // ═══════════════════════════════════════════════════════════════════════
-  // [FIX-5-NEW] EMA Trend Filter — veto signal yang melawan trend
-  // Ini adalah anti-LSR-manipulation filter. Jika EMA alignment jelas
-  // downtrend tapi signal LONG → potong bull score secara agresif.
-  // ═══════════════════════════════════════════════════════════════════════
+  // [FIX-5] EMA Trend Filter
   let trendConflict = false;
-
-  // Bear trend (EMA9 < EMA21 < EMA50) tapi signal LONG → penalty keras
   if (emaBearAlign && bullScore > bearScore) {
-    bullScore = Math.max(0, bullScore - 3); // [FIX-5] cut bull score
+    bullScore = Math.max(0, bullScore - 3);
     reasons.push('⚠ EMA downtrend conflict');
     trendConflict = true;
   }
-  // Bull trend (EMA9 > EMA21 > EMA50) tapi signal SHORT → penalty keras
   if (emaBullAlign && bearScore > bullScore) {
-    bearScore = Math.max(0, bearScore - 3); // [FIX-5] cut bear score
+    bearScore = Math.max(0, bearScore - 3);
     reasons.push('⚠ EMA uptrend conflict');
     trendConflict = true;
   }
-  // [FIX-5] Price jauh di bawah EMA50 (>1%) → additional bull penalty
   if (price < ema50 * 0.99 && bullScore > bearScore) {
     bullScore = Math.max(0, bullScore - 2);
     if (!trendConflict) reasons.push('Price < EMA50 (bull penalized)');
   }
-  // [FIX-5] Price jauh di atas EMA50 (>1%) → additional bear penalty
   if (price > ema50 * 1.01 && bearScore > bullScore) {
     bearScore = Math.max(0, bearScore - 2);
     if (!trendConflict) reasons.push('Price > EMA50 (bear penalized)');
   }
-  // ═══════════════════════════════════════════════════════════════════════
 
   const minScore = 4;
   if (bullScore < minScore && bearScore < minScore) return null;
@@ -1337,11 +1439,11 @@ function _analyzeSignal(symbol, candles) {
   return {
     symbol, direction, confidence, entry, tp, sl, rr, rsi, reasons, price,
     ema9, ema21, ema50, volRatio,
-    trendConflict,           // [FIX-5] expose untuk visual warning
-    emaBullAlign, emaBearAlign  // [FIX-5] expose untuk visual
+    trendConflict, emaBullAlign, emaBearAlign
   };
 }
 
+// [AI-FIX-2] runAISignalScan — TF hardcoded to 15m, no more TF select
 async function runAISignalScan() {
   ensureSignalPaneReady();
   const statusEl = document.getElementById('ai-scan-status');
@@ -1349,9 +1451,11 @@ async function runAISignalScan() {
   const statsEl  = document.getElementById('ai-signal-stats');
   if (!gridEl) return;
 
-  const tf = document.getElementById('ai-signal-tf')?.value || '5';
+  // [AI-FIX-2] Fixed 15m — best balance for signal detection. TF selector removed.
+  const tf = '15';
+
   if (statusEl) statusEl.textContent = '⟳ Scanning...';
-  gridEl.innerHTML = `<div style="color:var(--text2);font-family:var(--mono);font-size:12px;padding:30px;text-align:center;grid-column:1/-1;">⟳ Mengambil data ${AI_SIGNAL_PAIRS.length} pair...</div>`;
+  gridEl.innerHTML = `<div style="color:var(--text2);font-family:var(--mono);font-size:12px;padding:24px;text-align:center;grid-column:1/-1;">⟳ Mengambil data ${AI_SIGNAL_PAIRS.length} pair (TF: 15m)...</div>`;
 
   const results = [];
   let scanned = 0, errors = 0;
@@ -1384,37 +1488,38 @@ async function runAISignalScan() {
   _renderAISignals(results, scanned, tf);
   _renderAIScanStats(results, scanned, errors, statsEl);
   const ts = new Date().toLocaleTimeString();
-  if (statusEl) statusEl.textContent = `✓ ${scanned} pair @ ${ts} | TF:${tf}m | ${results.length} signal`;
+  if (statusEl) statusEl.textContent = `✓ ${scanned} pair @ ${ts} | ${results.length} signal`;
+
+  // [AI-FIX-1] Save scan results to localStorage so auto-scan persists
+  if (results.length > 0) {
+    Storage.set('aiLastScanResults', { results, ts, scanned });
+  }
 }
 
 function _renderAIScanStats(results, total, errors, el) {
   if (!el) return;
-  const longs   = results.filter(r => r.direction === 'LONG').length;
-  const shorts  = results.filter(r => r.direction === 'SHORT').length;
-  const avgConf = results.length ? (results.reduce((s, r) => s + r.confidence, 0) / results.length * 100).toFixed(0) : 0;
-  // [FIX-5-VISUAL] Tambah stat untuk conflict count
+  const longs    = results.filter(r => r.direction === 'LONG').length;
+  const shorts   = results.filter(r => r.direction === 'SHORT').length;
+  const avgConf  = results.length ? (results.reduce((s, r) => s + r.confidence, 0) / results.length * 100).toFixed(0) : 0;
   const conflicts = results.filter(r => r.trendConflict).length;
   el.innerHTML = [
-    { label: 'Scanned',   value: total,           color: 'var(--text)' },
-    { label: 'LONG',      value: longs,            color: 'var(--accent)' },
-    { label: 'SHORT',     value: shorts,           color: 'var(--danger)' },
-    { label: 'Avg Conf',  value: avgConf + '%',    color: 'var(--warn)' },
-    // [FIX-5-VISUAL] Tampilkan jumlah sinyal yang punya trend conflict
+    { label: 'Scanned',    value: total,          color: 'var(--text)' },
+    { label: 'LONG',       value: longs,           color: 'var(--accent)' },
+    { label: 'SHORT',      value: shorts,          color: 'var(--danger)' },
+    { label: 'Avg Conf',   value: avgConf + '%',   color: 'var(--warn)' },
     { label: '⚠ Conflict', value: conflicts,       color: conflicts > 0 ? '#f59e0b' : 'var(--text2)' },
-  ].map(s => `<div style="background:var(--bg2);border:1px solid var(--border);border-radius:4px;padding:8px;text-align:center;">
+  ].map(s => `<div style="background:var(--bg2);border-right:1px solid var(--border);padding:8px;text-align:center;">
     <div style="font-size:9px;font-family:var(--mono);color:var(--text2);text-transform:uppercase;">${s.label}</div>
     <div style="font-family:var(--mono);font-size:16px;font-weight:700;color:${s.color};margin-top:2px;">${s.value}</div>
   </div>`).join('');
 }
 
-// ════════════════════════════════════════════════════════════════════════════
-// [FIX-5-VISUAL] _renderAISignals — tampilkan trend conflict badge
-// ════════════════════════════════════════════════════════════════════════════
+// [AI-FIX-3] _renderAISignals — full width, no side constraints
 function _renderAISignals(results, total, tf) {
   const gridEl = document.getElementById('ai-signal-grid');
   if (!gridEl) return;
   if (!results.length) {
-    gridEl.innerHTML = `<div style="color:var(--text2);font-family:var(--mono);font-size:12px;padding:30px;text-align:center;grid-column:1/-1;border:1px dashed var(--border);border-radius:6px;">Tidak ada sinyal kuat dari ${total} pair di TF ${tf}m.<br><span style="font-size:10px;opacity:0.6;">Coba TF lebih besar atau tunggu momentum terbentuk.</span></div>`;
+    gridEl.innerHTML = `<div style="color:var(--text2);font-family:var(--mono);font-size:12px;padding:24px;text-align:center;grid-column:1/-1;border:1px dashed var(--border);border-radius:6px;">Tidak ada sinyal kuat dari ${total} pair<br><span style="font-size:10px;opacity:0.6;">Coba lagi nanti atau tunggu momentum terbentuk.</span></div>`;
     _lastAIScanResults = [];
     return;
   }
@@ -1431,53 +1536,52 @@ function _renderAISignals(results, total, tf) {
     const confBar = `<div style="height:3px;background:var(--border);border-radius:2px;margin:6px 0 8px;">
       <div style="height:3px;width:${confPct}%;background:${color};border-radius:2px;transition:width .3s;"></div></div>`;
 
-    // [FIX-5-VISUAL] Badge untuk trend conflict warning
     const conflictBadge = s.trendConflict
-      ? `<span style="background:rgba(245,158,11,0.2);color:#f59e0b;border:1px solid rgba(245,158,11,0.4);border-radius:3px;padding:2px 7px;font-family:var(--mono);font-size:9px;font-weight:700;letter-spacing:0.5px;margin-left:4px;">⚠ TREND CONFLICT</span>`
+      ? `<span style="background:rgba(245,158,11,0.2);color:#f59e0b;border:1px solid rgba(245,158,11,0.4);border-radius:3px;padding:2px 6px;font-family:var(--mono);font-size:8px;font-weight:700;margin-left:4px;">⚠ CONFLICT</span>`
       : '';
 
-    // [FIX-5-VISUAL] EMA trend indicator
-    const emaLabel = s.emaBullAlign ? '▲ EMA bull' : s.emaBearAlign ? '▼ EMA bear' : '— EMA mix';
+    const emaLabel = s.emaBullAlign ? '▲ bull' : s.emaBearAlign ? '▼ bear' : '— mix';
     const emaColor = s.emaBullAlign ? 'var(--accent)' : s.emaBearAlign ? 'var(--danger)' : 'var(--text2)';
 
     return `
-      <div style="background:var(--bg2);border:1px solid ${border};border-radius:6px;padding:14px;cursor:pointer;transition:border-color .2s;${s.trendConflict ? 'opacity:0.75;' : ''}"
+      <div style="background:var(--bg2);border:1px solid ${border};border-radius:6px;padding:12px;cursor:pointer;transition:border-color .2s;${s.trendConflict ? 'opacity:0.78;' : ''}"
            onclick="selectAISignalPair('${s.symbol}')"
            onmouseenter="this.style.borderColor='${color}'"
            onmouseleave="this.style.borderColor='${border}'">
-        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
-          <span style="font-family:var(--mono);font-weight:700;color:var(--text);font-size:13px;">${s.symbol.replace('USDT','')}/USDT</span>
-          <div style="display:flex;align-items:center;gap:4px;">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;">
+          <span style="font-family:var(--mono);font-weight:700;color:var(--text);font-size:12px;">${s.symbol.replace('USDT','/USDT')}</span>
+          <div style="display:flex;align-items:center;gap:3px;">
             ${conflictBadge}
-            <span style="background:${bgColor};color:${color};border:1px solid ${border};border-radius:4px;padding:3px 10px;font-family:var(--mono);font-size:11px;font-weight:700;">${s.direction}</span>
+            <span style="background:${bgColor};color:${color};border:1px solid ${border};border-radius:3px;padding:2px 8px;font-family:var(--mono);font-size:10px;font-weight:700;">${s.direction}</span>
           </div>
         </div>
         ${confBar}
-        <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:6px;margin-bottom:8px;">
-          <div style="text-align:center;background:var(--panel);border:1px solid var(--border);border-radius:4px;padding:6px;">
-            <div style="font-size:8px;color:var(--text2);text-transform:uppercase;margin-bottom:2px;">Entry</div>
-            <div style="font-family:var(--mono);color:var(--blue);font-size:11px;font-weight:600;">${s.entry.toFixed(dec)}</div>
+        <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:5px;margin-bottom:7px;">
+          <div style="text-align:center;background:var(--panel);border:1px solid var(--border);border-radius:3px;padding:5px;">
+            <div style="font-size:8px;color:var(--text2);text-transform:uppercase;margin-bottom:1px;">Entry</div>
+            <div style="font-family:var(--mono);color:var(--blue);font-size:10px;font-weight:600;">${s.entry.toFixed(dec)}</div>
           </div>
-          <div style="text-align:center;background:var(--panel);border:1px solid var(--border);border-radius:4px;padding:6px;">
-            <div style="font-size:8px;color:var(--text2);text-transform:uppercase;margin-bottom:2px;">TP</div>
-            <div style="font-family:var(--mono);color:var(--accent);font-size:11px;font-weight:600;">${s.tp.toFixed(dec)}</div>
+          <div style="text-align:center;background:var(--panel);border:1px solid var(--border);border-radius:3px;padding:5px;">
+            <div style="font-size:8px;color:var(--text2);text-transform:uppercase;margin-bottom:1px;">TP</div>
+            <div style="font-family:var(--mono);color:var(--accent);font-size:10px;font-weight:600;">${s.tp.toFixed(dec)}</div>
           </div>
-          <div style="text-align:center;background:var(--panel);border:1px solid var(--border);border-radius:4px;padding:6px;">
-            <div style="font-size:8px;color:var(--text2);text-transform:uppercase;margin-bottom:2px;">SL</div>
-            <div style="font-family:var(--mono);color:var(--danger);font-size:11px;font-weight:600;">${s.sl.toFixed(dec)}</div>
+          <div style="text-align:center;background:var(--panel);border:1px solid var(--border);border-radius:3px;padding:5px;">
+            <div style="font-size:8px;color:var(--text2);text-transform:uppercase;margin-bottom:1px;">SL</div>
+            <div style="font-family:var(--mono);color:var(--danger);font-size:10px;font-weight:600;">${s.sl.toFixed(dec)}</div>
           </div>
         </div>
-        <div style="display:flex;justify-content:space-between;font-family:var(--mono);font-size:10px;color:var(--text2);margin-bottom:6px;">
+        <div style="display:flex;justify-content:space-between;font-family:var(--mono);font-size:9px;color:var(--text2);margin-bottom:4px;">
           <span>RSI ${s.rsi.toFixed(0)}</span>
           <span>RR ${s.rr.toFixed(2)}×</span>
           <span>Conf ${confPct}%</span>
-          <span style="color:${emaColor}">${emaLabel}</span>
+          <span style="color:${emaColor}">EMA ${emaLabel}</span>
         </div>
         <div style="font-size:9px;color:var(--text2);font-style:italic;line-height:1.4;">${s.reasons.slice(0,3).join(' · ')}</div>
       </div>`;
   }).join('');
 }
 
+// [AI-FIX-4+AI-FIX-1] selectAISignalPair — record to history
 function selectAISignalPair(symbol) {
   const sel = document.getElementById('cfg-symbol');
   if (sel && [...sel.options].some(o => o.value === symbol)) {
@@ -1495,6 +1599,25 @@ function selectAISignalPair(symbol) {
     const dec = sig.price < 10 ? 4 : 2;
     const conflictWarn = sig.trendConflict ? ' ⚠CONFLICT' : '';
     toast(`📍 ${symbol} ${sig.direction}${conflictWarn} | Entry:${sig.entry.toFixed(dec)} TP:${sig.tp.toFixed(dec)} SL:${sig.sl.toFixed(dec)}`, !sig.trendConflict);
+
+    // [AI-FIX-1] Record signal to history (status: OPEN, will be tracked for WIN/LOSS)
+    _aiSignalHistory.unshift({
+      time:      new Date().toLocaleTimeString(),
+      symbol:    sig.symbol,
+      direction: sig.direction,
+      entry:     sig.entry,
+      tp:        sig.tp,
+      sl:        sig.sl,
+      rr:        sig.rr,
+      conf:      sig.confidence,
+      status:    'OPEN',
+      pnl:       null,
+      closeTime: null
+    });
+    if (_aiSignalHistory.length > 100) _aiSignalHistory.pop();
+    _saveAISignalHistory();
+    // renderAISignalHistory() will be called next time insight pane is active
+
     setTimeout(() => {
       addSignalMarker(action, sig.price);
       setTpSlLines(sig.entry, sig.tp, sig.sl);
@@ -1505,9 +1628,7 @@ function selectAISignalPair(symbol) {
   }
 }
 
-// ════════════════════════════════════════════════════════════════════════════
-// [FIX-4-ENHANCED] initTradesTab — inject tab + pane dengan containment benar
-// ════════════════════════════════════════════════════════════════════════════
+// ── Trades Tab (FIX-4) ────────────────────────────────────────────────────────
 function initTradesTab() {
   const tabBar = document.querySelector('.tab-bar');
   const spacer = document.querySelector('.tab-spacer');
@@ -1527,7 +1648,6 @@ function initTradesTab() {
     const pane = document.createElement('div');
     pane.className = 'tab-pane';
     pane.id = 'pane-trades';
-    // [FIX-4-ENHANCED] Set nuclear hide state sejak awal
     pane.style.display = 'none';
     pane.style.visibility = 'hidden';
     pane.style.pointerEvents = 'none';
@@ -1561,12 +1681,10 @@ function initTradesTab() {
           <div id="ts-losses" style="font-family:var(--mono);font-size:18px;font-weight:700;color:var(--danger);">0</div>
         </div>
       </div>
-
       <div style="display:flex;align-items:center;justify-content:space-between;padding:12px 20px;border-bottom:1px solid var(--border);background:var(--bg2);flex-shrink:0;">
         <span style="font-family:var(--mono);font-size:10px;font-weight:600;letter-spacing:2px;color:var(--text2);text-transform:uppercase;">📊 TRADE HISTORY</span>
         <button onclick="resetHistory()" style="padding:5px 12px;background:var(--panel);border:1px solid var(--border2);color:var(--danger);border-radius:4px;font-family:var(--mono);font-size:10px;cursor:pointer;">🗑 Reset</button>
       </div>
-
       <div style="flex:1;overflow-y:auto;">
         <table style="width:100%;border-collapse:collapse;font-family:var(--mono);font-size:12px;">
           <thead>
@@ -1584,9 +1702,7 @@ function initTradesTab() {
             <tr><td colspan="7" style="text-align:center;padding:3rem;color:var(--text2);font-family:var(--mono);font-size:13px;">No closed trades yet</td></tr>
           </tbody>
         </table>
-      </div>
-    `;
-
+      </div>`;
     mainPanel.appendChild(pane);
   }
 }
@@ -1648,44 +1764,36 @@ function renderFullTradesTable() {
   });
 
   if (!rows) {
-    rows = `<tr><td colspan="7" style="text-align:center;padding:3rem;color:var(--text2);font-family:var(--mono);font-size:13px;">No closed trades yet — start bot to begin paper trading</td></tr>`;
+    rows = `<tr><td colspan="7" style="text-align:center;padding:3rem;color:var(--text2);font-family:var(--mono);font-size:13px;">No closed trades yet</td></tr>`;
   }
   tbody.innerHTML = rows;
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// BOOT SEQUENCE
-// ═══════════════════════════════════════════════════════════════════════════════
+// ── BOOT SEQUENCE ─────────────────────────────────────────────────────────────
 
 loadConfig();
 loadSimState();
 loadBybitPairs('bybit');
 
-// Init AI SIGNAL pane di startup
-ensureSignalPaneReady();
+// [AI-FIX-1] Load signal history from localStorage on boot
+_loadAISignalHistory();
 
-// [FIX-4-ENHANCED] Init TRADES tab di startup
+ensureSignalPaneReady();
 initTradesTab();
 
-// ════════════════════════════════════════════════════════════════════════════
-// [FIX-3-ENHANCED] Boot: Nuclear hide semua non-active pane
-// Gunakan styling yang sama dengan switchTab untuk konsistensi
-// Ini memastikan dari frame pertama chart tidak bisa bleed ke tab lain
-// ════════════════════════════════════════════════════════════════════════════
+// Nuclear hide all non-active panes on boot
 (function _initPaneContainment() {
-  // Semua non-active pane: nuclear hide
   document.querySelectorAll('.tab-pane:not(.active)').forEach(p => {
     p.style.display = 'none';
     p.style.visibility = 'hidden';
     p.style.pointerEvents = 'none';
-    p.style.position = 'absolute';   // [FIX-3-ENHANCED] keluar dari grid flow
+    p.style.position = 'absolute';
     p.style.width = '0';
     p.style.height = '0';
     p.style.overflow = 'hidden';
     p.style.clip = 'rect(0,0,0,0)';
     p.style.zIndex = '-999';
   });
-  // Active pane (chart tab): restore ke grid flow
   const activePane = document.querySelector('.tab-pane.active');
   if (activePane) {
     activePane.style.display = 'flex';
@@ -1693,7 +1801,7 @@ initTradesTab();
     activePane.style.pointerEvents = 'auto';
     activePane.style.flexDirection = 'column';
     activePane.style.overflow = 'hidden';
-    activePane.style.position = 'relative';  // [FIX-3-ENHANCED] dalam grid flow
+    activePane.style.position = 'relative';
     activePane.style.width = '100%';
     activePane.style.height = '100%';
     activePane.style.clip = 'auto';
