@@ -3,15 +3,21 @@
 // Bybit V5 Order Executor — Production Grade
 // ==========================================
 // BUG FIX (v3.0.1): Renamed public Execute(ctx, OrderRequest) → execute(ctx, OrderRequest)
-// so that adapter.go can define the single public Execute(ctx, interface{}) method that
-// satisfies the main.go orderExec interface without a duplicate-method compile error.
+// BUG FIX (v3.1.0): [FIX-BAL] fetchFreeUSDT sekarang coba UNIFIED dulu, fallback CONTRACT.
+//   ROOT CAUSE: Bybit Unified Trading Account (UTA) pakai accountType=UNIFIED.
+//   Code lama hardcode accountType=CONTRACT → response sukses tapi list coin kosong
+//   → "USDT balance not found in response" → semua order gagal.
+//   FIX:
+//   1. Loop UNIFIED → CONTRACT → FUND, stop di yang pertama return USDT > 0
+//   2. Log raw response (truncated) supaya gampang debug kalau masih gagal
+//   3. Multi-field fallback: availableToWithdraw → walletBalance → equity
+//   4. Return 0 (bukan error) kalau USDT ditemukan tapi balance = 0
+//      supaya bot tau balance habis, bukan salah API key
 //
 // Layers of TP/SL defense:
 //   Layer 1 : Embed takeProfit/stopLoss directly in the order params
 //   Layer 2 : Post-fill verification via /v5/position/list
 //   Layer 3 : Fallback via /v5/position/trading-stop if Layer 1 missed
-//
-// All outbound REST calls go through bytick.com for ISP geo-block bypass.
 
 package bybit
 
@@ -77,8 +83,7 @@ func New(cfg Config) *Executor {
 	}
 }
 
-// execute is the internal entry point (lowercase — called by adapter.go's public Execute).
-// It: checks balance → sizes position → sets leverage → places order → verifies TP/SL.
+// execute adalah internal entry point (lowercase — dipanggil adapter.go).
 func (e *Executor) execute(ctx context.Context, req OrderRequest) error {
 	log.Printf("[Executor] ── %s %s ────────────────────────────", req.Side, req.Symbol)
 	log.Printf("[Executor] entry=%.4f SL=%.4f TP=%.4f RR=%.2f conf=%.3f",
@@ -89,13 +94,13 @@ func (e *Executor) execute(ctx context.Context, req OrderRequest) error {
 		return nil
 	}
 
-	// 1. Balance
+	// 1. Balance — [FIX-BAL] coba beberapa account type
 	freeUSDT, err := e.fetchFreeUSDT(ctx)
 	if err != nil {
 		return fmt.Errorf("balance fetch: %w", err)
 	}
 	if freeUSDT < 1 {
-		return fmt.Errorf("insufficient balance: %.2f USDT", freeUSDT)
+		return fmt.Errorf("insufficient balance: %.2f USDT (need >= $1)", freeUSDT)
 	}
 	log.Printf("[Executor] balance=%.2f USDT", freeUSDT)
 
@@ -107,13 +112,12 @@ func (e *Executor) execute(ctx context.Context, req OrderRequest) error {
 	riskUSDT := freeUSDT * e.cfg.RiskPct
 	rawSize  := riskUSDT / stopDist
 
-	// Apply minimum notional guard ($5)
 	notional := rawSize * req.Entry
 	if notional < 5.0 {
 		return fmt.Errorf("notional %.2f < $5 minimum", notional)
 	}
 
-	size := roundStep(rawSize, 0.001) // TODO: pull step from instruments-info
+	size := roundStep(rawSize, 0.001)
 	log.Printf("[Executor] size=%.4f notional=%.2f USDT risk=%.2f USDT", size, notional, riskUSDT)
 
 	// 3. Leverage
@@ -121,14 +125,14 @@ func (e *Executor) execute(ctx context.Context, req OrderRequest) error {
 		log.Printf("[Executor] leverage warning (non-fatal): %v", err)
 	}
 
-	// 4. Place limit order (Layer 1: embed TP/SL)
+	// 4. Place order (Layer 1: embed TP/SL)
 	orderID, err := e.placeOrder(ctx, req, size)
 	if err != nil {
 		return fmt.Errorf("place order: %w", err)
 	}
 	log.Printf("[Executor] ✓ Order placed id=%s", orderID)
 
-	// 5. Layer 2 & 3: verify TP/SL on position after brief fill window
+	// 5. Layer 2 & 3: verify TP/SL
 	go func() {
 		time.Sleep(3 * time.Second)
 		e.verifyAndFallbackTPSL(context.Background(), req)
@@ -216,7 +220,6 @@ func (e *Executor) verifyAndFallbackTPSL(ctx context.Context, req OrderRequest) 
 			return
 		}
 
-		// Layer 3: fallback
 		log.Printf("[Executor] Layer 1 MISS — setting TP/SL via trading-stop")
 		fallbackBody := map[string]interface{}{
 			"category":    "linear",
@@ -248,44 +251,109 @@ func (e *Executor) verifyAndFallbackTPSL(ctx context.Context, req OrderRequest) 
 	log.Printf("[Executor] Position not found yet (limit order unfilled?) — skipping TP/SL verify")
 }
 
-// ── Balance ───────────────────────────────────────────────────────────────────
+// ── Balance — [FIX-BAL] ───────────────────────────────────────────────────────
+//
+// Bybit punya 3 tipe account:
+//   UNIFIED  → Unified Trading Account (UTA) — akun baru default sejak 2023
+//   CONTRACT → Classic derivatives account — akun lama
+//   FUND     → Funding account (jarang untuk trading)
+//
+// Masalah lama: hardcode CONTRACT → UTA user dapat list kosong → "not found".
+// Fix: coba UNIFIED dulu, fallback ke CONTRACT, fallback ke FUND.
+// Tiap attempt di-log dengan truncated raw response untuk debug.
 
 func (e *Executor) fetchFreeUSDT(ctx context.Context) (float64, error) {
-	resp, err := e.signedGet(ctx, "/v5/account/wallet-balance", "accountType=CONTRACT")
-	if err != nil {
-		return 0, err
+	accountTypes := []string{"UNIFIED", "CONTRACT", "FUND"}
+
+	for _, acctType := range accountTypes {
+		bal, err := e.tryFetchBalance(ctx, acctType)
+		if err != nil {
+			log.Printf("[Executor-BAL] accountType=%s error: %v", acctType, err)
+			continue
+		}
+		if bal >= 0 {
+			// bal=0 bisa berarti akun kosong — valid, return tanpa error
+			log.Printf("[Executor-BAL] ✓ USDT=%.4f via accountType=%s", bal, acctType)
+			return bal, nil
+		}
+		// bal=-1 berarti USDT tidak ada di akun ini, coba berikutnya
+		log.Printf("[Executor-BAL] accountType=%s — USDT not in this account, trying next", acctType)
 	}
+
+	return 0, fmt.Errorf("USDT balance not found in UNIFIED/CONTRACT/FUND accounts — check API key permissions (needs 'Read' on Account)")
+}
+
+// tryFetchBalance coba satu accountType. Returns:
+//   >= 0   : USDT ditemukan, nilai balance (bisa 0 kalau akun kosong)
+//   -1     : USDT tidak ada di account ini, coba account lain
+//   error  : API error atau parse error
+func (e *Executor) tryFetchBalance(ctx context.Context, accountType string) (float64, error) {
+	resp, err := e.signedGet(ctx, "/v5/account/wallet-balance", "accountType="+accountType)
+	if err != nil {
+		return -1, fmt.Errorf("HTTP: %w", err)
+	}
+
+	// [FIX-BAL] Log raw untuk debug — truncate supaya log gak banjir
+	log.Printf("[Executor-BAL] accountType=%s raw=%s", accountType, truncateStr(string(resp), 300))
+
 	var result struct {
-		Result struct {
+		RetCode int    `json:"retCode"`
+		RetMsg  string `json:"retMsg"`
+		Result  struct {
 			List []struct {
-				Coin []struct {
+				AccountType string `json:"accountType"`
+				Coin        []struct {
 					Coin                string `json:"coin"`
-					AvailableToWithdraw string `json:"availableToWithdraw"`
 					WalletBalance       string `json:"walletBalance"`
+					AvailableToWithdraw string `json:"availableToWithdraw"`
+					AvailableToBorrow   string `json:"availableToBorrow"`
+					Equity              string `json:"equity"`
+					Free                string `json:"free"`
 				} `json:"coin"`
 			} `json:"list"`
 		} `json:"result"`
 	}
+
 	if err := json.Unmarshal(resp, &result); err != nil {
-		return 0, err
+		return -1, fmt.Errorf("JSON parse: %w", err)
 	}
+
+	if result.RetCode != 0 {
+		return -1, fmt.Errorf("API retCode=%d msg=%q", result.RetCode, result.RetMsg)
+	}
+
 	for _, acct := range result.Result.List {
 		for _, coin := range acct.Coin {
-			if coin.Coin != "USDT" {
+			if strings.ToUpper(coin.Coin) != "USDT" {
 				continue
 			}
-			v, _ := strconv.ParseFloat(coin.AvailableToWithdraw, 64)
-			if v > 0 {
-				return v, nil
+			// Multi-field fallback — tiap exchange/akun bisa beda field yang terisi
+			for fieldName, rawVal := range map[string]string{
+				"availableToWithdraw": coin.AvailableToWithdraw,
+				"walletBalance":       coin.WalletBalance,
+				"equity":              coin.Equity,
+				"free":                coin.Free,
+			} {
+				if rawVal == "" {
+					continue
+				}
+				v, err := strconv.ParseFloat(rawVal, 64)
+				if err == nil && v > 0 {
+					log.Printf("[Executor-BAL] field=%s val=%.4f", fieldName, v)
+					return v, nil
+				}
 			}
-			v, _ = strconv.ParseFloat(coin.WalletBalance, 64)
-			return v, nil
+			// USDT ditemukan tapi semua field 0 → akun ada tapi kosong
+			log.Printf("[Executor-BAL] USDT found in %s but all balance fields = 0 (empty account?)", accountType)
+			return 0, nil
 		}
 	}
-	return 0, fmt.Errorf("USDT balance not found in response")
+
+	// Account type ini tidak punya USDT coin sama sekali
+	return -1, nil
 }
 
-// FetchFreeUSDT is exported so the gateway can report it in bot_insight.json
+// FetchFreeUSDT exported untuk gateway
 func (e *Executor) FetchFreeUSDT(ctx context.Context) (float64, error) {
 	return e.fetchFreeUSDT(ctx)
 }
@@ -308,7 +376,6 @@ func (e *Executor) setLeverage(ctx context.Context, symbol string, leverage int)
 		RetMsg  string `json:"retMsg"`
 	}
 	_ = json.Unmarshal(resp, &r)
-	// retCode 110043 = "leverage not modified" — not an error
 	if r.RetCode != 0 && r.RetCode != 110043 {
 		return fmt.Errorf("setLeverage %d: %s", r.RetCode, r.RetMsg)
 	}
@@ -320,7 +387,7 @@ func (e *Executor) setLeverage(ctx context.Context, symbol string, leverage int)
 
 func (e *Executor) signedPost(ctx context.Context, path string, body map[string]interface{}) ([]byte, error) {
 	payload, _ := json.Marshal(body)
-	ts := strconv.FormatInt(time.Now().UnixMilli(), 10)
+	ts   := strconv.FormatInt(time.Now().UnixMilli(), 10)
 	sign := e.sign(ts + e.cfg.APIKey + recvWindow + string(payload))
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
@@ -343,7 +410,7 @@ func (e *Executor) signedPost(ctx context.Context, path string, body map[string]
 }
 
 func (e *Executor) signedGet(ctx context.Context, path, queryStr string) ([]byte, error) {
-	ts := strconv.FormatInt(time.Now().UnixMilli(), 10)
+	ts   := strconv.FormatInt(time.Now().UnixMilli(), 10)
 	sign := e.sign(ts + e.cfg.APIKey + recvWindow + queryStr)
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet,
@@ -372,7 +439,6 @@ func (e *Executor) sign(data string) string {
 
 // ── Utils ─────────────────────────────────────────────────────────────────────
 
-// bybitSymbol strips CCXT formatting (e.g. BTC/USDT:USDT → BTCUSDT)
 func bybitSymbol(s string) string {
 	s = strings.ReplaceAll(s, "/", "")
 	s = strings.ReplaceAll(s, ":", "")
@@ -380,10 +446,16 @@ func bybitSymbol(s string) string {
 	return s
 }
 
-// roundStep rounds v to the nearest multiple of step
 func roundStep(v, step float64) float64 {
 	if step <= 0 {
 		return v
 	}
 	return math.Round(v/step) * step
+}
+
+func truncateStr(s string, maxLen int) string {
+	if len(s) <= maxLen {
+		return s
+	}
+	return s[:maxLen] + "…"
 }
