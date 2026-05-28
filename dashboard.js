@@ -1,23 +1,11 @@
-// dashboard.js — TradeBot v3.3.0
-// ─────────────────────────────────────────────────────────────────────────────
-// CHANGELOG vs v3.2.0:
-//
-// [FIX-LEV]         MEXC leverage max = 200 for ALL pairs (not just BTC/ETH).
-//                   Bybit keeps pair-specific limits.
-//
-// [FIX-PAIRS]       AI_SIGNAL_PAIRS expanded to 25 pairs.
-//
-// [FIX-AUTOSCAN]    Auto-scan state persisted in localStorage. Survives refresh.
-//
-// [FIX-EXCHANGE-WARN] Warn user that Exchange/Mode changes require bot restart
-//                   (executor is baked into main.go at startup, not hot-swappable).
-//
-// [FIX-DRYRUN-UI]   Balance stat shows [DRY RUN] badge when DRY_RUN=1.
-//
-// [FIX-UI-GAP]      AI scanner header button group gap fixed.
-//
-// (All previous fixes AI-FIX-1..4, FIX-1..5, PAIR-FIX retained)
-// ─────────────────────────────────────────────────────────────────────────────
+// dashboard.js — TradeBot v3.4.0
+// FIXES vs v3.3.0:
+// [FIX-1]  cfg-mode onchange warning + exchange/mode restart toast
+// [FIX-2]  MEXC leverage per-pair tier (BTC/ETH=200, mid=100, small=50)
+// [FIX-4]  isDry: removed broken stats.balance===10000 heuristic
+// [FIX-5a] AI scanner minScore 4→3, diff 2→1 — more pairs pass filter
+// [FIX-5b] AI scanner dynamic TF selector (5m/15m/1h), _aiScanTF var
+// [FIX-5c] _restoreAutoScanState robust — no fragile setTimeout, retry if btn missing
 'use strict';
 
 let logs = [];
@@ -36,6 +24,7 @@ const MAX_CHART_POINTS = 150;
 
 let _lastAIScanResults = [];
 let _aiSignalHistory = [];
+let _aiScanTF = '15'; // [FIX-5b] dynamic TF for AI scanner
 
 let stats = {
   price: null, prevPrice: null, atr: null, oi: null, oiTime: null,
@@ -165,10 +154,7 @@ function syncLev(source) {
     limitLeverageInput(num);
 }
 
-// ── [FIX-LEV] MEXC max leverage = 200 for ALL USDT pairs ─────────────────────
-// MEXC Futures supports up to 200x for essentially all USDT perpetual pairs.
-// Old code: BTC/ETH → 200, else → 100. That was wrong.
-// Bybit: BTC/ETH → 100x, others → 50x (conservative, accurate).
+// [FIX-2] MEXC leverage tiered per pair category, Bybit pair-specific
 function updateLeverageLimits() {
     const exchange = document.getElementById('cfg-exchange').value;
     const symbol   = document.getElementById('cfg-symbol').value || 'BTCUSDT';
@@ -177,8 +163,14 @@ function updateLeverageLimits() {
     let maxLev;
 
     if (exchange === 'mexc') {
-        // [FIX-LEV] MEXC: ALL USDT pairs support up to 200x leverage
-        maxLev = 200;
+        // [FIX-2] MEXC: tiered by pair — not all pairs support 200x
+        if (symbol.includes('BTC') || symbol.includes('ETH')) {
+            maxLev = 200;
+        } else if (['SOLUSDT','BNBUSDT','XRPUSDT','DOGEUSDT','AVAXUSDT','LINKUSDT','ADAUSDT'].includes(symbol)) {
+            maxLev = 100;
+        } else {
+            maxLev = 50;
+        }
     } else {
         // Bybit: pair-specific
         maxLev = (symbol.includes('BTC') || symbol.includes('ETH')) ? 100 : 50;
@@ -190,6 +182,8 @@ function updateLeverageLimits() {
         document.getElementById('lev-val-display').textContent = maxLev + 'x';
         saveToLocal();
     }
+    const levDisp = document.getElementById('lev-val-display');
+    if (levDisp) levDisp.title = `Max ${symbol} on ${exchange}: ${maxLev}x`;
 }
 
 function limitLeverageInput(el) {
@@ -334,7 +328,7 @@ function updateLSRStats() {
     if (biasEl) { biasEl.textContent = stats.bias.split('_')[0]; biasEl.className = 'bias-badge ' + stats.bias; }
 }
 
-// ── [FIX-DRYRUN-UI] Balance display — show [DRY RUN] badge ───────────────────
+// [FIX-4] Balance display — isDry based ONLY on toggle, never on balance value
 function updateBalanceStats() {
     if (!stats.balance) return;
     const balEl = document.getElementById('stat-balance');
@@ -346,11 +340,10 @@ function updateBalanceStats() {
         const span = document.getElementById('stat-bal-pct');
         if (span) { span.textContent = `(${diff > 0 ? '+' : ''}${diff.toFixed(2)}%)`; span.style.color = diff > 0 ? 'var(--accent)' : 'var(--danger)'; }
     }
-    // [FIX-DRYRUN-UI] Show DRY RUN badge if balance is exactly 10000 (Go hardcoded) or cfg-dryrun checked
-    const isDry = document.getElementById('cfg-dryrun')?.checked || stats.balance === 10000;
-    const subEl = document.getElementById('stat-risk');
-    if (subEl && isDry) {
-        subEl.innerHTML = '<span style="background:rgba(245,158,11,0.15);color:var(--warn);border:1px solid rgba(245,158,11,0.3);border-radius:3px;padding:1px 6px;font-size:9px;font-weight:700;margin-right:4px;">DRY RUN</span>Risk ' + (stats.risk_pct * 100).toFixed(1) + '% / trade';
+    // [FIX-4] ONLY use the toggle — never guess from balance value
+    const isDry = document.getElementById('cfg-dryrun')?.checked;
+    if (riskEl && isDry) {
+        riskEl.innerHTML = '<span style="background:rgba(245,158,11,0.15);color:var(--warn);border:1px solid rgba(245,158,11,0.3);border-radius:3px;padding:1px 6px;font-size:9px;font-weight:700;margin-right:4px;">DRY RUN</span>Risk ' + (stats.risk_pct * 100).toFixed(1) + '% / trade';
     }
 }
 
@@ -670,7 +663,15 @@ function saveToLocal() {
     Storage.set('botUIState', state);
 }
 
-document.querySelectorAll('input, select').forEach(el => { el.addEventListener('change', () => { saveConfig(); }); });
+// [FIX-1] Generic change listener — warn on exchange/mode changes requiring restart
+document.querySelectorAll('input, select').forEach(el => {
+    el.addEventListener('change', () => {
+        saveConfig();
+        if (el.id === 'cfg-mode') {
+            toast('⚠ Mode change requires full BINARY RESTART to take effect', false);
+        }
+    });
+});
 
 function collectEnv() {
     function keyVal(id) { const v = document.getElementById(id)?.value; return (v && v !== _KEY_SENTINEL) ? v : ''; }
@@ -701,17 +702,10 @@ async function saveConfig() {
     } catch(e) { toast('Koneksi gagal', false); }
 }
 
-// ── [FIX-EXCHANGE-WARN] Warn on exchange/mode change — requires restart ───────
-// The Go executor is initialized ONCE at startup from main.go loadConfig().
-// Hot-swap is not supported. User must restart the binary for exchange/mode changes.
+// [FIX-1] onExchangeChange — warn restart needed
 function onExchangeChange(val) {
     loadBybitPairs(val); updateLeverageLimits(); saveConfig();
-    toast('⚠ Exchange change requires BOT RESTART to take effect', false);
-}
-
-function onModeChange(val) {
-    saveConfig();
-    toast('⚠ Mode (Demo/Real) change requires BOT RESTART to take effect', false);
+    toast('⚠ Exchange change requires BOT RESTART (binary, not just Stop/Start button)', false);
 }
 
 async function loadConfig() {
@@ -766,7 +760,6 @@ async function loadConfig() {
 
         updateLeverageLimits();
 
-        // Push loaded symbol/config to server so brain knows correct pair before START
         setTimeout(() => {
             try { fetch('/api/save-env', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(collectEnv()) }); }
             catch(e) {}
@@ -876,7 +869,6 @@ async function fetchAIInsight() {
 // AI SIGNAL SCANNER
 // ══════════════════════════════════════════════════════════════════════════════
 
-// [FIX-PAIRS] Expanded to 25 pairs — major USDT perpetuals on Bybit
 const AI_SIGNAL_PAIRS = [
   'BTCUSDT','ETHUSDT','SOLUSDT','BNBUSDT','XRPUSDT',
   'DOGEUSDT','PEPEUSDT','AVAXUSDT','LINKUSDT','ADAUSDT',
@@ -887,89 +879,28 @@ const AI_SIGNAL_PAIRS = [
 
 let _aiSignalTimer = null;
 let _aiSignalPaneReady = false;
-let _autoScanActive = false; // [FIX-AUTOSCAN] managed via localStorage
+let _autoScanActive = false;
 
-// ── [FIX-UI-GAP] ensureSignalPaneReady ───────────────────────────────────────
-// Fixed: button group uses gap:8px + no flex-wrap to prevent layout shift.
-// Fixed: pair count dynamically from AI_SIGNAL_PAIRS.length
-function ensureSignalPaneReady() {
-    if (_aiSignalPaneReady) return;
-    _aiSignalPaneReady = true;
-    const pane = document.getElementById('pane-insight'); if (!pane) return;
-    pane.style.padding = '0'; pane.style.background = 'var(--bg)';
-
-    pane.innerHTML = `
-    <div style="height:100%;overflow-y:auto;box-sizing:border-box;display:flex;flex-direction:column;">
-
-      <!-- [FIX-UI-GAP] Header: no flex-wrap, gap:8px, align-items:center -->
-      <div style="display:flex;align-items:center;justify-content:space-between;padding:12px 16px;flex-shrink:0;border-bottom:1px solid var(--border);background:var(--bg2);">
-        <div>
-          <div style="font-family:var(--mono);color:var(--accent);font-size:13px;font-weight:600;letter-spacing:2px;">🎯 AI SIGNAL SCANNER</div>
-          <div style="font-family:var(--mono);font-size:9px;color:var(--text2);margin-top:2px;">TF: 15m · ${AI_SIGNAL_PAIRS.length} pairs · Klik kartu → chart</div>
-        </div>
-        <!-- [FIX-UI-GAP] Buttons in a row with consistent gap, no wrap -->
-        <div style="display:flex;gap:8px;align-items:center;flex-shrink:0;">
-          <span id="ai-scan-status" style="font-family:var(--mono);font-size:10px;color:var(--text2);">⟳ idle</span>
-          <button onclick="runAISignalScan()" style="padding:6px 14px;background:var(--accent);color:#000;border:none;border-radius:4px;font-family:var(--mono);font-size:11px;font-weight:700;cursor:pointer;letter-spacing:1px;white-space:nowrap;">⚡ SCAN</button>
-          <button onclick="toggleAutoScan()" id="btn-auto-scan" style="padding:6px 10px;background:var(--panel);border:1px solid var(--border2);color:var(--text2);border-radius:4px;font-family:var(--mono);font-size:10px;cursor:pointer;white-space:nowrap;">AUTO: OFF</button>
-        </div>
-      </div>
-
-      <!-- Scan stats bar -->
-      <div id="ai-signal-stats" style="display:grid;grid-template-columns:repeat(5,1fr);border-bottom:1px solid var(--border);flex-shrink:0;"></div>
-
-      <!-- Signal cards grid -->
-      <div id="ai-signal-grid" style="padding:12px 16px;display:grid;gap:8px;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));flex-shrink:0;">
-        <div style="color:var(--text2);font-family:var(--mono);font-size:12px;padding:24px;text-align:center;grid-column:1/-1;border:1px dashed var(--border);border-radius:6px;">
-          Klik <strong style="color:var(--accent)">⚡ SCAN</strong> untuk analisa ${AI_SIGNAL_PAIRS.length} pair<br>
-          <span style="font-size:10px;opacity:0.6;margin-top:4px;display:block;">Klik kartu → chart + entry/TP/SL lines · History dicatat otomatis</span>
-        </div>
-      </div>
-
-      <!-- Signal History panel -->
-      <div style="flex-shrink:0;border-top:1px solid var(--border);background:var(--bg2);">
-        <div style="display:flex;align-items:center;justify-content:space-between;padding:10px 16px;border-bottom:1px solid var(--border);">
-          <span style="font-family:var(--mono);font-size:10px;font-weight:600;letter-spacing:2px;color:var(--text2);text-transform:uppercase;">📊 SIGNAL HISTORY</span>
-          <div style="display:flex;gap:12px;align-items:center;">
-            <div id="ai-hist-summary" style="display:flex;gap:14px;font-family:var(--mono);font-size:11px;"></div>
-            <button onclick="clearAISignalHistory()" style="padding:4px 10px;background:var(--panel);border:1px solid var(--border2);color:var(--danger);border-radius:4px;font-family:var(--mono);font-size:10px;cursor:pointer;">🗑 Reset</button>
-          </div>
-        </div>
-        <div style="max-height:220px;overflow-y:auto;">
-          <table style="width:100%;border-collapse:collapse;font-family:var(--mono);font-size:11px;">
-            <thead>
-              <tr style="background:var(--panel);position:sticky;top:0;z-index:1;">
-                <th style="text-align:left;padding:7px 12px;color:var(--text2);font-weight:600;font-size:9px;letter-spacing:1.5px;border-bottom:1px solid var(--border);">Time</th>
-                <th style="text-align:left;padding:7px 12px;color:var(--text2);font-weight:600;font-size:9px;letter-spacing:1.5px;border-bottom:1px solid var(--border);">Pair</th>
-                <th style="text-align:left;padding:7px 12px;color:var(--text2);font-weight:600;font-size:9px;letter-spacing:1.5px;border-bottom:1px solid var(--border);">Dir</th>
-                <th style="text-align:left;padding:7px 12px;color:var(--text2);font-weight:600;font-size:9px;letter-spacing:1.5px;border-bottom:1px solid var(--border);">Entry</th>
-                <th style="text-align:left;padding:7px 12px;color:var(--text2);font-weight:600;font-size:9px;letter-spacing:1.5px;border-bottom:1px solid var(--border);">TP</th>
-                <th style="text-align:left;padding:7px 12px;color:var(--text2);font-weight:600;font-size:9px;letter-spacing:1.5px;border-bottom:1px solid var(--border);">SL</th>
-                <th style="text-align:left;padding:7px 12px;color:var(--text2);font-weight:600;font-size:9px;letter-spacing:1.5px;border-bottom:1px solid var(--border);">Status</th>
-                <th style="text-align:left;padding:7px 12px;color:var(--text2);font-weight:600;font-size:9px;letter-spacing:1.5px;border-bottom:1px solid var(--border);">P&L</th>
-              </tr>
-            </thead>
-            <tbody id="ai-signal-history-body"></tbody>
-          </table>
-        </div>
-      </div>
-
-    </div>`;
-
-    renderAISignalHistory();
-
-    // [FIX-AUTOSCAN] Restore auto scan state from localStorage after pane built
-    _restoreAutoScanState();
+// [FIX-5b] TF selector for AI scanner
+function setAITF(btn) {
+    document.querySelectorAll('.ai-tf-btn').forEach(b => {
+        b.style.background = 'transparent';
+        b.style.color = 'var(--text2)';
+    });
+    btn.style.background = 'var(--blue-d)';
+    btn.style.color = '#fff';
+    _aiScanTF = btn.dataset.tf;
 }
 
-// ── [FIX-AUTOSCAN] toggleAutoScan + persistence ───────────────────────────────
+// [FIX-5c] toggleAutoScan — clear old timer before setting new one
 function toggleAutoScan() {
     _autoScanActive = !_autoScanActive;
-    Storage.set('aiAutoScanActive', _autoScanActive); // [FIX-AUTOSCAN] persist
+    Storage.set('aiAutoScanActive', _autoScanActive);
     const btn = document.getElementById('btn-auto-scan'); if (!btn) return;
     if (_autoScanActive) {
         btn.textContent = 'AUTO: ON'; btn.style.borderColor = 'var(--accent)'; btn.style.color = 'var(--accent)';
         runAISignalScan();
+        if (_aiSignalTimer) clearInterval(_aiSignalTimer);
         _aiSignalTimer = setInterval(runAISignalScan, 5 * 60 * 1000);
     } else {
         btn.textContent = 'AUTO: OFF'; btn.style.borderColor = 'var(--border2)'; btn.style.color = 'var(--text2)';
@@ -977,19 +908,24 @@ function toggleAutoScan() {
     }
 }
 
-// [FIX-AUTOSCAN] Restore auto-scan state after pane is built
+// [FIX-5c] Robust restore — no fragile single setTimeout, retry if element missing
 function _restoreAutoScanState() {
-    const savedActive = Storage.get('aiAutoScanActive', false);
-    if (!savedActive) return;
-    // Small delay so DOM is settled
-    setTimeout(() => {
-        const btn = document.getElementById('btn-auto-scan');
-        if (!btn) return;
-        _autoScanActive = true;
-        btn.textContent = 'AUTO: ON'; btn.style.borderColor = 'var(--accent)'; btn.style.color = 'var(--accent)';
+    if (!Storage.get('aiAutoScanActive', false)) return;
+    const btn = document.getElementById('btn-auto-scan');
+    if (!btn) {
+        // Element not in DOM yet, retry once
+        setTimeout(_restoreAutoScanState, 400);
+        return;
+    }
+    if (_autoScanActive) return; // already active, skip duplicate
+    _autoScanActive = true;
+    btn.textContent = 'AUTO: ON';
+    btn.style.borderColor = 'var(--accent)';
+    btn.style.color = 'var(--accent)';
+    if (!_aiSignalTimer) {
         runAISignalScan();
         _aiSignalTimer = setInterval(runAISignalScan, 5 * 60 * 1000);
-    }, 200);
+    }
 }
 
 // ── Technical indicators ──────────────────────────────────────────────────────
@@ -1053,9 +989,10 @@ function _analyzeSignal(symbol, candles) {
     if (emaBullAlign && bearScore > bullScore) { bearScore = Math.max(0, bearScore - 3); reasons.push('⚠ EMA uptrend conflict'); trendConflict = true; }
     if (price < ema50 * 0.99 && bullScore > bearScore) { bullScore = Math.max(0, bullScore - 2); if (!trendConflict) reasons.push('Price < EMA50 (bull penalized)'); }
     if (price > ema50 * 1.01 && bearScore > bullScore) { bearScore = Math.max(0, bearScore - 2); if (!trendConflict) reasons.push('Price > EMA50 (bear penalized)'); }
-    const minScore = 4;
+    // [FIX-5a] Lower thresholds: minScore 4→3, diff 2→1 to show more pairs
+    const minScore = 3;
     if (bullScore < minScore && bearScore < minScore) return null;
-    if (Math.abs(bullScore - bearScore) < 2) return null;
+    if (Math.abs(bullScore - bearScore) < 1) return null;
     const isBull = bullScore > bearScore, direction = isBull ? 'LONG' : 'SHORT', score = isBull ? bullScore : bearScore;
     const confidence = Math.min(0.95, 0.35 + score * 0.08);
     const slMult = 1.2, tpMult = rsi < 40 || rsi > 60 ? 2.8 : 2.2;
@@ -1068,9 +1005,10 @@ async function runAISignalScan() {
     ensureSignalPaneReady();
     const statusEl = document.getElementById('ai-scan-status'), gridEl = document.getElementById('ai-signal-grid'), statsEl = document.getElementById('ai-signal-stats');
     if (!gridEl) return;
-    const tf = '15';
-    if (statusEl) statusEl.textContent = '⟳ Scanning...';
-    gridEl.innerHTML = `<div style="color:var(--text2);font-family:var(--mono);font-size:12px;padding:24px;text-align:center;grid-column:1/-1;">⟳ Mengambil data ${AI_SIGNAL_PAIRS.length} pair (TF: 15m)...</div>`;
+    // [FIX-5b] Use dynamic TF
+    const tf = _aiScanTF;
+    if (statusEl) statusEl.textContent = `⟳ Scanning ${tf}m...`;
+    gridEl.innerHTML = `<div style="color:var(--text2);font-family:var(--mono);font-size:12px;padding:24px;text-align:center;grid-column:1/-1;">⟳ Mengambil data ${AI_SIGNAL_PAIRS.length} pair (TF: ${tf}m)...</div>`;
     const results = []; let scanned = 0, errors = 0;
     const batchSize = 5;
     for (let i = 0; i < AI_SIGNAL_PAIRS.length; i += batchSize) {
@@ -1090,7 +1028,7 @@ async function runAISignalScan() {
     _renderAISignals(results, scanned, tf);
     _renderAIScanStats(results, scanned, errors, statsEl);
     const ts = new Date().toLocaleTimeString();
-    if (statusEl) statusEl.textContent = `✓ ${scanned} pair @ ${ts} | ${results.length} signal`;
+    if (statusEl) statusEl.textContent = `✓ ${scanned}/${AI_SIGNAL_PAIRS.length} @ ${ts} | ${results.length} signal | TF:${tf}m`;
     if (results.length > 0) Storage.set('aiLastScanResults', { results, ts, scanned });
 }
 
@@ -1113,7 +1051,7 @@ function _renderAIScanStats(results, total, errors, el) {
 
 function _renderAISignals(results, total, tf) {
     const gridEl = document.getElementById('ai-signal-grid'); if (!gridEl) return;
-    if (!results.length) { gridEl.innerHTML = `<div style="color:var(--text2);font-family:var(--mono);font-size:12px;padding:24px;text-align:center;grid-column:1/-1;border:1px dashed var(--border);border-radius:6px;">Tidak ada sinyal kuat dari ${total} pair<br><span style="font-size:10px;opacity:0.6;">Coba lagi nanti atau tunggu momentum terbentuk.</span></div>`; _lastAIScanResults = []; return; }
+    if (!results.length) { gridEl.innerHTML = `<div style="color:var(--text2);font-family:var(--mono);font-size:12px;padding:24px;text-align:center;grid-column:1/-1;border:1px dashed var(--border);border-radius:6px;">Tidak ada sinyal kuat dari ${total} pair (TF: ${tf}m)<br><span style="font-size:10px;opacity:0.6;">Coba TF lain atau tunggu momentum terbentuk.</span></div>`; _lastAIScanResults = []; return; }
     const sorted = [...results].sort((a, b) => b.confidence - a.confidence); _lastAIScanResults = sorted;
     gridEl.innerHTML = sorted.map(s => {
         const isLong = s.direction === 'LONG', color = isLong ? 'var(--accent)' : 'var(--danger)', bgColor = isLong ? '#00e5a012' : '#ef444412', border = isLong ? '#00e5a030' : '#ef444430';
@@ -1153,6 +1091,81 @@ function selectAISignalPair(symbol) {
         _saveAISignalHistory();
         setTimeout(() => { addSignalMarker(action, sig.price); setTpSlLines(sig.entry, sig.tp, sig.sl); _showChartLegend(); }, 1200);
     } else { toast(`Chart: ${symbol}`, true); }
+}
+
+// ── ensureSignalPaneReady ─────────────────────────────────────────────────────
+function ensureSignalPaneReady() {
+    if (_aiSignalPaneReady) return;
+    _aiSignalPaneReady = true;
+    const pane = document.getElementById('pane-insight'); if (!pane) return;
+    pane.style.padding = '0'; pane.style.background = 'var(--bg)';
+
+    pane.innerHTML = `
+    <div style="height:100%;overflow-y:auto;box-sizing:border-box;display:flex;flex-direction:column;">
+
+      <!-- Header with TF selector + action buttons — no flex-wrap, gap:8px -->
+      <div style="display:flex;align-items:center;justify-content:space-between;padding:12px 16px;flex-shrink:0;border-bottom:1px solid var(--border);background:var(--bg2);">
+        <div>
+          <div style="font-family:var(--mono);color:var(--accent);font-size:13px;font-weight:600;letter-spacing:2px;">🎯 AI SIGNAL SCANNER</div>
+          <div style="font-family:var(--mono);font-size:9px;color:var(--text2);margin-top:2px;">${AI_SIGNAL_PAIRS.length} pairs · Klik kartu → chart+TP/SL lines</div>
+        </div>
+        <!-- [FIX-5b] TF selector + action buttons, no wrap, gap:8px -->
+        <div style="display:flex;gap:8px;align-items:center;flex-shrink:0;">
+          <div style="display:flex;gap:2px;background:var(--bg);border:1px solid var(--border);border-radius:4px;padding:2px;">
+            <button class="ai-tf-btn" data-tf="5"  onclick="setAITF(this)" style="padding:3px 8px;font-family:var(--mono);font-size:10px;border:none;border-radius:3px;cursor:pointer;background:transparent;color:var(--text2);">5m</button>
+            <button class="ai-tf-btn active" data-tf="15" onclick="setAITF(this)" style="padding:3px 8px;font-family:var(--mono);font-size:10px;border:none;border-radius:3px;cursor:pointer;background:var(--blue-d);color:#fff;">15m</button>
+            <button class="ai-tf-btn" data-tf="60" onclick="setAITF(this)" style="padding:3px 8px;font-family:var(--mono);font-size:10px;border:none;border-radius:3px;cursor:pointer;background:transparent;color:var(--text2);">1h</button>
+          </div>
+          <span id="ai-scan-status" style="font-family:var(--mono);font-size:10px;color:var(--text2);">⟳ idle</span>
+          <button onclick="runAISignalScan()" style="padding:6px 14px;background:var(--accent);color:#000;border:none;border-radius:4px;font-family:var(--mono);font-size:11px;font-weight:700;cursor:pointer;letter-spacing:1px;white-space:nowrap;">⚡ SCAN</button>
+          <button onclick="toggleAutoScan()" id="btn-auto-scan" style="padding:6px 10px;background:var(--panel);border:1px solid var(--border2);color:var(--text2);border-radius:4px;font-family:var(--mono);font-size:10px;cursor:pointer;white-space:nowrap;">AUTO: OFF</button>
+        </div>
+      </div>
+
+      <!-- Scan stats bar -->
+      <div id="ai-signal-stats" style="display:grid;grid-template-columns:repeat(5,1fr);border-bottom:1px solid var(--border);flex-shrink:0;"></div>
+
+      <!-- Signal cards grid -->
+      <div id="ai-signal-grid" style="padding:12px 16px;display:grid;gap:8px;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));flex-shrink:0;">
+        <div style="color:var(--text2);font-family:var(--mono);font-size:12px;padding:24px;text-align:center;grid-column:1/-1;border:1px dashed var(--border);border-radius:6px;">
+          Klik <strong style="color:var(--accent)">⚡ SCAN</strong> untuk analisa ${AI_SIGNAL_PAIRS.length} pair<br>
+          <span style="font-size:10px;opacity:0.6;margin-top:4px;display:block;">Pilih TF · Klik kartu → chart + entry/TP/SL lines · History dicatat otomatis</span>
+        </div>
+      </div>
+
+      <!-- Signal History panel -->
+      <div style="flex-shrink:0;border-top:1px solid var(--border);background:var(--bg2);">
+        <div style="display:flex;align-items:center;justify-content:space-between;padding:10px 16px;border-bottom:1px solid var(--border);">
+          <span style="font-family:var(--mono);font-size:10px;font-weight:600;letter-spacing:2px;color:var(--text2);text-transform:uppercase;">📊 SIGNAL HISTORY</span>
+          <div style="display:flex;gap:12px;align-items:center;">
+            <div id="ai-hist-summary" style="display:flex;gap:14px;font-family:var(--mono);font-size:11px;"></div>
+            <button onclick="clearAISignalHistory()" style="padding:4px 10px;background:var(--panel);border:1px solid var(--border2);color:var(--danger);border-radius:4px;font-family:var(--mono);font-size:10px;cursor:pointer;">🗑 Reset</button>
+          </div>
+        </div>
+        <div style="max-height:220px;overflow-y:auto;">
+          <table style="width:100%;border-collapse:collapse;font-family:var(--mono);font-size:11px;">
+            <thead>
+              <tr style="background:var(--panel);position:sticky;top:0;z-index:1;">
+                <th style="text-align:left;padding:7px 12px;color:var(--text2);font-weight:600;font-size:9px;letter-spacing:1.5px;border-bottom:1px solid var(--border);">Time</th>
+                <th style="text-align:left;padding:7px 12px;color:var(--text2);font-weight:600;font-size:9px;letter-spacing:1.5px;border-bottom:1px solid var(--border);">Pair</th>
+                <th style="text-align:left;padding:7px 12px;color:var(--text2);font-weight:600;font-size:9px;letter-spacing:1.5px;border-bottom:1px solid var(--border);">Dir</th>
+                <th style="text-align:left;padding:7px 12px;color:var(--text2);font-weight:600;font-size:9px;letter-spacing:1.5px;border-bottom:1px solid var(--border);">Entry</th>
+                <th style="text-align:left;padding:7px 12px;color:var(--text2);font-weight:600;font-size:9px;letter-spacing:1.5px;border-bottom:1px solid var(--border);">TP</th>
+                <th style="text-align:left;padding:7px 12px;color:var(--text2);font-weight:600;font-size:9px;letter-spacing:1.5px;border-bottom:1px solid var(--border);">SL</th>
+                <th style="text-align:left;padding:7px 12px;color:var(--text2);font-weight:600;font-size:9px;letter-spacing:1.5px;border-bottom:1px solid var(--border);">Status</th>
+                <th style="text-align:left;padding:7px 12px;color:var(--text2);font-weight:600;font-size:9px;letter-spacing:1.5px;border-bottom:1px solid var(--border);">P&L</th>
+              </tr>
+            </thead>
+            <tbody id="ai-signal-history-body"></tbody>
+          </table>
+        </div>
+      </div>
+
+    </div>`;
+
+    renderAISignalHistory();
+    // [FIX-5c] Restore auto scan after pane is built
+    _restoreAutoScanState();
 }
 
 // ── Trades Tab ────────────────────────────────────────────────────────────────
@@ -1208,7 +1221,7 @@ function renderFullTradesTable() {
     let rows = '';
     if (activeTrade) {
         const dec = activeTrade.entry < 1 ? 6 : activeTrade.entry < 10 ? 4 : 2;
-        rows += `<tr style="background:rgba(245,158,11,0.04)"><td style="padding:12px 20px;border-bottom:1px solid var(--border);color:var(--text)">${activeTrade.time}</td><td style="padding:12px 20px;border-bottom:1px solid var(--border)" class="trade-open">${activeTrade.action}</td><td style="padding:12px 20px;border-bottom:1px solid var(--border);color:var(--blue)">${activeTrade.entry.toFixed(dec)}</td><td style="padding:12px 20px;border-bottom:1px solid var(--border)" class="trade-win">${activeTrade.tp.toFixed(dec)}</td><td style="padding:12px 20px;border-bottom:1px solid var(--border)" class="trade-loss">${activeTrade.sl.toFixed(dec)}</td><td style="padding:12px 20px;border-bottom:1px solid var(--border)"><span style="display:inline-block;padding:3px 8px;border-radius:3px;font-size:10px;font-weight:700;letter-spacing:1px;background:rgba(245,158,11,0.15);color:var(--warn);border:1px solid rgba(245,158,11,0.3);">OPEN</span></td><td style="padding:12px 20px;border-bottom:1px solid var(--border)" class="trade-open">pending</td></tr>`;
+        rows += `<tr style="background:rgba(245,158,11,0.04)"><td style="padding:12px 20px;border-bottom:1px solid var(--border);color:var(--text)">${activeTrade.time}</td><td style="padding:12px 20px;border-bottom:1px solid var(--border)" class="trade-open">${activeTrade.action}</td><td style="padding:12px 20px;border-bottom:1px solid var(--border);color:var(--text)">${activeTrade.entry.toFixed(dec)}</td><td style="padding:12px 20px;border-bottom:1px solid var(--border)" class="trade-win">${activeTrade.tp.toFixed(dec)}</td><td style="padding:12px 20px;border-bottom:1px solid var(--border)" class="trade-loss">${activeTrade.sl.toFixed(dec)}</td><td style="padding:12px 20px;border-bottom:1px solid var(--border)"><span style="display:inline-block;padding:3px 8px;border-radius:3px;font-size:10px;font-weight:700;letter-spacing:1px;background:rgba(245,158,11,0.15);color:var(--warn);border:1px solid rgba(245,158,11,0.3);">OPEN</span></td><td style="padding:12px 20px;border-bottom:1px solid var(--border)" class="trade-open">pending</td></tr>`;
     }
     tradeHistory.forEach(t => {
         const isWin = t.result === 'WIN', cls = isWin ? 'trade-win' : 'trade-loss', dec = t.entry < 1 ? 6 : t.entry < 10 ? 4 : 2, pnl = (t.pnl_pct >= 0 ? '+' : '') + t.pnl_pct.toFixed(2) + '%';
