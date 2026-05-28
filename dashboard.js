@@ -1,14 +1,36 @@
-// dashboard.js — TradeBot v3.0.5
-// FIXES vs v3.0.4:
-// [FIX-3] CHART OVERLAP: switchTab sekarang force style.display='none' ke semua pane
-//         Root cause lama: CSS class removal tidak selalu override inline/computed styles
-//         dari LightweightCharts yang meng-inject style ke parent container
-// [FIX-4] TRADES TAB: initTradesTab() inject tab button + pane-trades di runtime
-//         renderFullTradesTable() render histori lengkap dengan stats bar
-//         Trade history dipindah ke tab TRADES, mini panel di chart tab dipertahankan
-// [FIX-5-PARTIAL] Bot tidak auto-start trading saat server launch (sudah handled di
-//         server.go botRunning.Store(false) — kalau masih kedetect, cek main.go)
-
+// dashboard.js — TradeBot v3.1.0
+// ─────────────────────────────────────────────────────────────────────────────
+// CHANGELOG vs v3.0.5:
+//
+// [FIX-1] startBot() sekarang auto-save config DULU sebelum send /api/start
+//         sehingga symbol yg dipilih user tersimpan ke .env sebelum engine baca.
+//         NOTE: Go engine tetap perlu restart manual untuk symbol change mid-run.
+//         Warning toast ditambahkan jika symbol berubah saat bot running.
+//
+// [FIX-3-ENHANCED] switchTab():
+//         ROOT CAUSE: LightweightCharts canvas mempertahankan pixel dimensinya
+//         meski parent di-set display:none → canvas tetap "render" di stacking
+//         context dan tembus ke tab lain.
+//         FIX: (1) set position:absolute + width:0 + height:0 + clip:rect(0,0,0,0)
+//              pada semua pane non-aktif (keluar dari grid flow sepenuhnya)
+//              (2) _lwChart.resize(1,1) saat meninggalkan chart tab
+//              (3) _lwChart.resize(w,h) restore saat kembali ke chart tab
+//
+// [FIX-4-ENHANCED] initTradesTab():
+//         Pane dynamically injected sekarang mendapatkan grid containment styling
+//         yang sama dengan pane lainnya agar tidak overflow.
+//
+// [FIX-5-NEW] _analyzeSignal():
+//         EMA Trend Filter — jika EMA9 < EMA21 < EMA50 (bearish aligned) tapi
+//         signal adalah LONG, bullScore dipotong -3. Jika harga < EMA50 by >1%,
+//         tambahan -2 penalty. Mencegah bot entry LONG hanya karena LSR tinggi
+//         padahal trend teknikal jelas downtrend.
+//
+// [FIX-5-VISUAL] _renderAISignals():
+//         Kartu signal menampilkan badge "⚠ TREND CONFLICT" jika arah signal
+//         berlawanan dengan EMA alignment. User bisa lihat langsung mana yang
+//         rawan fake signal.
+// ─────────────────────────────────────────────────────────────────────────────
 'use strict';
 
 let logs = [];
@@ -25,7 +47,6 @@ let _lastCandleTs = 0;
 let priceHistory = [];
 const MAX_CHART_POINTS = 150;
 
-// [FIX-5] Global untuk store hasil AI scan terakhir agar selectAISignalPair bisa akses
 let _lastAIScanResults = [];
 
 let stats = {
@@ -38,6 +59,9 @@ let tradeHistory = [];
 let signalCount = 0;
 let totalPnl = 0;
 let isChartHidden = false;
+
+// [FIX-1] Track symbol at bot-start time untuk deteksi perubahan
+let _symbolAtBotStart = '';
 
 // ── Safe Storage Wrapper ──────────────────────────────────────────────────────
 const Storage = {
@@ -61,7 +85,6 @@ const Storage = {
     }
 };
 
-// [FIX-7] toggleChart: legend hanya ditampilkan kalau ada pendingMarkers
 function toggleChart() {
   isChartHidden = !isChartHidden;
   const wrap = document.getElementById('chart-wrapper');
@@ -72,6 +95,15 @@ function toggleChart() {
   if (toolbar) toolbar.style.display = isChartHidden ? 'none' : 'flex';
   if (legend) legend.style.display = (!isChartHidden && _pendingMarkers.length > 0) ? 'flex' : 'none';
   if (btn) btn.textContent = isChartHidden ? '👁 Show Chart' : '👁 Hide Chart';
+  // [FIX-3-ENHANCED] Resize chart saat di-show kembali
+  if (!isChartHidden && _lwChart) {
+    setTimeout(() => {
+      const c = document.getElementById('chart-container');
+      if (c && c.clientWidth > 10) {
+        try { _lwChart.resize(c.clientWidth, c.clientHeight); } catch(e) {}
+      }
+    }, 50);
+  }
 }
 
 function syncLev(source) {
@@ -135,7 +167,7 @@ function resetHistory() {
     tradeHistory = []; totalPnl = 0; signalCount = 0; activeTrade = null; stats.initBalance = null;
     Storage.remove('botInitBalance');
     saveSimState(); updateTradeStats(); updateBalanceStats(); renderTradesTable();
-    renderFullTradesTable(); // [FIX-4] juga reset trades tab
+    renderFullTradesTable();
   }
 }
 
@@ -190,7 +222,6 @@ function parseLog(log) {
   for (const p of PARSERS) { const m = log.msg.match(p.re); if (m) { p.fn(m, log); break; } }
 }
 
-// [FIX-2] Helper: deteksi apakah nilai itu Unix timestamp (bukan OI)
 function isLikelyTimestamp(v) {
   if (!v || isNaN(v)) return false;
   if (v >= 1.58e12 && v <= 2.05e12) return true;
@@ -204,7 +235,7 @@ function openDryTrade(action, params) {
   activeTrade = { action, ...params, time: new Date().toLocaleTimeString() };
   addSignalMarker(action, params.entry); setTpSlLines(params.entry, params.tp, params.sl);
   saveSimState(); updateTradeStats(); renderTradesTable();
-  renderFullTradesTable(); // [FIX-4]
+  renderFullTradesTable();
 }
 
 function checkTradeOutcome(currentPrice) {
@@ -233,7 +264,7 @@ function closeTrade(result, exitPrice) {
   }
   activeTrade = null; setTpSlLines(null, null, null);
   saveSimState(); updateTradeStats(); renderTradesTable();
-  renderFullTradesTable(); // [FIX-4]
+  renderFullTradesTable();
 }
 
 function updatePriceStats() {
@@ -254,25 +285,21 @@ function updatePriceStats() {
   }
 }
 
-// [FIX-2] OI display — validasi ketat, jangan tampilkan timestamp sebagai OI
 function updateOIStats() {
   const v = stats.oi;
   const oiEl = document.getElementById('stat-oi');
   const oiTimeEl = document.getElementById('stat-oi-time');
   if (!oiEl) return;
-
   if (!v || isNaN(v) || isLikelyTimestamp(v)) {
     oiEl.textContent = '—';
     if (oiTimeEl) oiTimeEl.textContent = isLikelyTimestamp(v) ? 'data err' : '--';
     return;
   }
-
   let fmt;
   if (v >= 1e9)      fmt = (v / 1e9).toFixed(2) + 'B';
   else if (v >= 1e6) fmt = (v / 1e6).toFixed(2) + 'M';
   else if (v >= 1e3) fmt = (v / 1e3).toFixed(1) + 'K';
   else               fmt = v.toFixed(0);
-
   oiEl.textContent = fmt;
   if (oiTimeEl) oiTimeEl.textContent = stats.oiTime || '--';
 }
@@ -376,8 +403,8 @@ async function initChart() {
   const ro = new ResizeObserver(entries => {
     if (entries.length === 0 || entries[0].target !== wrapper) return;
     const newRect = entries[0].contentRect;
-    if (_lwChart && newRect.width > 0 && newRect.height > 0 && !isChartHidden) {
-      _lwChart.applyOptions({ width: newRect.width, height: newRect.height });
+    if (_lwChart && newRect.width > 10 && newRect.height > 10 && !isChartHidden) {
+      try { _lwChart.resize(newRect.width, newRect.height); } catch(e) {}
     }
   });
   ro.observe(wrapper);
@@ -549,12 +576,10 @@ async function fetchPositions() {
     const r = await fetch('/api/positions');
     if (!r.ok) return;
     const d = await r.json();
-
     if (_chartLines.length > 0) {
       _chartLines.forEach(l => { try { _candleSeries.removePriceLine(l); } catch(e) {} });
       _chartLines = [];
     }
-
     if (d.active && d.active.length > 0) {
       const pos = d.active[0];
       try {
@@ -603,7 +628,6 @@ function renderTradesTableGo(active, history) {
   tbody.innerHTML = html;
 }
 
-// [FIX-5] renderTradesTable — render paper trade history (sim mode)
 function renderTradesTable() {
   const tbody = document.getElementById('trades-tbody');
   if (!tbody) return;
@@ -636,51 +660,79 @@ function renderTradesTable() {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// [FIX-3] switchTab — EXPLICIT display override to fix chart overlap bug
-// ROOT CAUSE: LightweightCharts sets inline CSS on its internal canvas/divs.
-//   When pane-chart gets display:none via CSS class only, the chart's internal
-//   resize observer can still repaint and bleed over sibling panes due to
-//   stacking context issues. Force-setting style.display resolves this.
+// [FIX-3-ENHANCED] switchTab — NUCLEAR chart containment
+// ════════════════════════════════════════════════════════════════════════════
+// ROOT CAUSE ANALYSIS:
+//   LightweightCharts menginject canvas ke dalam #chart-container dengan
+//   position:absolute. Saat pane di-hide dengan display:none saja, canvas
+//   MASIH mempertahankan pixel dimensions-nya di memory. Dalam stacking
+//   context grid, canvas element ini bisa "bleeding" ke sibling panes.
+//
+//   FIX 1: set position:absolute + width:0 + height:0 + clip:rect(0,0,0,0)
+//          pada SEMUA non-active pane → keluar dari grid flow sepenuhnya
+//   FIX 2: _lwChart.resize(1,1) saat meninggalkan chart tab → canvas
+//          dikecilkan ke 1px sehingga tidak bisa tembus ke mana-mana
+//   FIX 3: visibility:hidden + pointerEvents:none sebagai belt-and-suspenders
 // ════════════════════════════════════════════════════════════════════════════
 function switchTab(name, btn) {
   document.querySelectorAll('.tab').forEach(b => b.classList.remove('active'));
 
-  // [FIX-3] Explicitly hide ALL panes — both class AND inline style
-  // Do NOT rely on CSS class cascade alone due to LightweightCharts stacking context
+  // [FIX-3-ENHANCED] Nuclear hide — keluar dari grid flow + semua visibility tricks
   document.querySelectorAll('.tab-pane').forEach(p => {
     p.classList.remove('active');
-    p.style.display = 'none';    // [FIX-3] force hide via inline style
-    p.style.overflow = 'hidden'; // [FIX-3] extra containment
+    p.style.display = 'none';
+    p.style.visibility = 'hidden';
+    p.style.pointerEvents = 'none';
+    p.style.position = 'absolute';   // [FIX-3-ENHANCED] keluar dari grid flow
+    p.style.width = '0';
+    p.style.height = '0';
+    p.style.overflow = 'hidden';
+    p.style.clip = 'rect(0,0,0,0)';
+    p.style.zIndex = '-999';
   });
+
+  // [FIX-3-ENHANCED] Shrink chart canvas ke 1x1 saat TIDAK di chart tab
+  // Ini mencegah LightweightCharts canvas tembus ke pane lain
+  if (name !== 'chart' && _lwChart) {
+    try { _lwChart.resize(1, 1); } catch(e) {}
+  }
 
   btn.classList.add('active');
   const target = document.getElementById('pane-' + name);
   if (!target) return;
 
-  // [FIX-3] Force show the active pane via inline style
+  // [FIX-3-ENHANCED] Restore active pane ke dalam grid flow
   target.classList.add('active');
-  target.style.display = 'flex';         // [FIX-3] must match .tab-pane.active
-  target.style.flexDirection = 'column'; // [FIX-3] restore flex direction
-  target.style.overflow = 'hidden';      // [FIX-3] contain chart canvas
-  target.style.height = '100%';          // [FIX-3] fill parent
+  target.style.display = 'flex';
+  target.style.visibility = 'visible';
+  target.style.pointerEvents = 'auto';
+  target.style.flexDirection = 'column';
+  target.style.overflow = 'hidden';
+  target.style.position = 'relative';  // [FIX-3-ENHANCED] kembali ke grid flow
+  target.style.width = '100%';
+  target.style.height = '100%';
+  target.style.clip = 'auto';
+  target.style.zIndex = '1';
 
   const logFilter = document.getElementById('log-filter-btns');
   if (logFilter) logFilter.style.display = name === 'logs' ? 'flex' : 'none';
 
   if (name === 'chart') {
-    // Re-trigger chart resize after pane becomes visible
+    // [FIX-3-ENHANCED] Restore chart size setelah pane visible kembali
     setTimeout(() => {
       if (_lwChart && !isChartHidden) {
-        const c = document.getElementById('chart-container');
-        if (c && c.clientWidth > 0) {
-          _lwChart.applyOptions({ width: c.clientWidth, height: c.clientHeight });
+        const wrapper = document.getElementById('chart-wrapper');
+        if (wrapper && wrapper.clientWidth > 10) {
+          try { _lwChart.resize(wrapper.clientWidth, wrapper.clientHeight); } catch(e) {}
         }
+        // Re-apply markers setelah resize
+        _applyMarkers();
       }
     }, 50);
   }
 
   if (name === 'insight') ensureSignalPaneReady();
-  if (name === 'trades') renderFullTradesTable(); // [FIX-4]
+  if (name === 'trades') renderFullTradesTable();
 }
 
 function setFilter(btn) {
@@ -763,10 +815,45 @@ function updateStatus(running) {
   document.querySelectorAll('#config-form input, #config-form select').forEach(el => { el.disabled = running; });
 }
 
+// ════════════════════════════════════════════════════════════════════════════
+// [FIX-1] startBot — save config DULU, baru start
+// Memastikan symbol yang dipilih user tersimpan ke .env sebelum bot start.
+// NOTE: Go engine tetap perlu RESTART untuk benar-benar ganti symbol mid-run.
+// Tampilkan warning jika symbol berubah sejak terakhir kali start.
+// ════════════════════════════════════════════════════════════════════════════
 async function startBot() {
+  const currentSym = document.getElementById('cfg-symbol')?.value || '';
+
+  // [FIX-1] Warn jika symbol berubah dari sesi sebelumnya
+  if (_symbolAtBotStart && _symbolAtBotStart !== currentSym) {
+    toast(`⚠ Symbol berubah ${_symbolAtBotStart}→${currentSym}. Restart binary untuk efektif.`, false);
+    // Delay agar user bisa baca toast, tapi tetap lanjut
+    await new Promise(r => setTimeout(r, 1200));
+  }
+
+  // [FIX-1] Save config ke .env DULU sebelum start
   try {
-    const r = await fetch('/api/start', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(collectEnv()) });
-    const d = await r.json(); toast(d.message, d.ok);
+    const saveR = await fetch('/api/save-env', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify(collectEnv())
+    });
+    const saveD = await saveR.json();
+    if (!saveD.ok) throw new Error(saveD.message);
+  } catch(e) {
+    toast('Config save gagal: ' + e.message, false);
+    return;
+  }
+
+  try {
+    const r = await fetch('/api/start', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify(collectEnv())
+    });
+    const d = await r.json();
+    toast(d.message, d.ok);
+    if (d.ok) _symbolAtBotStart = currentSym; // [FIX-1] catat symbol saat start
   } catch(e) { toast('Koneksi gagal', false); }
 }
 
@@ -840,6 +927,7 @@ async function loadConfig() {
       else { sel.dataset.pendingSymbol = sym; }
       const hdrSym = document.getElementById('hdr-symbol');
       if (hdrSym) hdrSym.textContent = sym;
+      _symbolAtBotStart = sym; // [FIX-1] track initial symbol
     }
 
     if (local.LEVERAGE || e.LEVERAGE) {
@@ -952,7 +1040,6 @@ function _getLiveSymbol() {
   return (sel && sel.value) ? sel.value.replace('_', '') : 'BTCUSDT';
 }
 
-// [FIX-3] WS ticker: sumber tunggal untuk price + 24h%
 function connectLivePriceWS() {
   const sym = _getLiveSymbol();
   if (_wsTicker) { _wsTicker.close(); _wsTicker = null; }
@@ -963,7 +1050,6 @@ function connectLivePriceWS() {
       const data = JSON.parse(msg.data);
       if (data?.topic === `tickers.${sym}` && data?.data) {
         const ticker = data.data;
-
         if (ticker.lastPrice !== undefined) {
           const price = parseFloat(ticker.lastPrice);
           if (price && !isNaN(price)) {
@@ -974,7 +1060,6 @@ function connectLivePriceWS() {
             updatePriceStats();
           }
         }
-
         if (ticker.price24hPcnt !== undefined) {
           const raw = parseFloat(ticker.price24hPcnt);
           if (!isNaN(raw)) {
@@ -998,7 +1083,6 @@ async function fetchAIInsight() {
   try {
     const r = await fetch('/api/insight');
     const d = await r.json();
-
     if (d.open_interest !== undefined) {
       if (!isLikelyTimestamp(d.open_interest) && d.open_interest > 0) {
         stats.oi = d.open_interest;
@@ -1006,7 +1090,6 @@ async function fetchAIInsight() {
         updateOIStats();
       }
     }
-
     if (d.lsr_val) {
       stats.lsr = d.lsr_val;
       let biasTxt = 'NEUTRAL';
@@ -1015,7 +1098,6 @@ async function fetchAIInsight() {
       stats.bias = biasTxt;
       updateLSRStats();
     }
-
     if (d.balance > 0) {
       stats.balance = d.balance;
       if (!stats.initBalance) {
@@ -1025,13 +1107,12 @@ async function fetchAIInsight() {
       }
       updateBalanceStats();
     }
-
     if (d.last_price && !stats.price) { stats.price = d.last_price; updatePriceStats(); }
   } catch(e) {}
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// [FIX-6] AI SIGNAL SCANNER — Independent, langsung ke Bybit publik
+// AI SIGNAL SCANNER
 // ═══════════════════════════════════════════════════════════════════════════════
 
 const AI_SIGNAL_PAIRS = [
@@ -1077,9 +1158,6 @@ function ensureSignalPaneReady() {
         </div>
       </div>
     </div>`;
-
-  const tabBtn = document.getElementById('tab-signal-btn') || document.querySelector('.tab[onclick*="insight"]');
-  if (tabBtn) tabBtn.textContent = '🎯 AI SIGNAL';
 }
 
 let _autoScanActive = false;
@@ -1143,6 +1221,19 @@ function _calcATR(candles, period = 14) {
   return atr;
 }
 
+// ════════════════════════════════════════════════════════════════════════════
+// [FIX-5-NEW] _analyzeSignal — EMA Trend Filter
+// ════════════════════════════════════════════════════════════════════════════
+// ROOT CAUSE: Bot sering LONG padahal downtrend karena LSR tinggi (whale long).
+// LSR adalah data dari luar candle — bisa misleading karena whales juga hedge.
+// FIX: Setelah semua scoring, terapkan EMA trend penalty:
+//   - emaBearAlign (EMA9 < EMA21 < EMA50) + bullScore > bearScore
+//     → potong bullScore -3 (trend berlawanan signal)
+//   - price < EMA50 * 0.99 → potong bullScore -2 (harga di bawah medium trend)
+//   - Berlaku sebaliknya untuk short signal dalam uptrend
+// Ini tidak 100% menghilangkan LSR influence, tapi memberikan veto kuat
+// dari trend teknikal sehingga bot tidak masuk melawan arus.
+// ════════════════════════════════════════════════════════════════════════════
 function _analyzeSignal(symbol, candles) {
   if (candles.length < 35) return null;
   const closes   = candles.map(c => c.c);
@@ -1195,6 +1286,37 @@ function _analyzeSignal(symbol, candles) {
   if (prev2.c < prev2.o && Math.abs(prev.c - prev.o) < atr * 0.3 && last.c > last.o && last.c > (prev2.o + prev2.c) / 2) { bullScore += 2; reasons.push('Morning star'); }
   if (prev2.c > prev2.o && Math.abs(prev.c - prev.o) < atr * 0.3 && last.c < last.o && last.c < (prev2.o + prev2.c) / 2) { bearScore += 2; reasons.push('Evening star'); }
 
+  // ═══════════════════════════════════════════════════════════════════════
+  // [FIX-5-NEW] EMA Trend Filter — veto signal yang melawan trend
+  // Ini adalah anti-LSR-manipulation filter. Jika EMA alignment jelas
+  // downtrend tapi signal LONG → potong bull score secara agresif.
+  // ═══════════════════════════════════════════════════════════════════════
+  let trendConflict = false;
+
+  // Bear trend (EMA9 < EMA21 < EMA50) tapi signal LONG → penalty keras
+  if (emaBearAlign && bullScore > bearScore) {
+    bullScore = Math.max(0, bullScore - 3); // [FIX-5] cut bull score
+    reasons.push('⚠ EMA downtrend conflict');
+    trendConflict = true;
+  }
+  // Bull trend (EMA9 > EMA21 > EMA50) tapi signal SHORT → penalty keras
+  if (emaBullAlign && bearScore > bullScore) {
+    bearScore = Math.max(0, bearScore - 3); // [FIX-5] cut bear score
+    reasons.push('⚠ EMA uptrend conflict');
+    trendConflict = true;
+  }
+  // [FIX-5] Price jauh di bawah EMA50 (>1%) → additional bull penalty
+  if (price < ema50 * 0.99 && bullScore > bearScore) {
+    bullScore = Math.max(0, bullScore - 2);
+    if (!trendConflict) reasons.push('Price < EMA50 (bull penalized)');
+  }
+  // [FIX-5] Price jauh di atas EMA50 (>1%) → additional bear penalty
+  if (price > ema50 * 1.01 && bearScore > bullScore) {
+    bearScore = Math.max(0, bearScore - 2);
+    if (!trendConflict) reasons.push('Price > EMA50 (bear penalized)');
+  }
+  // ═══════════════════════════════════════════════════════════════════════
+
   const minScore = 4;
   if (bullScore < minScore && bearScore < minScore) return null;
   if (Math.abs(bullScore - bearScore) < 2) return null;
@@ -1212,7 +1334,12 @@ function _analyzeSignal(symbol, candles) {
   const rr     = Math.abs(tp - entry) / Math.abs(sl - entry);
   if (rr < 1.5) return null;
 
-  return { symbol, direction, confidence, entry, tp, sl, rr, rsi, reasons, price, ema9, ema21, volRatio };
+  return {
+    symbol, direction, confidence, entry, tp, sl, rr, rsi, reasons, price,
+    ema9, ema21, ema50, volRatio,
+    trendConflict,           // [FIX-5] expose untuk visual warning
+    emaBullAlign, emaBearAlign  // [FIX-5] expose untuk visual
+  };
 }
 
 async function runAISignalScan() {
@@ -1265,17 +1392,24 @@ function _renderAIScanStats(results, total, errors, el) {
   const longs   = results.filter(r => r.direction === 'LONG').length;
   const shorts  = results.filter(r => r.direction === 'SHORT').length;
   const avgConf = results.length ? (results.reduce((s, r) => s + r.confidence, 0) / results.length * 100).toFixed(0) : 0;
+  // [FIX-5-VISUAL] Tambah stat untuk conflict count
+  const conflicts = results.filter(r => r.trendConflict).length;
   el.innerHTML = [
-    { label: 'Scanned',  value: total,        color: 'var(--text)' },
-    { label: 'LONG',     value: longs,         color: 'var(--accent)' },
-    { label: 'SHORT',    value: shorts,        color: 'var(--danger)' },
-    { label: 'Avg Conf', value: avgConf + '%', color: 'var(--warn)' },
+    { label: 'Scanned',   value: total,           color: 'var(--text)' },
+    { label: 'LONG',      value: longs,            color: 'var(--accent)' },
+    { label: 'SHORT',     value: shorts,           color: 'var(--danger)' },
+    { label: 'Avg Conf',  value: avgConf + '%',    color: 'var(--warn)' },
+    // [FIX-5-VISUAL] Tampilkan jumlah sinyal yang punya trend conflict
+    { label: '⚠ Conflict', value: conflicts,       color: conflicts > 0 ? '#f59e0b' : 'var(--text2)' },
   ].map(s => `<div style="background:var(--bg2);border:1px solid var(--border);border-radius:4px;padding:8px;text-align:center;">
     <div style="font-size:9px;font-family:var(--mono);color:var(--text2);text-transform:uppercase;">${s.label}</div>
     <div style="font-family:var(--mono);font-size:16px;font-weight:700;color:${s.color};margin-top:2px;">${s.value}</div>
   </div>`).join('');
 }
 
+// ════════════════════════════════════════════════════════════════════════════
+// [FIX-5-VISUAL] _renderAISignals — tampilkan trend conflict badge
+// ════════════════════════════════════════════════════════════════════════════
 function _renderAISignals(results, total, tf) {
   const gridEl = document.getElementById('ai-signal-grid');
   if (!gridEl) return;
@@ -1296,14 +1430,27 @@ function _renderAISignals(results, total, tf) {
     const dec     = s.price < 0.01 ? 6 : s.price < 1 ? 5 : s.price < 10 ? 4 : s.price < 1000 ? 3 : 2;
     const confBar = `<div style="height:3px;background:var(--border);border-radius:2px;margin:6px 0 8px;">
       <div style="height:3px;width:${confPct}%;background:${color};border-radius:2px;transition:width .3s;"></div></div>`;
+
+    // [FIX-5-VISUAL] Badge untuk trend conflict warning
+    const conflictBadge = s.trendConflict
+      ? `<span style="background:rgba(245,158,11,0.2);color:#f59e0b;border:1px solid rgba(245,158,11,0.4);border-radius:3px;padding:2px 7px;font-family:var(--mono);font-size:9px;font-weight:700;letter-spacing:0.5px;margin-left:4px;">⚠ TREND CONFLICT</span>`
+      : '';
+
+    // [FIX-5-VISUAL] EMA trend indicator
+    const emaLabel = s.emaBullAlign ? '▲ EMA bull' : s.emaBearAlign ? '▼ EMA bear' : '— EMA mix';
+    const emaColor = s.emaBullAlign ? 'var(--accent)' : s.emaBearAlign ? 'var(--danger)' : 'var(--text2)';
+
     return `
-      <div style="background:var(--bg2);border:1px solid ${border};border-radius:6px;padding:14px;cursor:pointer;transition:border-color .2s;"
+      <div style="background:var(--bg2);border:1px solid ${border};border-radius:6px;padding:14px;cursor:pointer;transition:border-color .2s;${s.trendConflict ? 'opacity:0.75;' : ''}"
            onclick="selectAISignalPair('${s.symbol}')"
            onmouseenter="this.style.borderColor='${color}'"
            onmouseleave="this.style.borderColor='${border}'">
         <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
           <span style="font-family:var(--mono);font-weight:700;color:var(--text);font-size:13px;">${s.symbol.replace('USDT','')}/USDT</span>
-          <span style="background:${bgColor};color:${color};border:1px solid ${border};border-radius:4px;padding:3px 10px;font-family:var(--mono);font-size:11px;font-weight:700;">${s.direction}</span>
+          <div style="display:flex;align-items:center;gap:4px;">
+            ${conflictBadge}
+            <span style="background:${bgColor};color:${color};border:1px solid ${border};border-radius:4px;padding:3px 10px;font-family:var(--mono);font-size:11px;font-weight:700;">${s.direction}</span>
+          </div>
         </div>
         ${confBar}
         <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:6px;margin-bottom:8px;">
@@ -1324,7 +1471,7 @@ function _renderAISignals(results, total, tf) {
           <span>RSI ${s.rsi.toFixed(0)}</span>
           <span>RR ${s.rr.toFixed(2)}×</span>
           <span>Conf ${confPct}%</span>
-          <span>Vol ${s.volRatio.toFixed(1)}×</span>
+          <span style="color:${emaColor}">${emaLabel}</span>
         </div>
         <div style="font-size:9px;color:var(--text2);font-style:italic;line-height:1.4;">${s.reasons.slice(0,3).join(' · ')}</div>
       </div>`;
@@ -1346,7 +1493,8 @@ function selectAISignalPair(symbol) {
   if (sig) {
     const action = sig.direction === 'LONG' ? 'BUY' : 'SELL';
     const dec = sig.price < 10 ? 4 : 2;
-    toast(`📍 ${symbol} ${sig.direction} | Entry:${sig.entry.toFixed(dec)} TP:${sig.tp.toFixed(dec)} SL:${sig.sl.toFixed(dec)}`, true);
+    const conflictWarn = sig.trendConflict ? ' ⚠CONFLICT' : '';
+    toast(`📍 ${symbol} ${sig.direction}${conflictWarn} | Entry:${sig.entry.toFixed(dec)} TP:${sig.tp.toFixed(dec)} SL:${sig.sl.toFixed(dec)}`, !sig.trendConflict);
     setTimeout(() => {
       addSignalMarker(action, sig.price);
       setTpSlLines(sig.entry, sig.tp, sig.sl);
@@ -1358,12 +1506,9 @@ function selectAISignalPair(symbol) {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// [FIX-4] TRADES TAB — Inject tab button & pane dinamis di startup
-// Tab TRADES baru dengan full trade history + stats bar
+// [FIX-4-ENHANCED] initTradesTab — inject tab + pane dengan containment benar
 // ════════════════════════════════════════════════════════════════════════════
-
 function initTradesTab() {
-  // [FIX-4] Inject tab button ke tab-bar
   const tabBar = document.querySelector('.tab-bar');
   const spacer = document.querySelector('.tab-spacer');
   if (tabBar && spacer && !document.querySelector('[data-trade-tab]')) {
@@ -1375,7 +1520,6 @@ function initTradesTab() {
     tabBar.insertBefore(tradeBtn, spacer);
   }
 
-  // [FIX-4] Inject pane-trades ke main-panel jika belum ada
   if (!document.getElementById('pane-trades')) {
     const mainPanel = document.querySelector('.main-panel');
     if (!mainPanel) return;
@@ -1383,9 +1527,17 @@ function initTradesTab() {
     const pane = document.createElement('div');
     pane.className = 'tab-pane';
     pane.id = 'pane-trades';
-    pane.style.display = 'none';       // [FIX-3] hidden by default via inline style
-    pane.style.flexDirection = 'column';
+    // [FIX-4-ENHANCED] Set nuclear hide state sejak awal
+    pane.style.display = 'none';
+    pane.style.visibility = 'hidden';
+    pane.style.pointerEvents = 'none';
+    pane.style.position = 'absolute';
+    pane.style.width = '0';
+    pane.style.height = '0';
     pane.style.overflow = 'hidden';
+    pane.style.clip = 'rect(0,0,0,0)';
+    pane.style.zIndex = '-999';
+    pane.style.flexDirection = 'column';
     pane.innerHTML = `
       <div style="display:grid;grid-template-columns:repeat(5,1fr);border-bottom:1px solid var(--border);background:var(--bg2);flex-shrink:0;">
         <div style="padding:12px 16px;border-right:1px solid var(--border);text-align:center;">
@@ -1439,12 +1591,10 @@ function initTradesTab() {
   }
 }
 
-// [FIX-4] renderFullTradesTable — render trade history ke tab TRADES
 function renderFullTradesTable() {
   const tbody = document.getElementById('trades-full-tbody');
   if (!tbody) return;
 
-  // Update stats bar
   const wins    = tradeHistory.filter(t => t.result === 'WIN').length;
   const losses  = tradeHistory.filter(t => t.result === 'LOSS').length;
   const total   = tradeHistory.length;
@@ -1460,10 +1610,7 @@ function renderFullTradesTable() {
   if (el('ts-wins'))   el('ts-wins').textContent   = wins;
   if (el('ts-losses')) el('ts-losses').textContent = losses;
 
-  // Render rows
   let rows = '';
-
-  // Active/open trade (if any)
   if (activeTrade) {
     const dec = activeTrade.entry < 1 ? 6 : activeTrade.entry < 10 ? 4 : 2;
     rows += `<tr style="background:rgba(245,158,11,0.04)">
@@ -1479,7 +1626,6 @@ function renderFullTradesTable() {
     </tr>`;
   }
 
-  // Closed trades
   tradeHistory.forEach(t => {
     const isWin = t.result === 'WIN';
     const cls   = isWin ? 'trade-win' : 'trade-loss';
@@ -1488,7 +1634,7 @@ function renderFullTradesTable() {
     const badgeBg  = isWin ? 'rgba(0,229,160,0.12)' : 'rgba(239,68,68,0.1)';
     const badgeClr = isWin ? 'var(--accent)' : 'var(--danger)';
     const badgeBdr = isWin ? 'rgba(0,229,160,0.3)' : 'rgba(239,68,68,0.3)';
-    rows += `<tr style="transition:background 0.1s" onmouseenter="this.style.background='rgba(255,255,255,0.02)'" onmouseleave="this.style.background=''">
+    rows += `<tr onmouseenter="this.style.background='rgba(255,255,255,0.02)'" onmouseleave="this.style.background=''">
       <td style="padding:12px 20px;border-bottom:1px solid var(--border);color:var(--text2)">${t.time}</td>
       <td style="padding:12px 20px;border-bottom:1px solid var(--border)" class="${cls}">${t.action}</td>
       <td style="padding:12px 20px;border-bottom:1px solid var(--border);color:var(--text)">${t.entry.toFixed(dec)}</td>
@@ -1504,37 +1650,56 @@ function renderFullTradesTable() {
   if (!rows) {
     rows = `<tr><td colspan="7" style="text-align:center;padding:3rem;color:var(--text2);font-family:var(--mono);font-size:13px;">No closed trades yet — start bot to begin paper trading</td></tr>`;
   }
-
   tbody.innerHTML = rows;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// Boot sequence
+// BOOT SEQUENCE
 // ═══════════════════════════════════════════════════════════════════════════════
 
 loadConfig();
 loadSimState();
 loadBybitPairs('bybit');
 
-// [FIX-6] Init AI SIGNAL pane di startup
+// Init AI SIGNAL pane di startup
 ensureSignalPaneReady();
 
-// [FIX-4] Init TRADES tab di startup
+// [FIX-4-ENHANCED] Init TRADES tab di startup
 initTradesTab();
 
-// [FIX-3] Init: set display:none explicitly on all non-active panes
-// Ensures chart doesn't bleed through on first render
-document.querySelectorAll('.tab-pane:not(.active)').forEach(p => {
-  p.style.display = 'none';
-  p.style.overflow = 'hidden';
-});
-const activePane = document.querySelector('.tab-pane.active');
-if (activePane) {
-  activePane.style.display = 'flex';
-  activePane.style.flexDirection = 'column';
-  activePane.style.overflow = 'hidden';
-  activePane.style.height = '100%';
-}
+// ════════════════════════════════════════════════════════════════════════════
+// [FIX-3-ENHANCED] Boot: Nuclear hide semua non-active pane
+// Gunakan styling yang sama dengan switchTab untuk konsistensi
+// Ini memastikan dari frame pertama chart tidak bisa bleed ke tab lain
+// ════════════════════════════════════════════════════════════════════════════
+(function _initPaneContainment() {
+  // Semua non-active pane: nuclear hide
+  document.querySelectorAll('.tab-pane:not(.active)').forEach(p => {
+    p.style.display = 'none';
+    p.style.visibility = 'hidden';
+    p.style.pointerEvents = 'none';
+    p.style.position = 'absolute';   // [FIX-3-ENHANCED] keluar dari grid flow
+    p.style.width = '0';
+    p.style.height = '0';
+    p.style.overflow = 'hidden';
+    p.style.clip = 'rect(0,0,0,0)';
+    p.style.zIndex = '-999';
+  });
+  // Active pane (chart tab): restore ke grid flow
+  const activePane = document.querySelector('.tab-pane.active');
+  if (activePane) {
+    activePane.style.display = 'flex';
+    activePane.style.visibility = 'visible';
+    activePane.style.pointerEvents = 'auto';
+    activePane.style.flexDirection = 'column';
+    activePane.style.overflow = 'hidden';
+    activePane.style.position = 'relative';  // [FIX-3-ENHANCED] dalam grid flow
+    activePane.style.width = '100%';
+    activePane.style.height = '100%';
+    activePane.style.clip = 'auto';
+    activePane.style.zIndex = '1';
+  }
+})();
 
 poll();
 setInterval(poll, 1500);
