@@ -1,14 +1,13 @@
-// dashboard.js — TradeBot v3.0.4
-// FIXES vs v3.0.3:
-// [FIX-1] LOG TIME: Semua timestamp di log/stats sekarang pakai local device timezone (WIB kalau device WIB)
-//         server.go sudah kirim HH:MM:SS local, dashboard tinggal display apa adanya
-// [FIX-2] OI DISPLAY: isLikelyTimestamp guard + display '—' kalau nilai tidak valid
-// [FIX-3] 24h PERCENT: HANYA dari Bybit WS ticker.price24hPcnt (decimal → ×100), TIDAK dari bot_insight.pct_24h
-// [FIX-4] BOT TIDAK ENTRY: trading style alias fix ada di consensus/mod.rs (terpisah), dashboard pastikan TRADING_STYLE terkirim benar
-// [FIX-5] ENTRY/TP/SL + TRADE HISTORY: selectAISignalPair langsung set marker + lines, trade history render benar
-// [FIX-6] AI SIGNAL SCANNER: Independent dari bot utama, jalan sendiri scrape Bybit publik, auto-update 5 menit
-//         ensureSignalPaneReady() dipanggil di boot — tidak lazy lagi
-// [FIX-7] CHART LEGEND: Hidden by default, hanya muncul saat ada marker/line aktif di chart
+// dashboard.js — TradeBot v3.0.5
+// FIXES vs v3.0.4:
+// [FIX-3] CHART OVERLAP: switchTab sekarang force style.display='none' ke semua pane
+//         Root cause lama: CSS class removal tidak selalu override inline/computed styles
+//         dari LightweightCharts yang meng-inject style ke parent container
+// [FIX-4] TRADES TAB: initTradesTab() inject tab button + pane-trades di runtime
+//         renderFullTradesTable() render histori lengkap dengan stats bar
+//         Trade history dipindah ke tab TRADES, mini panel di chart tab dipertahankan
+// [FIX-5-PARTIAL] Bot tidak auto-start trading saat server launch (sudah handled di
+//         server.go botRunning.Store(false) — kalau masih kedetect, cek main.go)
 
 'use strict';
 
@@ -71,7 +70,6 @@ function toggleChart() {
   const btn = document.getElementById('btn-toggle-chart');
   if (wrap) wrap.style.display = isChartHidden ? 'none' : 'block';
   if (toolbar) toolbar.style.display = isChartHidden ? 'none' : 'flex';
-  // Legend hanya muncul kalau ada marker aktif
   if (legend) legend.style.display = (!isChartHidden && _pendingMarkers.length > 0) ? 'flex' : 'none';
   if (btn) btn.textContent = isChartHidden ? '👁 Show Chart' : '👁 Hide Chart';
 }
@@ -137,6 +135,7 @@ function resetHistory() {
     tradeHistory = []; totalPnl = 0; signalCount = 0; activeTrade = null; stats.initBalance = null;
     Storage.remove('botInitBalance');
     saveSimState(); updateTradeStats(); updateBalanceStats(); renderTradesTable();
+    renderFullTradesTable(); // [FIX-4] juga reset trades tab
   }
 }
 
@@ -194,9 +193,9 @@ function parseLog(log) {
 // [FIX-2] Helper: deteksi apakah nilai itu Unix timestamp (bukan OI)
 function isLikelyTimestamp(v) {
   if (!v || isNaN(v)) return false;
-  if (v >= 1.58e12 && v <= 2.05e12) return true; // milliseconds
-  if (v >= 1.58e9  && v <= 2.05e9)  return true; // seconds
-  if (v > 1e11) return true;                       // terlalu besar untuk OI normal
+  if (v >= 1.58e12 && v <= 2.05e12) return true;
+  if (v >= 1.58e9  && v <= 2.05e9)  return true;
+  if (v > 1e11) return true;
   return false;
 }
 
@@ -205,6 +204,7 @@ function openDryTrade(action, params) {
   activeTrade = { action, ...params, time: new Date().toLocaleTimeString() };
   addSignalMarker(action, params.entry); setTpSlLines(params.entry, params.tp, params.sl);
   saveSimState(); updateTradeStats(); renderTradesTable();
+  renderFullTradesTable(); // [FIX-4]
 }
 
 function checkTradeOutcome(currentPrice) {
@@ -233,6 +233,7 @@ function closeTrade(result, exitPrice) {
   }
   activeTrade = null; setTpSlLines(null, null, null);
   saveSimState(); updateTradeStats(); renderTradesTable();
+  renderFullTradesTable(); // [FIX-4]
 }
 
 function updatePriceStats() {
@@ -451,7 +452,6 @@ function _resetLiveCandle() { _liveCandle = null; }
 
 let _pendingMarkers = [];
 
-// [FIX-7] addSignalMarker: setelah add marker, tampilkan legend
 function addSignalMarker(action, price) {
   const tf = parseInt(_currentTf) || 5;
   const tfSec = tf * 60;
@@ -466,11 +466,9 @@ function addSignalMarker(action, price) {
   } else {
     setTimeout(_applyMarkers, 1500);
   }
-  // Tampilkan legend ketika ada marker
   _showChartLegend();
 }
 
-// [FIX-7] Show chart legend hanya kalau tidak hidden dan ada marker
 function _showChartLegend() {
   const legend = document.getElementById('chart-legend');
   if (legend && !isChartHidden && _pendingMarkers.length > 0) {
@@ -502,7 +500,6 @@ function setTpSlLines(entry, tp, sl) {
   if (entry) _entryLine = _candleSeries.createPriceLine({ price: entry, color: '#3b82f6',    lineWidth: 1, lineStyle: 0, axisLabelVisible: true, title: 'ENTRY' });
   if (tp)    _tpLine    = _candleSeries.createPriceLine({ price: tp,    color: '#00e5a070', lineWidth: 1, lineStyle: 2, axisLabelVisible: true, title: 'TP' });
   if (sl)    _slLine    = _candleSeries.createPriceLine({ price: sl,    color: '#ef444470', lineWidth: 1, lineStyle: 2, axisLabelVisible: true, title: 'SL' });
-  // Tampilkan legend kalau ada lines aktif
   if (entry || tp || sl) _showChartLegend();
 }
 
@@ -610,7 +607,6 @@ function renderTradesTableGo(active, history) {
 function renderTradesTable() {
   const tbody = document.getElementById('trades-tbody');
   if (!tbody) return;
-  // Jika Go engine sedang handle trades, jangan overwrite
   if (_chartLines.length > 0 && activeTrade === null && tradeHistory.length === 0) return;
   if (!tradeHistory.length && !activeTrade) {
     tbody.innerHTML = '<tr><td colspan="7" style="color:var(--text2);text-align:center;padding:10px">Belum ada trade</td></tr>';
@@ -639,14 +635,40 @@ function renderTradesTable() {
   tbody.innerHTML = rows;
 }
 
+// ════════════════════════════════════════════════════════════════════════════
+// [FIX-3] switchTab — EXPLICIT display override to fix chart overlap bug
+// ROOT CAUSE: LightweightCharts sets inline CSS on its internal canvas/divs.
+//   When pane-chart gets display:none via CSS class only, the chart's internal
+//   resize observer can still repaint and bleed over sibling panes due to
+//   stacking context issues. Force-setting style.display resolves this.
+// ════════════════════════════════════════════════════════════════════════════
 function switchTab(name, btn) {
   document.querySelectorAll('.tab').forEach(b => b.classList.remove('active'));
-  document.querySelectorAll('.tab-pane').forEach(p => p.classList.remove('active'));
+
+  // [FIX-3] Explicitly hide ALL panes — both class AND inline style
+  // Do NOT rely on CSS class cascade alone due to LightweightCharts stacking context
+  document.querySelectorAll('.tab-pane').forEach(p => {
+    p.classList.remove('active');
+    p.style.display = 'none';    // [FIX-3] force hide via inline style
+    p.style.overflow = 'hidden'; // [FIX-3] extra containment
+  });
+
   btn.classList.add('active');
-  document.getElementById('pane-' + name).classList.add('active');
+  const target = document.getElementById('pane-' + name);
+  if (!target) return;
+
+  // [FIX-3] Force show the active pane via inline style
+  target.classList.add('active');
+  target.style.display = 'flex';         // [FIX-3] must match .tab-pane.active
+  target.style.flexDirection = 'column'; // [FIX-3] restore flex direction
+  target.style.overflow = 'hidden';      // [FIX-3] contain chart canvas
+  target.style.height = '100%';          // [FIX-3] fill parent
+
   const logFilter = document.getElementById('log-filter-btns');
   if (logFilter) logFilter.style.display = name === 'logs' ? 'flex' : 'none';
+
   if (name === 'chart') {
+    // Re-trigger chart resize after pane becomes visible
     setTimeout(() => {
       if (_lwChart && !isChartHidden) {
         const c = document.getElementById('chart-container');
@@ -656,9 +678,9 @@ function switchTab(name, btn) {
       }
     }, 50);
   }
-  if (name === 'insight') {
-    ensureSignalPaneReady();
-  }
+
+  if (name === 'insight') ensureSignalPaneReady();
+  if (name === 'trades') renderFullTradesTable(); // [FIX-4]
 }
 
 function setFilter(btn) {
@@ -695,7 +717,6 @@ function renderLogs() {
   filtered.forEach(l => {
     const row = document.createElement('div');
     row.className = 'log-entry ' + l.level;
-    // [FIX-1] Tampilkan ts apa adanya — server.go sudah kirim local time HH:MM:SS
     row.innerHTML = `<span class="log-ts">${l.ts}</span><span class="log-lvl">${l.level}</span><span class="log-name">${l.name}</span><span class="log-msg">${escHtml(l.msg)}</span>`;
     frag.appendChild(row);
   });
@@ -779,13 +800,12 @@ document.querySelectorAll('input, select').forEach(el => {
 
 function collectEnv() {
   function keyVal(id) { const v = document.getElementById(id)?.value; return (v && v !== _KEY_SENTINEL) ? v : ''; }
-  // [FIX-4] Pastikan TRADING_STYLE terkirim benar sesuai value di select
   return {
     SYMBOL:              document.getElementById('cfg-symbol').value.trim(),
     LEVERAGE:            document.getElementById('cfg-leverage').value,
     EXCHANGE:            document.getElementById('cfg-exchange').value,
     EXCHANGE_MODE:       document.getElementById('cfg-mode').value,
-    TRADING_STYLE:       document.getElementById('cfg-style').value,  // "scalping" | "daytrade" | "sniper"
+    TRADING_STYLE:       document.getElementById('cfg-style').value,
     TARGET_TYPE:         document.getElementById('cfg-target-type').value,
     RISK_PCT:            (parseInt(document.getElementById('cfg-risk').value) / 100).toString(),
     USE_MOCK_OHLCV:      document.getElementById('cfg-mock').checked ? '1' : '0',
@@ -915,7 +935,6 @@ function _onSymbolChange(sym) {
   if (_volSeries)    try { _volSeries.setData([]); }    catch(e) {}
   _pendingMarkers = [];
   setTpSlLines(null, null, null);
-  // Sembunyikan legend saat ganti symbol (belum ada data baru)
   const legend = document.getElementById('chart-legend');
   if (legend) legend.style.display = 'none';
   stats.price = null; stats.prevPrice = null;
@@ -934,8 +953,6 @@ function _getLiveSymbol() {
 }
 
 // [FIX-3] WS ticker: sumber tunggal untuk price + 24h%
-// price24hPcnt dari Bybit WS = decimal form (e.g. 0.0117 = +1.17%)
-// JANGAN ambil pct dari bot_insight karena itu ATR/price bukan 24h change
 function connectLivePriceWS() {
   const sym = _getLiveSymbol();
   if (_wsTicker) { _wsTicker.close(); _wsTicker = null; }
@@ -958,12 +975,10 @@ function connectLivePriceWS() {
           }
         }
 
-        // [FIX-3] 24h% HANYA dari WS ticker, bukan dari bot_insight
-        // Bybit kirim dalam decimal form: 0.0117 = 1.17%
         if (ticker.price24hPcnt !== undefined) {
           const raw = parseFloat(ticker.price24hPcnt);
           if (!isNaN(raw)) {
-            const pct24h = raw * 100; // convert decimal → percent
+            const pct24h = raw * 100;
             const deltaEl = document.getElementById('hdr-delta');
             if (deltaEl) {
               const sign = pct24h >= 0 ? '+' : '';
@@ -979,20 +994,17 @@ function connectLivePriceWS() {
   _wsTicker.onclose = () => setTimeout(connectLivePriceWS, 3000);
 }
 
-// [FIX-2/FIX-3] fetchAIInsight: OI harus valid, pct_24h TIDAK dipakai untuk header delta
 async function fetchAIInsight() {
   try {
     const r = await fetch('/api/insight');
     const d = await r.json();
 
-    // OI: hanya update jika nilai valid (bukan timestamp)
     if (d.open_interest !== undefined) {
       if (!isLikelyTimestamp(d.open_interest) && d.open_interest > 0) {
         stats.oi = d.open_interest;
         stats.oiTime = d.timestamp;
         updateOIStats();
       }
-      // jika timestamp / invalid: tampilkan '—'
     }
 
     if (d.lsr_val) {
@@ -1015,14 +1027,11 @@ async function fetchAIInsight() {
     }
 
     if (d.last_price && !stats.price) { stats.price = d.last_price; updatePriceStats(); }
-
-    // TIDAK update hdr-delta dari pct_24h bot_insight (itu bukan 24h change, itu volatility/ATR)
   } catch(e) {}
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // [FIX-6] AI SIGNAL SCANNER — Independent, langsung ke Bybit publik
-// Jalan tanpa bot, auto-update setiap 5 menit, tidak bergantung ke bot_insight
 // ═══════════════════════════════════════════════════════════════════════════════
 
 const AI_SIGNAL_PAIRS = [
@@ -1033,7 +1042,6 @@ const AI_SIGNAL_PAIRS = [
 let _aiSignalTimer = null;
 let _aiSignalPaneReady = false;
 
-// [FIX-6] Inisialisasi pane AI SIGNAL — dipanggil di boot, bukan lazy
 function ensureSignalPaneReady() {
   if (_aiSignalPaneReady) return;
   _aiSignalPaneReady = true;
@@ -1070,7 +1078,6 @@ function ensureSignalPaneReady() {
       </div>
     </div>`;
 
-  // Update tab label
   const tabBtn = document.getElementById('tab-signal-btn') || document.querySelector('.tab[onclick*="insight"]');
   if (tabBtn) tabBtn.textContent = '🎯 AI SIGNAL';
 }
@@ -1269,7 +1276,6 @@ function _renderAIScanStats(results, total, errors, el) {
   </div>`).join('');
 }
 
-// [FIX-5][FIX-6] _renderAISignals: simpan ke _lastAIScanResults global
 function _renderAISignals(results, total, tf) {
   const gridEl = document.getElementById('ai-signal-grid');
   if (!gridEl) return;
@@ -1325,19 +1331,15 @@ function _renderAISignals(results, total, tf) {
   }).join('');
 }
 
-// [FIX-5] Klik signal card → pindah ke chart + tampilkan marker + TP/SL lines + legend
 function selectAISignalPair(symbol) {
-  // Ganti symbol di selector
   const sel = document.getElementById('cfg-symbol');
   if (sel && [...sel.options].some(o => o.value === symbol)) {
     sel.value = symbol;
     _onSymbolChange(symbol);
   }
 
-  // Cari signal dari hasil scan terakhir
   const sig = _lastAIScanResults.find(s => s.symbol === symbol);
 
-  // Switch ke chart tab
   const chartBtn = document.querySelector('.tab[onclick*="chart"]');
   if (chartBtn) switchTab('chart', chartBtn);
 
@@ -1345,15 +1347,165 @@ function selectAISignalPair(symbol) {
     const action = sig.direction === 'LONG' ? 'BUY' : 'SELL';
     const dec = sig.price < 10 ? 4 : 2;
     toast(`📍 ${symbol} ${sig.direction} | Entry:${sig.entry.toFixed(dec)} TP:${sig.tp.toFixed(dec)} SL:${sig.sl.toFixed(dec)}`, true);
-    // Delay kasih waktu chart load data pair baru
     setTimeout(() => {
       addSignalMarker(action, sig.price);
       setTpSlLines(sig.entry, sig.tp, sig.sl);
-      _showChartLegend(); // Pastikan legend muncul
+      _showChartLegend();
     }, 1200);
   } else {
     toast(`Chart: ${symbol}`, true);
   }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// [FIX-4] TRADES TAB — Inject tab button & pane dinamis di startup
+// Tab TRADES baru dengan full trade history + stats bar
+// ════════════════════════════════════════════════════════════════════════════
+
+function initTradesTab() {
+  // [FIX-4] Inject tab button ke tab-bar
+  const tabBar = document.querySelector('.tab-bar');
+  const spacer = document.querySelector('.tab-spacer');
+  if (tabBar && spacer && !document.querySelector('[data-trade-tab]')) {
+    const tradeBtn = document.createElement('button');
+    tradeBtn.className = 'tab';
+    tradeBtn.setAttribute('data-trade-tab', '1');
+    tradeBtn.textContent = '📊 TRADES';
+    tradeBtn.onclick = function() { switchTab('trades', this); };
+    tabBar.insertBefore(tradeBtn, spacer);
+  }
+
+  // [FIX-4] Inject pane-trades ke main-panel jika belum ada
+  if (!document.getElementById('pane-trades')) {
+    const mainPanel = document.querySelector('.main-panel');
+    if (!mainPanel) return;
+
+    const pane = document.createElement('div');
+    pane.className = 'tab-pane';
+    pane.id = 'pane-trades';
+    pane.style.display = 'none';       // [FIX-3] hidden by default via inline style
+    pane.style.flexDirection = 'column';
+    pane.style.overflow = 'hidden';
+    pane.innerHTML = `
+      <div style="display:grid;grid-template-columns:repeat(5,1fr);border-bottom:1px solid var(--border);background:var(--bg2);flex-shrink:0;">
+        <div style="padding:12px 16px;border-right:1px solid var(--border);text-align:center;">
+          <div style="font-family:var(--mono);font-size:9px;font-weight:600;letter-spacing:1.5px;text-transform:uppercase;color:var(--text2);margin-bottom:4px;">Total</div>
+          <div id="ts-total" style="font-family:var(--mono);font-size:18px;font-weight:700;color:var(--text);">0</div>
+        </div>
+        <div style="padding:12px 16px;border-right:1px solid var(--border);text-align:center;">
+          <div style="font-family:var(--mono);font-size:9px;font-weight:600;letter-spacing:1.5px;text-transform:uppercase;color:var(--text2);margin-bottom:4px;">Win Rate</div>
+          <div id="ts-wr" style="font-family:var(--mono);font-size:18px;font-weight:700;color:var(--text);">--</div>
+        </div>
+        <div style="padding:12px 16px;border-right:1px solid var(--border);text-align:center;">
+          <div style="font-family:var(--mono);font-size:9px;font-weight:600;letter-spacing:1.5px;text-transform:uppercase;color:var(--text2);margin-bottom:4px;">Sim P&L</div>
+          <div id="ts-pnl" style="font-family:var(--mono);font-size:18px;font-weight:700;color:var(--text);">+0.00%</div>
+        </div>
+        <div style="padding:12px 16px;border-right:1px solid var(--border);text-align:center;">
+          <div style="font-family:var(--mono);font-size:9px;font-weight:600;letter-spacing:1.5px;text-transform:uppercase;color:var(--text2);margin-bottom:4px;">Wins</div>
+          <div id="ts-wins" style="font-family:var(--mono);font-size:18px;font-weight:700;color:var(--accent);">0</div>
+        </div>
+        <div style="padding:12px 16px;text-align:center;">
+          <div style="font-family:var(--mono);font-size:9px;font-weight:600;letter-spacing:1.5px;text-transform:uppercase;color:var(--text2);margin-bottom:4px;">Losses</div>
+          <div id="ts-losses" style="font-family:var(--mono);font-size:18px;font-weight:700;color:var(--danger);">0</div>
+        </div>
+      </div>
+
+      <div style="display:flex;align-items:center;justify-content:space-between;padding:12px 20px;border-bottom:1px solid var(--border);background:var(--bg2);flex-shrink:0;">
+        <span style="font-family:var(--mono);font-size:10px;font-weight:600;letter-spacing:2px;color:var(--text2);text-transform:uppercase;">📊 TRADE HISTORY</span>
+        <button onclick="resetHistory()" style="padding:5px 12px;background:var(--panel);border:1px solid var(--border2);color:var(--danger);border-radius:4px;font-family:var(--mono);font-size:10px;cursor:pointer;">🗑 Reset</button>
+      </div>
+
+      <div style="flex:1;overflow-y:auto;">
+        <table style="width:100%;border-collapse:collapse;font-family:var(--mono);font-size:12px;">
+          <thead>
+            <tr style="background:var(--panel);position:sticky;top:0;z-index:1;">
+              <th style="text-align:left;padding:10px 20px;color:var(--text2);font-weight:600;font-size:10px;letter-spacing:1.5px;border-bottom:1px solid var(--border);text-transform:uppercase;">Time</th>
+              <th style="text-align:left;padding:10px 20px;color:var(--text2);font-weight:600;font-size:10px;letter-spacing:1.5px;border-bottom:1px solid var(--border);text-transform:uppercase;">Side</th>
+              <th style="text-align:left;padding:10px 20px;color:var(--text2);font-weight:600;font-size:10px;letter-spacing:1.5px;border-bottom:1px solid var(--border);text-transform:uppercase;">Entry</th>
+              <th style="text-align:left;padding:10px 20px;color:var(--text2);font-weight:600;font-size:10px;letter-spacing:1.5px;border-bottom:1px solid var(--border);text-transform:uppercase;">TP</th>
+              <th style="text-align:left;padding:10px 20px;color:var(--text2);font-weight:600;font-size:10px;letter-spacing:1.5px;border-bottom:1px solid var(--border);text-transform:uppercase;">SL</th>
+              <th style="text-align:left;padding:10px 20px;color:var(--text2);font-weight:600;font-size:10px;letter-spacing:1.5px;border-bottom:1px solid var(--border);text-transform:uppercase;">Status</th>
+              <th style="text-align:left;padding:10px 20px;color:var(--text2);font-weight:600;font-size:10px;letter-spacing:1.5px;border-bottom:1px solid var(--border);text-transform:uppercase;">P&L</th>
+            </tr>
+          </thead>
+          <tbody id="trades-full-tbody">
+            <tr><td colspan="7" style="text-align:center;padding:3rem;color:var(--text2);font-family:var(--mono);font-size:13px;">No closed trades yet</td></tr>
+          </tbody>
+        </table>
+      </div>
+    `;
+
+    mainPanel.appendChild(pane);
+  }
+}
+
+// [FIX-4] renderFullTradesTable — render trade history ke tab TRADES
+function renderFullTradesTable() {
+  const tbody = document.getElementById('trades-full-tbody');
+  if (!tbody) return;
+
+  // Update stats bar
+  const wins    = tradeHistory.filter(t => t.result === 'WIN').length;
+  const losses  = tradeHistory.filter(t => t.result === 'LOSS').length;
+  const total   = tradeHistory.length;
+  const pnlSign = totalPnl >= 0 ? '+' : '';
+
+  const el = (id) => document.getElementById(id);
+  if (el('ts-total'))  el('ts-total').textContent  = total + (activeTrade ? ' +1' : '');
+  if (el('ts-wr'))     el('ts-wr').textContent      = total ? (wins/total*100).toFixed(1) + '%' : '--';
+  if (el('ts-pnl')) {
+    el('ts-pnl').textContent  = pnlSign + totalPnl.toFixed(2) + '%';
+    el('ts-pnl').style.color  = totalPnl > 0 ? 'var(--accent)' : totalPnl < 0 ? 'var(--danger)' : 'var(--text)';
+  }
+  if (el('ts-wins'))   el('ts-wins').textContent   = wins;
+  if (el('ts-losses')) el('ts-losses').textContent = losses;
+
+  // Render rows
+  let rows = '';
+
+  // Active/open trade (if any)
+  if (activeTrade) {
+    const dec = activeTrade.entry < 1 ? 6 : activeTrade.entry < 10 ? 4 : 2;
+    rows += `<tr style="background:rgba(245,158,11,0.04)">
+      <td style="padding:12px 20px;border-bottom:1px solid var(--border);color:var(--text)">${activeTrade.time}</td>
+      <td style="padding:12px 20px;border-bottom:1px solid var(--border)" class="trade-open">${activeTrade.action}</td>
+      <td style="padding:12px 20px;border-bottom:1px solid var(--border);color:var(--blue)">${activeTrade.entry.toFixed(dec)}</td>
+      <td style="padding:12px 20px;border-bottom:1px solid var(--border)" class="trade-win">${activeTrade.tp.toFixed(dec)}</td>
+      <td style="padding:12px 20px;border-bottom:1px solid var(--border)" class="trade-loss">${activeTrade.sl.toFixed(dec)}</td>
+      <td style="padding:12px 20px;border-bottom:1px solid var(--border)">
+        <span style="display:inline-block;padding:3px 8px;border-radius:3px;font-size:10px;font-weight:700;letter-spacing:1px;background:rgba(245,158,11,0.15);color:var(--warn);border:1px solid rgba(245,158,11,0.3);">OPEN</span>
+      </td>
+      <td style="padding:12px 20px;border-bottom:1px solid var(--border)" class="trade-open">pending</td>
+    </tr>`;
+  }
+
+  // Closed trades
+  tradeHistory.forEach(t => {
+    const isWin = t.result === 'WIN';
+    const cls   = isWin ? 'trade-win' : 'trade-loss';
+    const dec   = t.entry < 1 ? 6 : t.entry < 10 ? 4 : 2;
+    const pnl   = (t.pnl_pct >= 0 ? '+' : '') + t.pnl_pct.toFixed(2) + '%';
+    const badgeBg  = isWin ? 'rgba(0,229,160,0.12)' : 'rgba(239,68,68,0.1)';
+    const badgeClr = isWin ? 'var(--accent)' : 'var(--danger)';
+    const badgeBdr = isWin ? 'rgba(0,229,160,0.3)' : 'rgba(239,68,68,0.3)';
+    rows += `<tr style="transition:background 0.1s" onmouseenter="this.style.background='rgba(255,255,255,0.02)'" onmouseleave="this.style.background=''">
+      <td style="padding:12px 20px;border-bottom:1px solid var(--border);color:var(--text2)">${t.time}</td>
+      <td style="padding:12px 20px;border-bottom:1px solid var(--border)" class="${cls}">${t.action}</td>
+      <td style="padding:12px 20px;border-bottom:1px solid var(--border);color:var(--text)">${t.entry.toFixed(dec)}</td>
+      <td style="padding:12px 20px;border-bottom:1px solid var(--border)" class="trade-win">${t.tp.toFixed(dec)}</td>
+      <td style="padding:12px 20px;border-bottom:1px solid var(--border)" class="trade-loss">${t.sl.toFixed(dec)}</td>
+      <td style="padding:12px 20px;border-bottom:1px solid var(--border)">
+        <span style="display:inline-block;padding:3px 8px;border-radius:3px;font-size:10px;font-weight:700;letter-spacing:1px;background:${badgeBg};color:${badgeClr};border:1px solid ${badgeBdr};">${t.result}</span>
+      </td>
+      <td style="padding:12px 20px;border-bottom:1px solid var(--border)" class="${cls}">${pnl}</td>
+    </tr>`;
+  });
+
+  if (!rows) {
+    rows = `<tr><td colspan="7" style="text-align:center;padding:3rem;color:var(--text2);font-family:var(--mono);font-size:13px;">No closed trades yet — start bot to begin paper trading</td></tr>`;
+  }
+
+  tbody.innerHTML = rows;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -1364,8 +1516,25 @@ loadConfig();
 loadSimState();
 loadBybitPairs('bybit');
 
-// [FIX-6] Init AI SIGNAL pane di startup, tidak lazy
+// [FIX-6] Init AI SIGNAL pane di startup
 ensureSignalPaneReady();
+
+// [FIX-4] Init TRADES tab di startup
+initTradesTab();
+
+// [FIX-3] Init: set display:none explicitly on all non-active panes
+// Ensures chart doesn't bleed through on first render
+document.querySelectorAll('.tab-pane:not(.active)').forEach(p => {
+  p.style.display = 'none';
+  p.style.overflow = 'hidden';
+});
+const activePane = document.querySelector('.tab-pane.active');
+if (activePane) {
+  activePane.style.display = 'flex';
+  activePane.style.flexDirection = 'column';
+  activePane.style.overflow = 'hidden';
+  activePane.style.height = '100%';
+}
 
 poll();
 setInterval(poll, 1500);
