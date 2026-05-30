@@ -1,0 +1,29 @@
+# Environments
+.env
+bot_runtime.conf
+
+# Binaries and compiled files
+*.exe
+*.dll
+*.so
+*.dylib
+bot.exe
+go-engine/bot.exe
+rust-brain/target/
+
+# Database and state files
+*.db
+*.sqlite
+virtual_balance.txt
+agent_rl_weights.json
+
+# Logs
+*.log
+bot.log
+
+# Dependency directories
+node_modules/
+
+# OS generated files
+.DS_Store
+Thumbs.db

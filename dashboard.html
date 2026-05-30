@@ -31,6 +31,7 @@
     </div>
     
     <div>
+    <div>
       <div class="section-title">Trading Config</div>
       <div class="card" id="config-form">
         <label style="display:flex;justify-content:space-between;align-items:center">
@@ -44,12 +45,8 @@
           <option value="bybit">Bybit</option>
           <option value="mexc">MEXC</option>
         </select>
-        
-        <label>Mode</label>
-        <select id="cfg-mode">
-          <option value="demo">Demo (Testnet)</option>
-          <option value="real">Real (Mainnet)</option>
-        </select>
+        <label>Inject Virtual Balance (Dry Run)</label>
+        <button id="btn-inject" style="width:100%; padding: 10px; background: linear-gradient(135deg, #10b981, #059669); color: white; border: none; border-radius: 6px; cursor: pointer; font-weight: bold;">+ Add $1,000</button>
 
         <label>Trading Style (Auto-Interval)</label>
         <select id="cfg-style">
@@ -94,16 +91,7 @@
       </div>
     </div>
     
-    <div>
-      <div class="section-title">API Bybit (Demo)</div>
-      <div class="card">
-        <label>API Key</label>
-        <input type="password" id="key-bybit-demo-key" placeholder="••••••••••••">
-        <label>API Secret</label>
-        <input type="password" id="key-bybit-demo-secret" placeholder="••••••••••••">
-      </div>
-    </div>
-    
+
     <div>
       <div class="section-title">API Bybit (Real)</div>
       <div class="card">
@@ -147,13 +135,13 @@
       <div class="stat-card">
         <div class="stat-label">BALANCE</div>
         <div class="stat-value small" id="stat-balance">
-          -- USDT 
+          <span id="stat-bal-text">-- USDT</span> 
           <span id="stat-bal-pct" style="font-size:10px; opacity:0.7;"></span>
         </div>
         <div class="stat-sub" id="stat-risk">Risk --% / trade</div>
       </div>
       <div class="stat-card">
-        <div class="stat-label">WIN RATE</div>
+        <div class="stat-label">SIM WIN RATE</div>
         <div class="stat-value" id="stat-winrate">--</div>
         <div class="stat-sub" id="stat-trades">0 trades</div>
       </div>
@@ -208,14 +196,8 @@
         <div class="legend-item"><div class="legend-dot" style="background:var(--accent)"></div>BUY Signal</div>
         <div class="legend-item"><div class="legend-dot" style="background:var(--danger)"></div>SELL Signal</div>
       </div>
-      <div class="trades-panel" id="trades-panel" style="flex: 1; min-height: 120px; overflow: auto; border-top: 1px solid var(--border);">
-        <div class="trades-panel-title" style="position: sticky; top: 0; background: var(--bg2);">Trade History</div>
-        <table class="trades-table">
-          <thead><tr><th>Time</th><th>Side</th><th>Entry</th><th>TP</th><th>SL</th><th>Result</th><th>P&L</th></tr></thead>
-          <tbody id="trades-tbody"><tr><td colspan="7" style="color:var(--text2); text-align:center; padding:10px">Belum ada trade</td></tr></tbody>
-        </table>
-      </div>
     </div>
+
 
     <div class="tab-pane" id="pane-logs">
       <div id="log-container">

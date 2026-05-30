@@ -16,6 +16,9 @@ mod shm;
 use agents::{
     absurdist::AbsurdistAgent,
     cryptographer::CryptographerAgent,
+    data_engineer::DataEngineer,
+    economist::Economist,
+    game_theorist::GameTheorist,
     linguist::LinguistAgent,
     liquidator::LiquidatorAgent,
     mathematician::MathematicianAgent,
@@ -45,6 +48,9 @@ fn main() -> anyhow::Result<()> {
         .expect("rayon pool init");
 
     let agents: Vec<Box<dyn Agent + Send + Sync>> = vec![
+        Box::new(DataEngineer),
+        Box::new(Economist),
+        Box::new(GameTheorist),
         Box::new(MathematicianAgent::default()),
         Box::new(PhysicistAgent::default()),
         Box::new(CryptographerAgent),
@@ -53,7 +59,7 @@ fn main() -> anyhow::Result<()> {
         Box::new(AbsurdistAgent),
     ];
 
-    let consensus = ConsensusEngine;
+    let consensus = ConsensusEngine::new();
 
     // Wait for Go engine to create SHM
     let mut bridge = {
@@ -63,17 +69,17 @@ fn main() -> anyhow::Result<()> {
                 Ok(b)  => { info!("[SHM] Connected"); break b; }
                 Err(e) => {
                     if Instant::now() > deadline {
-                        error!("[SHM] Timeout waiting for Go engine. Is it running?");
+                        error!("[SHM] Waduh timeout nungguin Go engine. Udah jalan belom tuh?");
                         return Err(e);
                     }
-                    warn!("[SHM] Not ready: {e}. Retrying in 1s…");
+                    warn!("[SHM] Belom ready: {e}. Sabar, nyoba lagi dalam 1 detik…");
                     std::thread::sleep(Duration::from_secs(1));
                 }
             }
         }
     };
 
-    info!("[Brain] Ready. Waiting for market data…");
+    info!("[Otak-AI] Udah ready nih bos! Tinggal nunggu data dari market…");
 
     let mut last_ts: i64 = 0;
     let mut iteration: u64 = 0;
@@ -82,7 +88,7 @@ fn main() -> anyhow::Result<()> {
         let snap = match bridge.wait_for_market(Duration::from_secs(60)) {
             Some(s) => s,
             None => {
-                warn!("[Brain] 60s timeout — no market data. Is Go engine alive?");
+                warn!("[Otak-AI] Udah 60 detik gada data market sama sekali nih. Go engine nya idup ga tuh?");
                 continue;
             }
         };
@@ -121,15 +127,19 @@ fn main() -> anyhow::Result<()> {
         let elapsed_us = t_start.elapsed().as_micros();
 
         info!(
-            "[Brain] #{iteration} {sym} price={:.4} │ {:?} conf={:.3} RR={:.2} │ {elapsed_us}µs",
+            "[Otak-AI] #{iteration} {sym} harga={:.4} │ Analisa: {:?} yakin={:.3} RR={:.2} │ Waktu Mikir: {elapsed_us}µs",
             snap.price, signal.action, signal.confidence, signal.risk_reward
         );
 
         if signal.veto {
-            warn!("[Brain] VETO: {}", signal.veto_reason);
+            if signal.veto_reason.contains("buntu") {
+                info!("[Otak-AI] ⏳ Nunggu Momen: {}", signal.veto_reason);
+            } else {
+                warn!("[Otak-AI] 🚫 GAGAL ENTRY: {}", signal.veto_reason);
+            }
         } else if matches!(signal.action, agents::Direction::Buy | agents::Direction::Sell) {
             info!(
-                "[Brain] ★ {:?} entry={:.4} TP={:.4} SL={:.4} conf={:.3}",
+                "[Otak-AI] ★ GAS TEROOOS! Mau {:?} di harga {:.4} | TP di {:.4} | SL di {:.4} | Tingkat Yakin: {:.3}",
                 signal.action, signal.entry, signal.take_profit, signal.stop_loss, signal.confidence
             );
         }

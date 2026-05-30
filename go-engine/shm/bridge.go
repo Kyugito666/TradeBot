@@ -50,7 +50,7 @@ const (
 	maxCandles  = 200
 	candleBytes = 48 // 6 × float64/int64
 	symLen      = 16
-	agentCount  = 6
+	agentCount  = 9
 	reasonLen   = 256
 
 	offSymbol   = offMarket
@@ -85,9 +85,9 @@ const (
 	offSigSL        = offSig + 32
 	offSigRR        = offSig + 40
 	offSigReason    = offSig + 48             // [256]byte
-	offSigDirs      = offSigReason + reasonLen // [6]uint8
-	// _pad3 [offSigDirs+6 .. offSigDirs+8]
-	offSigConvBase  = offSigDirs + 8          // [6]float64
+	offSigDirs      = offSigReason + reasonLen // [9]uint8
+	// alignment padding for 8 bytes: 10104 + 9 = 10113 -> pad 7 bytes = 10120
+	offSigConvBase  = offSigDirs + agentCount + 7 // [9]float64
 	offSigTs        = offSigConvBase + agentCount*8
 )
 

@@ -27,33 +27,74 @@ impl Agent for MathematicianAgent {
             return AgentVote::wait("mathematician", "insufficient candles");
         }
 
+        // ── Regime Filter (Kaufman Efficiency Ratio) ──────────────────────────
+        let mut er = 0.0;
+        let n = self.period.min(c.len() - 1);
+        if n > 0 {
+            let change = (c.last().unwrap() - c[c.len() - 1 - n]).abs();
+            let mut vol = 0.0;
+            for i in (c.len() - n)..c.len() {
+                vol += (c[i] - c[i - 1]).abs();
+            }
+            if vol > 1e-9 {
+                er = change / vol;
+            }
+        }
+        
+        let is_strong_uptrend = er > 0.35 && c.last().unwrap() > &c[c.len() - 1 - n];
+        let is_strong_downtrend = er > 0.35 && c.last().unwrap() < &c[c.len() - 1 - n];
+
         // ── Evidence 1: RSI (momentum) ───────────────────────────────────────
         let rsi_val = rsi(&c, self.rsi_period);
         let mut prob_up = 0.5_f64;
 
-        if rsi_val < 30.0 {
-            // Oversold → strong likelihood of reversal up
-            prob_up = bayesian_update(prob_up, 0.72, 0.28);
-        } else if rsi_val < 45.0 {
-            prob_up = bayesian_update(prob_up, 0.57, 0.43);
-        } else if rsi_val > 70.0 {
-            // Overbought → likelihood of reversal down
-            prob_up = bayesian_update(prob_up, 0.28, 0.72);
-        } else if rsi_val > 55.0 {
-            prob_up = bayesian_update(prob_up, 0.43, 0.57);
+        if is_strong_uptrend {
+            // Trend-following logic
+            if rsi_val > 65.0 {
+                prob_up = bayesian_update(prob_up, 0.75, 0.25); // Breakout momentum
+            } else if rsi_val < 50.0 {
+                prob_up = bayesian_update(prob_up, 0.65, 0.35); // Buy the dip
+            }
+        } else if is_strong_downtrend {
+            if rsi_val < 35.0 {
+                prob_up = bayesian_update(prob_up, 0.25, 0.75); // Breakdown momentum
+            } else if rsi_val > 50.0 {
+                prob_up = bayesian_update(prob_up, 0.35, 0.65); // Sell the rip
+            }
+        } else {
+            // Ranging market -> Mean Reversion logic
+            if rsi_val < 30.0 {
+                prob_up = bayesian_update(prob_up, 0.72, 0.28);
+            } else if rsi_val < 45.0 {
+                prob_up = bayesian_update(prob_up, 0.57, 0.43);
+            } else if rsi_val > 70.0 {
+                prob_up = bayesian_update(prob_up, 0.28, 0.72);
+            } else if rsi_val > 55.0 {
+                prob_up = bayesian_update(prob_up, 0.43, 0.57);
+            }
         }
 
-        // ── Evidence 2: Z-score (mean reversion) ─────────────────────────────
+        // ── Evidence 2: Z-score (mean reversion vs momentum) ─────────────────
         let z = zscore(&c, self.period);
 
-        if z < -2.0 {
-            prob_up = bayesian_update(prob_up, 0.68, 0.32);
-        } else if z < -1.0 {
-            prob_up = bayesian_update(prob_up, 0.58, 0.42);
-        } else if z > 2.0 {
-            prob_up = bayesian_update(prob_up, 0.32, 0.68);
-        } else if z > 1.0 {
-            prob_up = bayesian_update(prob_up, 0.42, 0.58);
+        if is_strong_uptrend {
+            if z > 1.5 {
+                prob_up = bayesian_update(prob_up, 0.65, 0.35); // Strong upside momentum
+            }
+        } else if is_strong_downtrend {
+            if z < -1.5 {
+                prob_up = bayesian_update(prob_up, 0.35, 0.65); // Strong downside momentum
+            }
+        } else {
+            if z < -2.0 {
+                prob_up = bayesian_update(prob_up, 0.68, 0.32);
+            } else if z < -1.0 {
+                prob_up = bayesian_update(prob_up, 0.58, 0.42);
+            } else if z > 2.0 {
+                prob_up = bayesian_update(prob_up, 0.32, 0.68);
+            } else if z > 1.0 {
+                prob_up = bayesian_update(prob_up, 0.42, 0.58);
+            }
         }
 
         let prob_down = 1.0 - prob_up;

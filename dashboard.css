@@ -343,7 +343,7 @@ input[type="range"]::-webkit-slider-thumb:hover { transform: scale(1.2); }
 }
 
 /* ── AI INSIGHT static box (legacy — kept for backward compat) ─────────────── */
-#pane-insight > div { max-width: 640px; margin: 0 auto; border: 1px solid var(--border); border-radius: var(--r); padding: 24px; background: var(--panel); box-shadow: 0 8px 24px rgba(0,0,0,0.2); }
+#pane-insight > div { width: 100%; border: 1px solid var(--border); border-radius: var(--r); padding: 24px; background: var(--panel); box-shadow: 0 8px 24px rgba(0,0,0,0.2); }
 #pane-insight h3 { font-family: var(--mono); color: var(--accent); font-size: 15px; letter-spacing: 1px; margin-bottom: 20px; border-bottom: 1px solid var(--border); padding-bottom: 12px; display: flex; align-items: center; gap: 8px; }
 .ai-box { display: flex; flex-direction: column; gap: 16px; }
 .ai-row { display: flex; justify-content: space-between; font-size: 13px; border-bottom: 1px solid var(--border2); padding-bottom: 10px; align-items: center; }
@@ -381,3 +381,26 @@ input[type="range"]::-webkit-slider-thumb:hover { transform: scale(1.2); }
 .toast.show { transform: translateY(0); opacity: 1; }
 .toast.ok   { border-left: 4px solid var(--accent); color: var(--text); }
 .toast.err  { border-left: 4px solid var(--danger);  color: var(--text); }
+
+/* ── MOBILE RESPONSIVENESS ─────────────────────────────────────────────────── */
+@media (max-width: 768px) {
+  body { padding: 10px; }
+  .grid-layout { grid-template-columns: 1fr !important; }
+  header { flex-direction: column; align-items: stretch; gap: 16px; padding: 16px; }
+  .brand { justify-content: center; }
+  .stats-row { justify-content: space-between; overflow-x: auto; padding-bottom: 8px; }
+  
+  .tab-nav { flex-wrap: wrap; gap: 8px; justify-content: center; }
+  .tab-btn { padding: 10px 16px; flex-grow: 1; text-align: center; }
+  
+  #pane-trade { grid-template-columns: 1fr; }
+  .panel.main-chart { min-height: 400px; }
+  
+  .tf-selector { overflow-x: auto; padding-bottom: 4px; }
+  .tf-btn { padding: 6px 12px; }
+  
+  #pane-insight > div { padding: 16px; }
+  .ai-box > div:nth-child(4) { grid-template-columns: 1fr; }
+  
+  .trades-table { display: block; overflow-x: auto; white-space: nowrap; }
+}

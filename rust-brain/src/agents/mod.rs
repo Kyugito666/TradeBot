@@ -2,6 +2,9 @@
 
 pub mod absurdist;
 pub mod cryptographer;
+pub mod data_engineer;
+pub mod economist;
+pub mod game_theorist;
 pub mod linguist;
 pub mod liquidator;
 pub mod mathematician;

@@ -55,8 +55,9 @@ import (
 )
 
 const (
+	// Gunakan api.bytick.com untuk bypass blokir ISP Indonesia / Kominfo
 	mainnetBase = "https://api.bytick.com"
-	testnetBase = "https://api-testnet.bybit.com"
+	testnetBase = "https://api-demo.bybit.com" // [FIX-DEMO] Demo Trading URL
 	recvWindow  = "5000"
 
 	// [FIX-BAL-SPAM] Balance cache TTL — jangan fetch lebih dari 1x per 30 detik.
@@ -69,7 +70,6 @@ type Config struct {
 	APIKey    string
 	APISecret string
 	Testnet   bool
-	DryRun    bool
 	Leverage  int
 	RiskPct   float64
 }
@@ -136,9 +136,11 @@ func New(cfg Config) *Executor {
 		base = testnetBase
 	}
 	e := &Executor{
-		cfg:    cfg,
-		client: &http.Client{Timeout: 10 * time.Second},
-		base:   base,
+		cfg: cfg,
+		client: &http.Client{
+			Timeout:   10 * time.Second,
+		},
+		base: base,
 	}
 	e.balCache.ttl = balanceCacheTTL
 	return e
@@ -149,11 +151,6 @@ func (e *Executor) execute(ctx context.Context, req OrderRequest) error {
 	log.Printf("[Executor] ── %s %s ────────────────────────────", req.Side, req.Symbol)
 	log.Printf("[Executor] entry=%.4f SL=%.4f TP=%.4f RR=%.2f conf=%.3f",
 		req.Entry, req.StopLoss, req.TakeProfit, req.RiskReward, req.Confidence)
-
-	if e.cfg.DryRun {
-		log.Printf("[Executor] DRY RUN — orders suppressed.")
-		return nil
-	}
 
 	// 1. Balance — [FIX-BAL-SPAM] pakai cache, skip fallback yang selalu gagal
 	freeUSDT, err := e.fetchFreeUSDT(ctx)

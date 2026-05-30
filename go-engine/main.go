@@ -108,7 +108,7 @@ func main() {
 	log.Printf("  TradeBot Go Orchestrator  v3.4")
 	log.Printf("  [FIX-VETO-1] EMA proxy threshold 1.10→2.0 (SELL) / 0.90→0.50 (BUY)")
 	log.Printf("  [FIX-VETO-2] High-confidence (>=0.65) bypass EMA veto")
-	log.Printf("  [FIX-DEDUP]  Failed order resets dedup timer (3s retry)")
+	log.Printf("  [FIX-DEDUP]  Order resets dedup timer (3s retry)")
 	log.Printf("  [FIX-MEXC]   Robust MEXC balance fetch with raw logging")
 	log.Printf("═══════════════════════════════════════════")
 
@@ -158,7 +158,6 @@ func main() {
 			APIKey:    apiKey,
 			APISecret: apiSecret,
 			Testnet:   testnet,
-			DryRun:    cfg.DryRun,
 			Leverage:  cfg.Leverage,
 			RiskPct:   cfg.RiskPct,
 		})
@@ -169,7 +168,6 @@ func main() {
 		orderExecutor = mexc.New(mexc.Config{
 			APIKey:    cfg.MexcAPIKey,
 			APISecret: cfg.MexcAPISecret,
-			DryRun:    cfg.DryRun,
 			Leverage:  cfg.Leverage,
 			RiskPct:   cfg.RiskPct,
 		})
@@ -177,28 +175,27 @@ func main() {
 		log.Fatalf("[main] Unknown exchange: %s", cfg.Exchange)
 	}
 
-	// ── Initial balance fetch ─────────────────────────────────────────────────
-	ctx := context.Background()
-	balance := 0.0
-	if !cfg.DryRun {
-		if b, err := fetchBalance(ctx, orderExecutor); err == nil {
-			balance = b
-			log.Printf("[main]   Exchange connected | exchange=%s mode=%s | free_USDT=%.2f",
-				cfg.Exchange, cfg.ExchangeMode, balance)
-		} else {
-			log.Printf("[main] API Auth Error: %v", err)
-			log.Printf("[main] ⚠ Cek API key di dashboard — bot jalan tapi order akan gagal sampai balance terbaca")
-			balance = 0.0
-		}
-	} else {
-		balance = 10000.0
-		log.Printf("[main]   DRY RUN | exchange=%s mode=%s | virtual_USDT=%.2f",
-			cfg.Exchange, cfg.ExchangeMode, balance)
-	}
-
 	// ── Gateway server ────────────────────────────────────────────────────────
 	srv := gateway.New(cfg.BaseDir)
 	go srv.Start()
+
+	// ── Initial balance fetch ─────────────────────────────────────────────────
+	ctx := context.Background()
+	balance := 0.0
+	if b, err := fetchBalance(ctx, orderExecutor, cfg, srv); err == nil {
+		balance = b
+		log.Printf("[main]   Exchange connected | exchange=%s mode=%s | free_USDT=%.2f",
+			cfg.Exchange, cfg.ExchangeMode, balance)
+	} else {
+		log.Printf("[main] ⚠️ Gagal fetch balance awal: %v", err)
+	}
+
+	// [FIX-BAL-DASH] Push initial balance to dashboard so it doesn't show --- while waiting for first signal
+	srv.UpdateInsight(gateway.InsightData{
+		Balance: balance,
+		Timestamp: time.Now().Format("15:04:05"),
+		Advice: "Menyiapkan mesin AI & menunggu data market pertama...",
+	})
 
 	// ── Market feed ───────────────────────────────────────────────────────────
 	feed := market.New(bridge, cfg.Symbol, cfg.OHLCVTF, cfg.OHLCVLimit)
@@ -272,12 +269,90 @@ func main() {
 			default:
 			}
 
-			if !srv.IsBotRunning() {
-				state := feed.State()
-				activeSym := state.Symbol
-				if activeSym == "" {
-					activeSym = cfg.Symbol
+			state := feed.State()
+			currentSym := state.Symbol
+			if currentSym == "" {
+				currentSym = cfg.Symbol
+			}
+
+			// ── Paper trade TP/SL check + timeout (Lakukan SEBELUM block sig & pause) ──
+			isDryRun := srv.IsDryRun()
+			if isDryRun && activePaperTrade != nil {
+				isClosed    := false
+				closeReason := ""
+				
+				if activePaperTrade.Symbol != "" && state.Symbol != "" && activePaperTrade.Symbol != state.Symbol {
+					activePaperTrade.Status = "CANCELLED_PAIR_SWITCH"
+					isClosed = true
+					closeReason = "User switched trading pair"
+				} else if activePaperTrade.Status == "PENDING" {
+					if (activePaperTrade.Side == "BUY" && state.Price <= activePaperTrade.LimitPrice) || 
+					   (activePaperTrade.Side == "SELL" && state.Price >= activePaperTrade.LimitPrice) {
+						activePaperTrade.Status = "OPEN"
+						activePaperTrade.EntryPrice = activePaperTrade.LimitPrice
+						log.Printf("[Paper] 📈 LIMIT Order KEJEMPUT! Status PENDING -> OPEN @ %.4f", activePaperTrade.EntryPrice)
+						srv.UpdatePositions(activePaperTrade, paperHistory)
+					} else if time.Since(paperTradeOpenedAt) > 30 * time.Minute {
+						activePaperTrade.Status = "CLOSED_TIMEOUT"
+						isClosed = true
+						closeReason = "Limit Order expired (30 min)"
+					}
 				}
+
+				if activePaperTrade.Status == "OPEN" {
+					unrealizedPct := 0.0
+					if activePaperTrade.Side == "BUY" {
+						unrealizedPct = ((state.Price - activePaperTrade.EntryPrice) / activePaperTrade.EntryPrice) * 100.0
+					} else if activePaperTrade.Side == "SELL" {
+						unrealizedPct = ((activePaperTrade.EntryPrice - state.Price) / activePaperTrade.EntryPrice) * 100.0
+					}
+					activePaperTrade.PnL = unrealizedPct * float64(cfg.Leverage)
+
+					if (activePaperTrade.Side == "BUY" && state.Price >= activePaperTrade.TakeProfit) ||
+						(activePaperTrade.Side == "SELL" && state.Price <= activePaperTrade.TakeProfit) {
+						activePaperTrade.Status = "CLOSED_TP"
+						isClosed    = true
+						closeReason = fmt.Sprintf("TP hit @ %.4f (target=%.4f)", state.Price, activePaperTrade.TakeProfit)
+					} else if (activePaperTrade.Side == "BUY" && state.Price <= activePaperTrade.StopLoss) ||
+						(activePaperTrade.Side == "SELL" && state.Price >= activePaperTrade.StopLoss) {
+						activePaperTrade.Status = "CLOSED_SL"
+						isClosed    = true
+						closeReason = fmt.Sprintf("SL hit @ %.4f (target=%.4f)", state.Price, activePaperTrade.StopLoss)
+					}
+
+					if !isClosed && time.Since(paperTradeOpenedAt) > MAX_PAPER_TRADE_DURATION {
+						activePaperTrade.Status = "TIMEOUT"
+						isClosed    = true
+						closeReason = fmt.Sprintf("TIMEOUT after %.0f min, price=%.4f",
+							time.Since(paperTradeOpenedAt).Minutes(), state.Price)
+					}
+				}
+
+				if isClosed {
+					log.Printf("[Paper] ✗ Trade Closed: %s | %s | PnL=%.2f%%",
+						activePaperTrade.Status, closeReason, activePaperTrade.PnL)
+					// Handle PnL for Virtual Balance
+					if isDryRun {
+						virtualBal := srv.GetVirtualBalance()
+						// Balikin margin + PnL (di mana PnL adalah persentase ROE)
+						profitUSD := activePaperTrade.Margin * (activePaperTrade.PnL / 100.0)
+						marginReturned := activePaperTrade.Margin + profitUSD
+						srv.SetVirtualBalance(virtualBal + marginReturned)
+					}
+
+					paperHistory = append([]gateway.Position{*activePaperTrade}, paperHistory...)
+					if len(paperHistory) > 50 {
+						paperHistory = paperHistory[:50]
+					}
+					activePaperTrade = nil
+					lastAction  = "WAIT"
+					lastActionAt = time.Now().Add(-getLastActionTimeout())
+				}
+
+				srv.UpdatePositions(activePaperTrade, paperHistory)
+			}
+
+			if !srv.IsBotRunning() {
 				lsr := state.LSR
 				if lsr < 1e-9 {
 					lsr = 1.0
@@ -287,7 +362,7 @@ func main() {
 					pct24h = math.Round((state.ATR14/state.Price)*100*10) / 10
 				}
 				srv.UpdateInsight(gateway.InsightData{
-					Symbol: activeSym, LastPrice: state.Price, OpenInterest: state.OI,
+					Symbol: currentSym, LastPrice: state.Price, OpenInterest: state.OI,
 					LSRVal: lsr, Pct24h: pct24h,
 					TrendState:   "MANUAL STOPPED — IDLE",
 					WhaleBias:    "NEUTRAL",
@@ -303,7 +378,7 @@ func main() {
 				continue
 			}
 
-			// ─── BOT RUNNING ──────────────────────────────────────────────────
+			// ─── BOT RUNNING (Signal dari Rust) ───────────────────────────────
 			sig := bridge.PollSignal(200 * time.Millisecond)
 			if sig == nil {
 				continue
@@ -313,59 +388,6 @@ func main() {
 				continue
 			}
 			lastRustSeq = uint64(sig.TsMs)
-
-			state := feed.State()
-			currentSym := state.Symbol
-			if currentSym == "" {
-				currentSym = cfg.Symbol
-			}
-
-			// ── Paper trade TP/SL check + timeout ────────────────────────────
-			if cfg.DryRun && activePaperTrade != nil {
-				isClosed    := false
-				closeReason := ""
-
-				unrealizedPct := 0.0
-				if activePaperTrade.Side == "BUY" {
-					unrealizedPct = ((state.Price - activePaperTrade.EntryPrice) / activePaperTrade.EntryPrice) * 100.0
-				} else if activePaperTrade.Side == "SELL" {
-					unrealizedPct = ((activePaperTrade.EntryPrice - state.Price) / activePaperTrade.EntryPrice) * 100.0
-				}
-				activePaperTrade.PnL = unrealizedPct * float64(cfg.Leverage)
-
-				if (activePaperTrade.Side == "BUY" && state.Price >= activePaperTrade.TakeProfit) ||
-					(activePaperTrade.Side == "SELL" && state.Price <= activePaperTrade.TakeProfit) {
-					activePaperTrade.Status = "CLOSED_TP"
-					isClosed    = true
-					closeReason = fmt.Sprintf("TP hit @ %.4f (target=%.4f)", state.Price, activePaperTrade.TakeProfit)
-				} else if (activePaperTrade.Side == "BUY" && state.Price <= activePaperTrade.StopLoss) ||
-					(activePaperTrade.Side == "SELL" && state.Price >= activePaperTrade.StopLoss) {
-					activePaperTrade.Status = "CLOSED_SL"
-					isClosed    = true
-					closeReason = fmt.Sprintf("SL hit @ %.4f (target=%.4f)", state.Price, activePaperTrade.StopLoss)
-				}
-
-				if !isClosed && time.Since(paperTradeOpenedAt) > MAX_PAPER_TRADE_DURATION {
-					activePaperTrade.Status = "TIMEOUT"
-					isClosed    = true
-					closeReason = fmt.Sprintf("TIMEOUT after %.0f min, price=%.4f",
-						time.Since(paperTradeOpenedAt).Minutes(), state.Price)
-				}
-
-				if isClosed {
-					log.Printf("[Paper] ✗ Trade Closed: %s | %s | PnL=%.2f%%",
-						activePaperTrade.Status, closeReason, activePaperTrade.PnL)
-					paperHistory = append([]gateway.Position{*activePaperTrade}, paperHistory...)
-					if len(paperHistory) > 50 {
-						paperHistory = paperHistory[:50]
-					}
-					activePaperTrade = nil
-					lastAction  = "WAIT"
-					lastActionAt = time.Now().Add(-getLastActionTimeout())
-				}
-
-				srv.UpdatePositions(activePaperTrade, paperHistory)
-			}
 
 			dirStr := []string{"WAIT", "BUY", "SELL"}[sig.Action]
 
@@ -378,18 +400,16 @@ func main() {
 				currentSym, dirStr, sig.Confidence, printEntry, printTP, printSL, sig.RiskReward, sig.Veto)
 
 			// Refresh balance
-			if !cfg.DryRun {
-				if b, err := fetchBalance(context.Background(), orderExecutor); err == nil {
-					balance = b
-				}
+			if b, err := fetchBalance(context.Background(), orderExecutor, cfg, srv); err == nil {
+				balance = b
 			}
 
 			updateInsight(srv, cfg, sig, balance, dirStr, feed)
 
 			if sig.Veto || dirStr == "WAIT" {
-				if sig.Veto {
-					log.Printf("[SKIP-VETO] %s", truncate(sig.VetoReason, 80))
-				}
+				// if sig.Veto {
+				// 	log.Printf("[SKIP-VETO] %s", truncate(sig.VetoReason, 80))
+				// }
 				lastAction = "WAIT"
 				continue
 			}
@@ -414,27 +434,24 @@ func main() {
 				continue
 			}
 
-			rrLimit := 1.2
+			rrLimit := 1.0
 			switch strings.ToLower(cfg.TradingStyle) {
 			case "scalping":
-				rrLimit = 0.8
+				rrLimit = 0.5
 			case "daytrading", "daytrade":
-				rrLimit = 1.0
+				rrLimit = 0.8
 			case "swing", "sniper":
-				rrLimit = 1.5
+				rrLimit = 1.0
 			}
 			if sig.RiskReward < rrLimit {
 				log.Printf("[SKIP-RR] RR=%.2f < %.2f (style=%s)", sig.RiskReward, rrLimit, cfg.TradingStyle)
 				continue
 			}
 
-			// [FIX-VETO-1+2] EMA proxy veto dengan threshold baru + high-conf bypass
-			if emaVetoReason := checkEMATrendVeto(feed, dirStr, sig.Confidence); emaVetoReason != "" {
-				log.Printf("[SKIP-EMA] %s", emaVetoReason)
-				continue
-			}
+			// Go engine tidak lagi memblokir via checkEMATrendVeto.
+			// Biarkan ConsensusEngine (Rust) yang menentukan EMA Veto (check_ema_trend_veto_v2).
 
-			if cfg.DryRun && activePaperTrade != nil {
+			if isDryRun && activePaperTrade != nil {
 				log.Printf("[SKIP-OPEN] Paper trade masih open: %s @ %.4f", activePaperTrade.Side, activePaperTrade.EntryPrice)
 				continue
 			}
@@ -445,20 +462,32 @@ func main() {
 			snapSig := *sig
 			snapDir := dirStr
 
-			if cfg.DryRun {
+			if isDryRun {
+				// Potong margin dari Virtual Balance
+				virtualBal := srv.GetVirtualBalance()
+				estimatedMargin := virtualBal * cfg.RiskPct
+				if virtualBal < estimatedMargin || estimatedMargin <= 0 {
+					log.Printf("[PAPER] Margin tidak cukup! Balance: %.2f, Butuh: %.2f", virtualBal, estimatedMargin)
+					continue
+				}
+				srv.SetVirtualBalance(virtualBal - estimatedMargin)
+
 				activePaperTrade = &gateway.Position{
+					Symbol:     cfg.Symbol,
 					Side:       snapDir,
-					EntryPrice: state.Price,
+					EntryPrice: state.Price, // Harga saat order ditaruh
+					LimitPrice: snapSig.Entry,
 					TakeProfit: snapSig.TakeProfit,
 					StopLoss:   snapSig.StopLoss,
 					Time:       time.Now().Format("15:04:05"),
-					Status:     "OPEN",
+					Status:     "PENDING",
 					PnL:        0.0,
+					Margin:     estimatedMargin,
 				}
 				paperTradeOpenedAt = time.Now()
 
-				log.Printf("[Paper] ✓ Virtual Order opened: %s %s @ %.4f",
-					snapDir, currentSym, state.Price)
+				log.Printf("[Paper] ✓ LIMIT Order placed: %s %s @ %.4f (Waiting for %.4f)",
+					snapDir, currentSym, state.Price, snapSig.Entry)
 				log.Printf("[Paper]   TP=%.4f SL=%.4f RR=%.2f conf=%.3f",
 					snapSig.TakeProfit, snapSig.StopLoss, snapSig.RiskReward, snapSig.Confidence)
 
@@ -494,6 +523,7 @@ func main() {
 	<-quit
 
 	log.Printf("[main] Shutdown signal received — closing...")
+	srv.RefundActiveMargin()
 	cancel()
 	srv.Stop()
 	time.Sleep(500 * time.Millisecond)
@@ -525,8 +555,8 @@ func checkEMATrendVeto(feed *market.Feed, direction string, confidence float64) 
 
 	// [FIX-VETO-2] High confidence signal — bypass veto entirely
 	// Rust brain 6-agent consensus lebih akurat dari LSR heuristic
-	if confidence >= 0.65 {
-		log.Printf("[EMA-PROXY] conf=%.3f >= 0.65 → bypass LSR veto (LSR=%.3f dir=%s)",
+	if confidence >= 0.35 {
+		log.Printf("[EMA-PROXY] conf=%.3f >= 0.35 → bypass LSR veto (LSR=%.3f dir=%s)",
 			confidence, lsr, direction)
 		return ""
 	}
@@ -566,8 +596,19 @@ func buildOrderRequest(sig shm.Signal, dir string, symbol string) interface{} {
 	}
 }
 
-func fetchBalance(ctx context.Context, exec orderExec) (float64, error) {
-	return exec.FetchFreeUSDT(ctx)
+func fetchBalance(ctx context.Context, exec orderExec, cfg Config, srv *gateway.Server) (float64, error) {
+	if srv.IsDryRun() {
+		return srv.GetVirtualBalance(), nil
+	}
+	// Fetch dari exchange via adapter khusus
+	// timeout khusus buat fetch
+	fetchCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+	b, err := exec.FetchFreeUSDT(fetchCtx)
+	if err != nil {
+		return 0, err
+	}
+	return b, nil
 }
 
 func updateInsight(srv *gateway.Server, cfg Config, sig *shm.Signal, balance float64, action string, feed *market.Feed) {
@@ -628,6 +669,7 @@ func updateInsight(srv *gateway.Server, cfg Config, sig *shm.Signal, balance flo
 		OpenInterest: state.OI,
 		LSRVal:       lsr,
 		Pct24h:       pct24h,
+		ATR:          state.ATR14,
 		TrendState:   trend,
 		WhaleBias:    bias,
 		SignalStatus: action,

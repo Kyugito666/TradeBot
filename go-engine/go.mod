@@ -1,4 +1,4 @@
-module tradebot/data-gateway
+module tradebot/go-engine
 
 go 1.26.3
 

@@ -108,17 +108,19 @@ type Feed struct {
 
 	// [FIX-F2] Channel untuk trigger WS reconnect saat symbol berubah.
 	// Buffer=1 agar UpdateSymbol() tidak block jika WS sedang reconnect.
-	symChangeCh chan struct{}
+	symChangeCh     chan struct{}
+	symChangeRestCh chan struct{}
 }
 
 // New membuat Feed baru. Symbol awal dari parameter, bisa diganti via UpdateSymbol().
 func New(bridge *shm.Bridge, symbol, ohlcvTF string, limit int) *Feed {
 	f := &Feed{
-		bridge:      bridge,
-		client:      &http.Client{Timeout: 10 * time.Second},
-		ohlcvTF:     ohlcvTF,
-		limit:       limit,
-		symChangeCh: make(chan struct{}, 1),
+		bridge:          bridge,
+		client:          &http.Client{Timeout: 10 * time.Second},
+		ohlcvTF:         ohlcvTF,
+		limit:           limit,
+		symChangeCh:     make(chan struct{}, 1),
+		symChangeRestCh: make(chan struct{}, 1),
 	}
 	// [FIX-F1] Init atomic symbol
 	f.atomicSymbol.Store(symbol)
@@ -166,6 +168,11 @@ func (f *Feed) UpdateSymbol(newSymbol string) {
 		log.Printf("[Feed] WS reconnect triggered for %s", newSymbol)
 	default:
 		// Channel sudah ada pending reconnect, tidak perlu kirim lagi
+	}
+
+	select {
+	case f.symChangeRestCh <- struct{}{}:
+	default:
 	}
 }
 
@@ -234,7 +241,7 @@ func (f *Feed) Run(ctx context.Context) {
 			select {
 			case <-ctx.Done():
 				return
-			case <-f.symChangeCh:
+			case <-f.symChangeRestCh:
 				newSym := f.getSymbol()
 				log.Printf("[Feed] Symbol changed to %s — refetching OHLCV+Aux", newSym)
 				// Fetch OHLCV untuk symbol baru
@@ -242,10 +249,10 @@ func (f *Feed) Run(ctx context.Context) {
 					log.Printf("[Feed] OHLCV fetch for new symbol %s failed: %v", newSym, err)
 				}
 				_ = f.fetchAux(newSym)
-				// Drain symChangeCh jika ada pesan duplikat
+				// Drain symChangeRestCh jika ada pesan duplikat
 				for {
 					select {
-					case <-f.symChangeCh:
+					case <-f.symChangeRestCh:
 					default:
 						goto drained
 					}
@@ -270,17 +277,25 @@ func (f *Feed) wsTickerLoop(ctx context.Context) {
 			return
 		default:
 		}
+		// Drain channel sebelum connect supaya tidak ada sinyal nyangkut yang langsung menutup koneksi baru
+		for {
+			select {
+			case <-f.symChangeCh:
+			default:
+				goto drainedWS
+			}
+		}
+	drainedWS:
+
 		// [FIX-F1] Baca symbol terbaru setiap reconnect
 		sym := f.getSymbol()
 		if err := f.wsConnect(ctx, sym); err != nil {
 			// [FIX-F2] Jika error karena symbol change, reconnect langsung (backoff=0)
-			select {
-			case <-f.symChangeCh:
+			if sym != f.getSymbol() {
 				// Symbol berubah saat WS connect — reconnect segera
 				log.Printf("[Feed] WS reconnecting for new symbol %s", f.getSymbol())
 				backoff = time.Second // reset backoff untuk symbol change
 				continue
-			default:
 			}
 			log.Printf("[Feed] WS error: %v — reconnect in %s", err, backoff)
 		}
@@ -335,11 +350,6 @@ func (f *Feed) wsConnect(ctx context.Context, symbol string) error {
 		case <-f.symChangeCh:
 			log.Printf("[Feed] Symbol change detected — closing WS for %s", symbol)
 			conn.Close() // trigger ReadMessage error → wsConnect return
-			// Kembalikan event ke channel agar wsTickerLoop bisa handle
-			select {
-			case f.symChangeCh <- struct{}{}:
-			default:
-			}
 		}
 	}()
 

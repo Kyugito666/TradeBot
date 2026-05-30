@@ -44,14 +44,12 @@ import (
 )
 
 const (
-	mexcBase   = "https://contract.mexc.com"
 	mexcRECVWN = "5000"
 )
 
 type Config struct {
 	APIKey    string
 	APISecret string
-	DryRun    bool
 	Leverage  int
 	RiskPct   float64
 }
@@ -69,21 +67,22 @@ type OrderRequest struct {
 type Executor struct {
 	cfg    Config
 	client *http.Client
+	base   string
 }
 
 func New(cfg Config) *Executor {
-	return &Executor{cfg: cfg, client: &http.Client{Timeout: 10 * time.Second}}
+	e := &Executor{
+		cfg:    cfg,
+		client: &http.Client{Timeout: 10 * time.Second},
+		base:   "https://contract.mexc.com",
+	}
+	return e
 }
 
 // execute is the internal typed entry point (lowercase — called by adapter.go).
 func (e *Executor) execute(ctx context.Context, req OrderRequest) error {
 	log.Printf("[MEXC] ── %s %s ────────────────────────", req.Side, req.Symbol)
 	log.Printf("[MEXC] entry=%.4f TP=%.4f SL=%.4f RR=%.2f", req.Entry, req.TakeProfit, req.StopLoss, req.RiskReward)
-
-	if e.cfg.DryRun {
-		log.Printf("[MEXC] DRY RUN — skipped")
-		return nil
-	}
 
 	freeUSDT, err := e.fetchBalance(ctx)
 	if err != nil {
@@ -330,11 +329,11 @@ func (e *Executor) signedPost(ctx context.Context, path string, body map[string]
 	raw := e.cfg.APIKey + ts + string(payload)
 	sign := signHMAC(raw, e.cfg.APISecret)
 
-	req, _ := http.NewRequestWithContext(ctx, "POST", mexcBase+path, bytes.NewReader(payload))
+	req, _ := http.NewRequestWithContext(ctx, "POST", e.base+path, bytes.NewReader(payload))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("ApiKey", e.cfg.APIKey)
-	req.Header.Set("Request-Time", ts)
 	req.Header.Set("Signature", sign)
+	req.Header.Set("Request-Time", ts)
 
 	resp, err := e.client.Do(req)
 	if err != nil {
@@ -348,7 +347,7 @@ func (e *Executor) signedGet(ctx context.Context, path, queryStr string) ([]byte
 	ts   := strconv.FormatInt(time.Now().UnixMilli(), 10)
 	sign := signHMAC(e.cfg.APIKey+ts+queryStr, e.cfg.APISecret)
 
-	url := mexcBase + path
+	url := e.base + path
 	if queryStr != "" {
 		url += "?" + queryStr
 	}

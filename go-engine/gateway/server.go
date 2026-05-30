@@ -32,6 +32,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -65,6 +66,7 @@ type InsightData struct {
 	OpenInterest float64 `json:"open_interest"`
 	LSRVal       float64 `json:"lsr_val"`
 	Pct24h       float64 `json:"pct_24h"`
+	ATR          float64 `json:"atr"`
 	TrendState   string  `json:"trend_state"`
 	WhaleBias    string  `json:"whale_bias"`
 	SignalStatus string  `json:"signal_status"`
@@ -84,13 +86,16 @@ type LogLine struct {
 }
 
 type Position struct {
+	Symbol     string  `json:"symbol"`
 	Side       string  `json:"side"`
 	EntryPrice float64 `json:"entry_price"`
+	LimitPrice float64 `json:"limit_price,omitempty"`
 	TakeProfit float64 `json:"take_profit"`
 	StopLoss   float64 `json:"stop_loss"`
 	Time       string  `json:"time"`
 	Status     string  `json:"status"`
 	PnL        float64 `json:"pnl"`
+	Margin     float64 `json:"margin"`
 }
 
 type Server struct {
@@ -105,7 +110,12 @@ type Server struct {
 	history   []Position
 
 	symbolCh  chan string
+	cfgMux    sync.RWMutex
 	activeCfg map[string]string
+
+	// Virtual Balance for Dry Run
+	virtualBalMux sync.RWMutex
+	virtualBal    float64
 }
 
 func New(baseDir string) *Server {
@@ -118,6 +128,12 @@ func New(baseDir string) *Server {
 		activeCfg: make(map[string]string),
 	}
 	s.botRunning.Store(false)
+
+	if b, err := os.ReadFile(filepath.Join(baseDir, "virtual_balance.txt")); err == nil {
+		if val, err := strconv.ParseFloat(string(b), 64); err == nil {
+			s.virtualBal = val
+		}
+	}
 
 	// ═══════════════════════════════════════════════════════════════════════
 	// [FIX-CLEAN-ENV] Bersihkan .env dari non-API-key settings SEBELUM seed activeCfg.
@@ -209,8 +225,8 @@ func (s *Server) sanitizeEnvFile(path string) {
 // ── [FIX-S4] writeRuntimeConfig ──────────────────────────────────────────────
 
 func (s *Server) writeRuntimeConfig() {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+	s.cfgMux.RLock()
+	defer s.cfgMux.RUnlock()
 	s.writeRuntimeConfigLocked()
 }
 
@@ -245,9 +261,15 @@ func (s *Server) GetSymbolCh() <-chan string {
 }
 
 func (s *Server) GetActiveSymbol() string {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+	s.cfgMux.RLock()
+	defer s.cfgMux.RUnlock()
 	return s.activeCfg["SYMBOL"]
+}
+
+func (s *Server) IsDryRun() bool {
+	s.cfgMux.RLock()
+	defer s.cfgMux.RUnlock()
+	return s.activeCfg["DRY_RUN"] == "1" || s.activeCfg["DRY_RUN"] == "true"
 }
 
 func (s *Server) UpdateInsight(d InsightData) {
@@ -257,6 +279,19 @@ func (s *Server) UpdateInsight(d InsightData) {
 	if b, err := json.Marshal(d); err == nil {
 		_ = os.WriteFile(filepath.Join(s.baseDir, InsightFile), b, 0o644)
 	}
+}
+
+func (s *Server) GetVirtualBalance() float64 {
+	s.virtualBalMux.RLock()
+	defer s.virtualBalMux.RUnlock()
+	return s.virtualBal
+}
+
+func (s *Server) SetVirtualBalance(b float64) {
+	s.virtualBalMux.Lock()
+	s.virtualBal = b
+	s.virtualBalMux.Unlock()
+	os.WriteFile(filepath.Join(s.baseDir, "virtual_balance.txt"), []byte(fmt.Sprintf("%f", b)), 0o644)
 }
 
 func (s *Server) UpdatePositions(active *Position, hist []Position) {
@@ -272,6 +307,24 @@ func (s *Server) UpdatePositions(active *Position, hist []Position) {
 	copy(s.history, hist)
 }
 
+func (s *Server) RefundActiveMargin() {
+	s.mu.Lock()
+	active := s.activePos
+	s.mu.Unlock()
+	
+	if active != nil && s.IsDryRun() {
+		profitUSD := active.Margin * (active.PnL / 100.0)
+		marginReturned := active.Margin + profitUSD
+		newBal := s.GetVirtualBalance() + marginReturned
+		s.SetVirtualBalance(newBal)
+		log.Printf("[Server] Refunded %.2f margin+PnL to Virtual Balance during shutdown.", marginReturned)
+		
+		s.mu.Lock()
+		s.activePos = nil
+		s.mu.Unlock()
+	}
+}
+
 func (s *Server) IsBotRunning() bool {
 	return s.botRunning.Load()
 }
@@ -283,6 +336,9 @@ func (s *Server) Start() {
 	mux.Handle("/dashboard.css", s.staticFile("dashboard.css"))
 	mux.Handle("/dashboard.js", s.staticFile("dashboard.js"))
 	mux.Handle("/lw-charts.js", s.staticFile("static/lw-charts.js"))
+	mux.HandleFunc("/favicon.ico", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	})
 
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/" || r.URL.Path == "/dashboard.html" {
@@ -294,6 +350,7 @@ func (s *Server) Start() {
 
 	mux.HandleFunc("/api/insight", s.handleInsight)
 	mux.HandleFunc("/api/positions", s.handlePositions)
+	mux.HandleFunc("/api/virtual/inject", s.handleVirtualInject)
 	mux.HandleFunc("/api/logs", s.handleLogs)
 	mux.HandleFunc("/api/status", s.handleStatus)
 	mux.HandleFunc("/api/get-env", s.handleGetEnv)
@@ -301,6 +358,7 @@ func (s *Server) Start() {
 	mux.HandleFunc("/api/start", s.handleStart)
 	mux.HandleFunc("/api/stop", s.handleStop)
 	mux.HandleFunc("/api/clear-logs", s.handleClearLogs)
+	mux.HandleFunc("/api/proxy/tickers", s.handleTickers)
 
 	addr := fmt.Sprintf(":%d", Port)
 	log.Printf("[Gateway] Dashboard: http://localhost%s", addr)
@@ -329,9 +387,14 @@ func (s *Server) Stop() {
 
 func (s *Server) handleInsight(w http.ResponseWriter, r *http.Request) {
 	s.mu.RLock()
-	d := s.insight
+	data := s.insight
 	s.mu.RUnlock()
-	s.jsonOK(w, d)
+
+	if s.IsDryRun() {
+		data.Balance = s.GetVirtualBalance()
+	}
+
+	s.jsonOK(w, data)
 }
 
 func (s *Server) handlePositions(w http.ResponseWriter, r *http.Request) {
@@ -386,13 +449,13 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 // handleGetEnv — [FIX-S3] merge .env (API keys only) + in-memory activeCfg
 func (s *Server) handleGetEnv(w http.ResponseWriter, r *http.Request) {
 	env := parseEnvFile(filepath.Join(s.baseDir, EnvFile))
-	s.mu.RLock()
+	s.cfgMux.RLock()
 	for k, v := range s.activeCfg {
 		if v != "" {
 			env[k] = v
 		}
 	}
-	s.mu.RUnlock()
+	s.cfgMux.RUnlock()
 	s.jsonOK(w, map[string]interface{}{"env": env})
 }
 
@@ -414,7 +477,7 @@ func (s *Server) handleSaveEnv(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	s.mu.Lock()
+	s.cfgMux.Lock()
 	oldSym := s.activeCfg["SYMBOL"]
 	for k, v := range data {
 		if !apiKeyNames[k] && v != "" {
@@ -422,7 +485,7 @@ func (s *Server) handleSaveEnv(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	newSym := s.activeCfg["SYMBOL"]
-	s.mu.Unlock()
+	s.cfgMux.Unlock()
 
 	s.writeRuntimeConfig()
 
@@ -477,14 +540,14 @@ func (s *Server) handleStart(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if incomingCfg != nil {
-		s.mu.Lock()
+		s.cfgMux.Lock()
 		for k, v := range incomingCfg {
 			if !apiKeyNames[k] && v != "" {
 				s.activeCfg[k] = v
 			}
 		}
 		newSym := s.activeCfg["SYMBOL"]
-		s.mu.Unlock()
+		s.cfgMux.Unlock()
 
 		s.writeRuntimeConfig()
 
@@ -536,13 +599,13 @@ func (s *Server) handleStart(w http.ResponseWriter, r *http.Request) {
 	log.Printf("[Gateway] Engine START — pair=%s mode=%s dry=%s",
 		s.GetActiveSymbol(),
 		func() string {
-			s.mu.RLock()
-			defer s.mu.RUnlock()
+			s.cfgMux.RLock()
+			defer s.cfgMux.RUnlock()
 			return s.activeCfg["EXCHANGE_MODE"]
 		}(),
 		func() string {
-			s.mu.RLock()
-			defer s.mu.RUnlock()
+			s.cfgMux.RLock()
+			defer s.cfgMux.RUnlock()
 			return s.activeCfg["DRY_RUN"]
 		}(),
 	)
@@ -575,14 +638,51 @@ func (s *Server) staticFile(name string) http.Handler {
 }
 
 func (s *Server) jsonOK(w http.ResponseWriter, v interface{}) {
-	b, _ := json.Marshal(v)
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Access-Control-Allow-Origin", "*")
-	w.Write(b)
+	json.NewEncoder(w).Encode(v)
+}
+
+func (s *Server) handleVirtualInject(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	if r.Method == http.MethodOptions {
+		w.Header().Set("Access-Control-Allow-Methods", "POST")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+		return
+	}
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req struct {
+		Amount float64 `json:"amount"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "Bad Request", http.StatusBadRequest)
+		return
+	}
+
+	s.virtualBalMux.RLock()
+	currentBal := s.virtualBal
+	s.virtualBalMux.RUnlock()
+	
+	newBal := currentBal + req.Amount
+	if newBal < 0 {
+		newBal = 0
+	}
+	s.SetVirtualBalance(newBal)
+	
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"success": true,
+		"balance": newBal,
+	})
 }
 
 func (s *Server) jsonErr(w http.ResponseWriter, msg string) {
 	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Access-Control-Allow-Origin", "*")
 	w.WriteHeader(500)
 	b, _ := json.Marshal(map[string]string{"ok": "false", "message": msg})
 	w.Write(b)
@@ -689,4 +789,25 @@ func parseEnvFile(path string) map[string]string {
 		m[k] = v
 	}
 	return m
+}
+
+// [FIX-ISP] Proxy agar dashboard tidak kena blokir CORS / ISP saat fetch Live PnL
+func (s *Server) handleTickers(w http.ResponseWriter, r *http.Request) {
+	syms := r.URL.Query().Get("symbol")
+	var url string
+	// Bybit v5 tickers endpoint ONLY accepts a single symbol.
+	// If multiple symbols are requested (contains comma) or none, fetch all symbols.
+	if syms != "" && !strings.Contains(syms, ",") {
+		url = "https://api.bytick.com/v5/market/tickers?category=linear&symbol=" + syms
+	} else {
+		url = "https://api.bytick.com/v5/market/tickers?category=linear"
+	}
+	resp, err := http.Get(url)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	defer resp.Body.Close()
+	w.Header().Set("Content-Type", "application/json")
+	io.Copy(w, resp.Body)
 }

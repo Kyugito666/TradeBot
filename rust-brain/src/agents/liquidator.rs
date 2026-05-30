@@ -68,18 +68,39 @@ impl Agent for LiquidatorAgent {
             .filter(|(p, _)| *p < current && (current - *p) < atr * 2.0)
             .min_by(|a, b| (current - a.0).partial_cmp(&(current - b.0)).unwrap());
 
+        // ── Evaluate directional magnet based on proximity and density ────────
         let (dir, conv, detail) = match (nearest_above, nearest_below) {
-            (Some(&(ap, aw)), _) => {
+            (Some(&(ap, aw)), Some(&(bp, bw))) => {
+                let dist_above = ap - current;
+                let dist_below = current - bp;
+                let density_above = (aw / oi_usd).min(1.0);
+                let density_below = (bw / oi_usd).min(1.0);
+
+                // Score = density / distance (higher is a stronger magnet)
+                let score_above = density_above / dist_above.max(1e-8);
+                let score_below = density_below / dist_below.max(1e-8);
+
+                if score_above > score_below * 1.2 {
+                    (Direction::Buy, density_above,
+                     format!("SHORT_cluster above @ {:.2} (dist={:.2} ATR={:.4} score={:.4})", ap, dist_above, atr, score_above))
+                } else if score_below > score_above * 1.2 {
+                    (Direction::Sell, density_below,
+                     format!("LONG_cluster below @ {:.2} (dist={:.2} ATR={:.4} score={:.4})", bp, dist_below, atr, score_below))
+                } else {
+                    (Direction::Wait, 0.0, "clusters above and below are balanced".into())
+                }
+            }
+            (Some(&(ap, aw)), None) => {
                 let density = (aw / oi_usd).min(1.0);
                 (Direction::Buy, density,
-                 format!("SHORT_cluster above @ {ap:.2} (dist={:.2} ATR={:.4})", ap-current, atr))
+                 format!("SHORT_cluster above @ {:.2} (dist={:.2} ATR={:.4})", ap, ap - current, atr))
             }
             (None, Some(&(bp, bw))) => {
                 let density = (bw / oi_usd).min(1.0);
                 (Direction::Sell, density,
-                 format!("LONG_cluster below @ {bp:.2} (dist={:.2} ATR={:.4})", current-bp, atr))
+                 format!("LONG_cluster below @ {:.2} (dist={:.2} ATR={:.4})", bp, current - bp, atr))
             }
-            _ => (Direction::Wait, 0.0, "no cluster in ATR×2 radius".into()),
+            (None, None) => (Direction::Wait, 0.0, "no cluster in ATR×2 radius".into()),
         };
 
         AgentVote {

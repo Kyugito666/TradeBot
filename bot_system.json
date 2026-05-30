@@ -1,0 +1,9 @@
+{
+    "timestamp": "2026-05-23T01:18:29.230030+00:00",
+    "status": "ANALYSIS_COMPLETE",
+    "data": {
+        "status": "skipped",
+        "action": "WAIT",
+        "reason": "VETO TRIGGERED: Physicist mendeteksi False Breakout (Wick penolakan ekstrem)."
+    }
+}

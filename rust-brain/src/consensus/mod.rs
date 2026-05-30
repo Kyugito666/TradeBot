@@ -9,14 +9,20 @@
 use crate::agents::{AgentVote, Direction};
 use crate::shm::{MarketSnapshot, SignalOutput, AGENT_COUNT};
 use chrono::Utc;
+use std::collections::HashMap;
+use std::sync::Mutex;
+use std::fs;
 
-const WEIGHTS: [(&str, f64); AGENT_COUNT] = [
-    ("mathematician", 0.28),
-    ("physicist",     0.22),
-    ("cryptographer", 0.20),
-    ("linguist",      0.12),
-    ("liquidator",    0.08),
+const WEIGHTS: [(&str, f64); 9] = [
+    ("mathematician", 0.25),
+    ("physicist",     0.20),
+    ("cryptographer", 0.15),
+    ("linguist",      0.10),
+    ("liquidator",    0.10),
     ("absurdist",     0.10),
+    ("game_theorist", 0.15),
+    ("economist",     0.15),
+    ("data_engineer", 0.0), // gatekeeper, no weight
 ];
 
 const ABSURDIST_DAMP: f64 = 0.30;
@@ -55,40 +61,40 @@ fn make_style_config(style_name: &str) -> StyleConfig {
     match style_name {
         "scalping" => StyleConfig {
             style_name:     style_name.to_string(),
-            min_confidence: 0.12,   // [FIX-CONF-SCALP] was 0.18
-            min_agree:      2,
-            tp_atr_mult:    1.0,
-            sl_atr_mult:    0.6,
-            noise_veto:     0.93,   // [FIX-NOISE-SCALP] was 0.82 → veto terus (noise=0.860)
-            min_rr:         0.8,    // [FIX-CONF-SCALP] was 1.2
+            min_confidence: 0.20,   // increased to 0.35 to reduce false signals -> Relaxed to 0.20 for more signals
+            min_agree:      1,      // was 2, relaxed to 1
+            tp_atr_mult:    1.2,    // increased TP distance -> Relaxed to 1.2
+            sl_atr_mult:    1.0,    // wider SL to avoid stop hunts
+            noise_veto:     1.50,   // stricter noise threshold -> Relaxed to 1.50
+            min_rr:         1.0,    // was 1.2
         },
         "daytrading" | "daytrade" | "day" => StyleConfig {
             style_name:     style_name.to_string(),
-            min_confidence: 0.32,
-            min_agree:      3,
-            tp_atr_mult:    2.2,
+            min_confidence: 0.25,
+            min_agree:      2,
+            tp_atr_mult:    2.0,
             sl_atr_mult:    1.2,
-            noise_veto:     0.78,   // [FIX-NOISE-DAY] was 0.68
-            min_rr:         1.3,
+            noise_veto:     1.20,   // [FIX-NOISE-DAY] was 0.78, relaxed to 1.20
+            min_rr:         1.2,
         },
         "swing" | "sniper" | "sniper_swing" => StyleConfig {
             style_name:     style_name.to_string(),
-            min_confidence: 0.45,
-            min_agree:      3,
-            tp_atr_mult:    3.5,
+            min_confidence: 0.30,
+            min_agree:      2,
+            tp_atr_mult:    3.0,
             sl_atr_mult:    1.5,
-            noise_veto:     0.65,   // [FIX-NOISE-SWING] was 0.55
-            min_rr:         1.8,
+            noise_veto:     1.00,   // [FIX-NOISE-SWING] was 0.65, relaxed to 1.00
+            min_rr:         1.5,
         },
         _ => {
             log::warn!("[Consensus] Unknown TRADING_STYLE='{style_name}', using scalping defaults");
             StyleConfig {
                 style_name:     style_name.to_string(),
                 min_confidence: 0.12,
-                min_agree:      2,
+                min_agree:      1,
                 tp_atr_mult:    1.0,
                 sl_atr_mult:    0.6,
-                noise_veto:     0.90,
+                noise_veto:     1.50,
                 min_rr:         0.8,
             }
         }
@@ -120,16 +126,114 @@ fn ema_alignment(snap: &MarketSnapshot) -> (f64, f64, f64, bool, bool) {
 }
 
 #[derive(Debug)]
-enum EmaVetoResult {
+enum QuantVetoResult {
+    Clear,
     Hard(String),
     Soft(f64),
-    Clear,
 }
 
-pub struct ConsensusEngine;
+#[derive(Debug, Clone)]
+struct ActiveTrade {
+    entry_price: f64,
+    tp: f64,
+    sl: f64,
+    direction: Direction,
+    agent_votes: Vec<(String, Direction, f64)>, // (agent_name, vote, conviction)
+    status: String, // "PENDING" or "OPEN"
+}
+
+pub struct ConsensusEngine {
+    active_trade: Mutex<Option<ActiveTrade>>,
+    weights: Mutex<HashMap<String, f64>>,
+}
 
 impl ConsensusEngine {
+    pub fn new() -> Self {
+        let mut initial_weights = HashMap::new();
+        for (name, w) in WEIGHTS.iter() {
+            initial_weights.insert(name.to_string(), *w);
+        }
+        
+        // Coba load dari file RL
+        if let Ok(data) = fs::read_to_string("agent_rl_weights.json") {
+            if let Ok(parsed) = serde_json::from_str::<HashMap<String, f64>>(&data) {
+                log::info!("[Consensus] Loaded self-learning RL weights from file.");
+                initial_weights = parsed;
+            }
+        }
+        
+        Self {
+            active_trade: Mutex::new(None),
+            weights: Mutex::new(initial_weights),
+        }
+    }
+    
+    fn update_rl_weights(&self, trade: &ActiveTrade, is_win: bool) {
+        let mut w_lock = self.weights.lock().unwrap();
+        for (agent, vote_dir, conv) in &trade.agent_votes {
+            if *vote_dir == Direction::Wait { continue; }
+            let is_agent_correct = *vote_dir == trade.direction;
+            let current = w_lock.get(agent).copied().unwrap_or(0.1);
+            
+            // Learning rate = 0.05 * conviction
+            let lr = 0.05 * conv;
+            let mut new_w = current;
+            
+            if is_win && is_agent_correct {
+                new_w += lr; // Reward
+            } else if !is_win && is_agent_correct {
+                new_w -= lr * 1.5; // Punish (loss)
+            } else if is_win && !is_agent_correct {
+                new_w -= lr * 0.5; // Punish slightly for doubting a win
+            } else if !is_win && !is_agent_correct {
+                new_w += lr * 0.5; // Reward slightly for dodging a loss
+            }
+            
+            w_lock.insert(agent.clone(), new_w.clamp(0.01, 1.0));
+        }
+        
+        // Simpan ke file
+        if let Ok(json) = serde_json::to_string_pretty(&*w_lock) {
+            let _ = fs::write("agent_rl_weights.json", json);
+        }
+    }
+
     pub fn evaluate(&self, votes: &[AgentVote], snap: &MarketSnapshot) -> SignalOutput {
+        // Cek trade yang sedang berjalan untuk feedback RL (Self-Learning)
+        let price = snap.price;
+        let mut trade_finished = false;
+        let mut is_win = false;
+        
+        {
+            let mut trade_lock = self.active_trade.lock().unwrap();
+            if let Some(trade) = trade_lock.as_mut() {
+                if trade.status == "PENDING" {
+                    if (trade.direction == Direction::Buy && price <= trade.entry_price) ||
+                       (trade.direction == Direction::Sell && price >= trade.entry_price) {
+                        trade.status = "OPEN".to_string();
+                        log::info!("[RL-Brain] Limit Order Kejemput! Status PENDING -> OPEN @ {}", trade.entry_price);
+                    }
+                } else if trade.status == "OPEN" {
+                    if trade.direction == Direction::Buy {
+                        if price >= trade.tp { trade_finished = true; is_win = true; }
+                        else if price <= trade.sl { trade_finished = true; is_win = false; }
+                    } else if trade.direction == Direction::Sell {
+                        if price <= trade.tp { trade_finished = true; is_win = true; }
+                        else if price >= trade.sl { trade_finished = true; is_win = false; }
+                    }
+                }
+                
+                if trade_finished {
+                    log::info!("[RL-Brain] Trade concluded. Win={}, updating agent weights!", is_win);
+                    let t = trade.clone();
+                    drop(trade_lock); // release lock sebelum update
+                    self.update_rl_weights(&t, is_win);
+                    let mut lock2 = self.active_trade.lock().unwrap();
+                    *lock2 = None;
+                }
+            }
+        }
+        
         let ts_ms = Utc::now().timestamp_millis();
 
         let style_name = read_trading_style();
@@ -140,7 +244,7 @@ impl ConsensusEngine {
         let (ema9, ema21, ema50, ema_bear, ema_bull) = ema_alignment(snap);
 
         if let Some(reason) = self.check_veto(votes, &cfg) {
-            log::warn!("[Consensus] VETO: {reason}");
+            log::warn!("[Otak-AI] BATAL: {reason}");
             return self.make_wait(votes, reason, ts_ms);
         }
 
@@ -170,7 +274,7 @@ impl ConsensusEngine {
         if active_w > 0.05 {
             score /= active_w;
         } else {
-            return self.make_wait(votes, "No active agent opinions".to_string(), ts_ms);
+            return self.make_wait(votes, "Tim agen lagi buntu / Pada diem nunggu momen".to_string(), ts_ms);
         }
 
         let gbm_bias = extract_gbm_bias(votes);
@@ -193,18 +297,18 @@ impl ConsensusEngine {
         let strong_consensus = (tentative_action == Direction::Buy  && buy_count  >= 4)
                             || (tentative_action == Direction::Sell && sell_count >= 4);
 
-        let ema_veto = self.check_ema_trend_veto_v2(
-            tentative_action, snap.price, ema9, ema21, ema50, ema_bear, ema_bull,
+        let quant_veto = self.check_quant_veto(
+            tentative_action, snap,
         );
 
-        let action = match ema_veto {
-            EmaVetoResult::Hard(ref reason) => {
-                log::warn!("[Consensus] HARD EMA VETO: {reason}");
+        let action = match quant_veto {
+            QuantVetoResult::Hard(ref reason) => {
+                log::warn!("[Consensus] QUANT VETO: {reason}");
                 return self.make_wait(votes, reason.clone(), ts_ms);
             }
-            EmaVetoResult::Soft(multiplier) => {
+            QuantVetoResult::Soft(multiplier) => {
                 if strong_consensus {
-                    log::info!("[Consensus] Strong consensus override EMA soft veto");
+                    log::info!("[Otak-AI] Sinyal kuat dari agen, tembus aja Quant filter!");
                     tentative_action
                 } else {
                     confidence *= multiplier;
@@ -213,13 +317,13 @@ impl ConsensusEngine {
                     } else {
                         return self.make_wait(
                             votes,
-                            format!("EMA soft conflict: post-penalty conf={:.3} < min={:.3}", confidence, cfg.min_confidence),
+                            format!("Kurang yakin bos, ngeri ngelawan trend EMA (Yakin: {:.3} < Minimal: {:.3})", confidence, cfg.min_confidence),
                             ts_ms,
                         );
                     }
                 }
             }
-            EmaVetoResult::Clear => tentative_action,
+            QuantVetoResult::Clear => tentative_action,
         };
 
         let raw_atr = snap.atr_14;
@@ -229,17 +333,17 @@ impl ConsensusEngine {
 
         let (entry, tp, sl) = match action {
             Direction::Buy => {
-                let e = price;
-                let s = price - atr * cfg.sl_atr_mult;
-                let t = liq_tp_above(snap, price, atr, cfg.tp_atr_mult * 1.5)
-                    .unwrap_or(price + atr * cfg.tp_atr_mult);
+                let e = price - atr * 0.3; // Nunggu pullback 0.3 ATR (Support)
+                let s = e - atr * cfg.sl_atr_mult;
+                let t = liq_tp_above(snap, e, atr, cfg.tp_atr_mult * 1.5)
+                    .unwrap_or(e + atr * cfg.tp_atr_mult);
                 (e, t.max(e + atr * cfg.tp_atr_mult), s)
             }
             Direction::Sell => {
-                let e = price;
-                let s = price + atr * cfg.sl_atr_mult;
-                let t = liq_tp_below(snap, price, atr, cfg.tp_atr_mult * 1.5)
-                    .unwrap_or(price - atr * cfg.tp_atr_mult);
+                let e = price + atr * 0.3; // Nunggu pullback 0.3 ATR (Resistance)
+                let s = e + atr * cfg.sl_atr_mult;
+                let t = liq_tp_below(snap, e, atr, cfg.tp_atr_mult * 1.5)
+                    .unwrap_or(e - atr * cfg.tp_atr_mult);
                 (e, t.min(e - atr * cfg.tp_atr_mult), s)
             }
             Direction::Wait => (price, price, price),
@@ -250,8 +354,8 @@ impl ConsensusEngine {
         let rr      = tp_dist / sl_dist;
 
         if matches!(action, Direction::Buy | Direction::Sell) && rr < cfg.min_rr {
-            let reason = format!("RR={:.2} < min_rr={:.2}", rr, cfg.min_rr);
-            log::warn!("[Consensus] {reason}");
+            let reason = format!("Untungnya kekecilan, mending gausah (RR={:.2} < minimal {:.2})", rr, cfg.min_rr);
+            log::warn!("[Otak-AI] {reason}");
             return self.make_wait(votes, reason, ts_ms);
         }
 
@@ -263,11 +367,11 @@ impl ConsensusEngine {
         }
 
         log::info!(
-            "[Consensus] {:?} conf={:.3} BUY={buy_count} SELL={sell_count} score={score:.3} RR={rr:.2} style={} EMA=({:.2},{:.2},{:.2}) bear={ema_bear} bull={ema_bull}",
+            "[Otak-AI] Hasil Rapat: {:?} yakin={:.3} BUY={buy_count} SELL={sell_count} score={score:.3} RR={rr:.2} style={} EMA=({:.2},{:.2},{:.2}) bear={ema_bear} bull={ema_bull}",
             action, confidence, cfg.style_name, ema9, ema21, ema50
         );
 
-        SignalOutput {
+        let sig = SignalOutput {
             action,
             confidence,
             entry,
@@ -279,46 +383,52 @@ impl ConsensusEngine {
             agent_dirs,
             agent_convictions,
             ts_ms,
+        };
+        
+        // Daftarkan trade baru ke tracker RL jika bukan wait
+        if action != Direction::Wait {
+            let mut agent_votes = Vec::new();
+            for v in votes {
+                agent_votes.push((v.agent.to_string(), v.direction, v.conviction));
+            }
+            let trade = ActiveTrade {
+                entry_price: entry, tp, sl, direction: action, agent_votes, status: "PENDING".to_string()
+            };
+            *self.active_trade.lock().unwrap() = Some(trade);
         }
+        
+        sig
     }
 
-    fn check_ema_trend_veto_v2(
-        &self, action: Direction, price: f64,
-        ema9: f64, ema21: f64, ema50: f64, ema_bear: bool, ema_bull: bool,
-    ) -> EmaVetoResult {
+    fn check_quant_veto(&self, action: Direction, snap: &MarketSnapshot) -> QuantVetoResult {
         match action {
             Direction::Buy => {
-                if ema_bear {
-                    if price < ema50 * 0.975 {
-                        EmaVetoResult::Hard(format!(
-                            "BUY HARD blocked: EMA bear-align + price {:.4} far below EMA50 {:.4}",
-                            price, ema50 * 0.975
-                        ))
-                    } else if price < ema50 {
-                        EmaVetoResult::Soft(0.60)
-                    } else { EmaVetoResult::Clear }
-                } else { EmaVetoResult::Clear }
+                if snap.lsr > 2.5 {
+                    QuantVetoResult::Hard(format!("VETO BUY: Market terlalu berat ke Long (LSR={:.2}). Rawan Liquidation Squeeze!", snap.lsr))
+                } else if snap.funding_rate > 0.001 {
+                    QuantVetoResult::Hard(format!("VETO BUY: Funding Rate terlalu tinggi ({:.4}). Cost of carry mahal!", snap.funding_rate))
+                } else { QuantVetoResult::Clear }
             }
             Direction::Sell => {
-                if ema_bull {
-                    if price > ema50 * 1.025 {
-                        EmaVetoResult::Hard(format!(
-                            "SELL HARD blocked: EMA bull-align + price {:.4} far above EMA50 {:.4}",
-                            price, ema50 * 1.025
-                        ))
-                    } else if price > ema50 {
-                        EmaVetoResult::Soft(0.60)
-                    } else { EmaVetoResult::Clear }
-                } else { EmaVetoResult::Clear }
+                if snap.lsr > 0.0 && snap.lsr < 0.5 {
+                    QuantVetoResult::Hard(format!("VETO SELL: Market terlalu berat ke Short (LSR={:.2}). Rawan Short Squeeze!", snap.lsr))
+                } else if snap.funding_rate < -0.001 {
+                    QuantVetoResult::Hard(format!("VETO SELL: Funding Rate negatif ekstrim ({:.4}). Cost of carry mahal!", snap.funding_rate))
+                } else { QuantVetoResult::Clear }
             }
-            Direction::Wait => EmaVetoResult::Clear,
+            Direction::Wait => QuantVetoResult::Clear,
         }
     }
 
     fn calc_effective_weights(
         &self, votes: &[AgentVote], snap: &MarketSnapshot, ema_bear: bool, ema_bull: bool,
     ) -> Vec<(&'static str, f64)> {
-        let mut ew: Vec<(&'static str, f64)> = WEIGHTS.iter().map(|&(n, w)| (n, w)).collect();
+        let w_lock = self.weights.lock().unwrap();
+        // Fallback untuk agen yang belum ada di map
+        let mut ew: Vec<(&'static str, f64)> = votes.iter()
+            .map(|v| (v.agent, w_lock.get(v.agent).copied().unwrap_or(0.1)))
+            .collect();
+            
         for (name, weight) in ew.iter_mut() {
             match *name {
                 "absurdist" => {
@@ -338,6 +448,11 @@ impl ConsensusEngine {
     }
 
     fn check_veto(&self, votes: &[AgentVote], cfg: &StyleConfig) -> Option<String> {
+        if let Some(v) = votes.iter().find(|v| v.agent == "data_engineer") {
+            if v.reasoning.contains("Blocking execution") {
+                return Some(v.reasoning.clone());
+            }
+        }
         if let Some(v) = votes.iter().find(|v| v.agent == "physicist") {
             if v.reasoning.contains("VOLATILITY CRISIS") {
                 return Some(v.reasoning.clone());
@@ -346,11 +461,11 @@ impl ConsensusEngine {
         if let Some(v) = votes.iter().find(|v| v.agent == "mathematician") {
             if let Some(noise) = parse_f64_field(&v.reasoning, "noise=") {
                 if noise > cfg.noise_veto {
-                    return Some(format!("Market noise {noise:.3} > threshold {:.2}", cfg.noise_veto));
+                    return Some(format!("Market lagi choppy/berisik banget nih ({noise:.3} > bates {:.2})", cfg.noise_veto));
                 }
             }
             if v.reasoning.contains("anomaly=true") {
-                return Some("Mathematical anomaly detected (|Z| > 4σ)".into());
+                return Some("Ada pergerakan aneh ga ngotak nih (|Z| > 4σ), hold dulu!".into());
             }
         }
         None

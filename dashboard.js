@@ -54,15 +54,54 @@ function _trackAISignalOutcomes(forcePrice) {
     if (!_aiSignalHistory.length || !price) return;
     let changed = false;
     _aiSignalHistory = _aiSignalHistory.map(sig => {
-        if (sig.status !== 'OPEN') return sig;
+        if (sig.status === 'WIN' || sig.status === 'LOSS') return sig;
+        
+        // [FIX-AI-SIGNAL] Hanya update signal yang symbol-nya sesuai dengan harga saat ini
+        const currentLiveSym = (typeof _getLiveSymbol === 'function') ? _getLiveSymbol() : '';
+        if (sig.symbol !== currentLiveSym) return sig;
+
         const updated = { ...sig };
-        if (sig.direction === 'LONG') {
-            if (price >= sig.tp) { updated.status = 'WIN'; updated.pnl = '+' + ((sig.tp - sig.entry) / sig.entry * 100).toFixed(2) + '%'; updated.closeTime = new Date().toLocaleTimeString(); changed = true; }
-            else if (price <= sig.sl) { updated.status = 'LOSS'; updated.pnl = ((sig.sl - sig.entry) / sig.entry * 100).toFixed(2) + '%'; updated.closeTime = new Date().toLocaleTimeString(); changed = true; }
-        } else {
-            if (price <= sig.tp) { updated.status = 'WIN'; updated.pnl = '+' + ((sig.entry - sig.tp) / sig.entry * 100).toFixed(2) + '%'; updated.closeTime = new Date().toLocaleTimeString(); changed = true; }
-            else if (price >= sig.sl) { updated.status = 'LOSS'; updated.pnl = ((sig.entry - sig.sl) / sig.entry * 100).toFixed(2) + '%'; updated.closeTime = new Date().toLocaleTimeString(); changed = true; }
+        const exchange = document.getElementById('cfg-exchange').value || 'mexc';
+        const activeSym = document.getElementById('cfg-symbol').value || 'BTCUSDT';
+        const userLev = stats.leverage || 10;
+        const levRatio = userLev / getMaxLeverage(exchange, activeSym);
+        const lev = Math.max(1, Math.round(getMaxLeverage(exchange, sig.symbol) * levRatio));
+
+        if (updated.status === 'PENDING') {
+            if ((sig.direction === 'LONG' || sig.direction === 'BUY') && price <= sig.entry) { updated.status = 'OPEN'; changed = true; }
+            else if ((sig.direction === 'SHORT' || sig.direction === 'SELL') && price >= sig.entry) { updated.status = 'OPEN'; changed = true; }
         }
+
+        if (updated.status === 'OPEN') {
+            if (sig.direction === 'LONG' || sig.direction === 'BUY') {
+                if (price >= sig.tp) { updated.status = 'WIN'; updated.pnl = '+' + (((sig.tp - sig.entry) / sig.entry) * 100 * lev).toFixed(2) + '%'; updated.closeTime = new Date().toLocaleTimeString(); changed = true; }
+                else if (price <= sig.sl) { updated.status = 'LOSS'; updated.pnl = (((sig.sl - sig.entry) / sig.entry) * 100 * lev).toFixed(2) + '%'; updated.closeTime = new Date().toLocaleTimeString(); changed = true; }
+            } else {
+                if (price <= sig.tp) { updated.status = 'WIN'; updated.pnl = '+' + (((sig.entry - sig.tp) / sig.entry) * 100 * lev).toFixed(2) + '%'; updated.closeTime = new Date().toLocaleTimeString(); changed = true; }
+                else if (price >= sig.sl) { updated.status = 'LOSS'; updated.pnl = (((sig.entry - sig.sl) / sig.entry) * 100 * lev).toFixed(2) + '%'; updated.closeTime = new Date().toLocaleTimeString(); changed = true; }
+            }
+        }
+        
+        if (updated.status === 'OPEN') {
+            let unrealizedPct = 0;
+            if (sig.direction === 'LONG' || sig.direction === 'BUY') {
+                unrealizedPct = ((price - sig.entry) / sig.entry) * 100.0 * lev;
+                const maxWin = ((sig.tp - sig.entry) / sig.entry) * 100.0 * lev;
+                const maxLoss = ((sig.sl - sig.entry) / sig.entry) * 100.0 * lev;
+                if (unrealizedPct > maxWin) unrealizedPct = maxWin;
+                if (unrealizedPct < maxLoss) unrealizedPct = maxLoss;
+            } else {
+                unrealizedPct = ((sig.entry - price) / sig.entry) * 100.0 * lev;
+                const maxWin = ((sig.entry - sig.tp) / sig.entry) * 100.0 * lev;
+                const maxLoss = ((sig.entry - sig.sl) / sig.entry) * 100.0 * lev;
+                if (unrealizedPct > maxWin) unrealizedPct = maxWin;
+                if (unrealizedPct < maxLoss) unrealizedPct = maxLoss;
+            }
+            const sign = unrealizedPct >= 0 ? '+' : '';
+            updated.pnl = `${sign}${unrealizedPct.toFixed(2)}%`;
+            changed = true;
+        }
+
         return updated;
     });
     if (changed) { _saveAISignalHistory(); renderAISignalHistory(); }
@@ -95,12 +134,17 @@ function renderAISignalHistory() {
         const dec = s.entry < 1 ? 6 : s.entry < 10 ? 4 : s.entry < 1000 ? 3 : 2;
         const statusColor = isWin ? 'var(--accent)' : isLoss ? 'var(--danger)' : 'var(--warn)';
         const statusBg = isWin ? 'rgba(0,229,160,0.12)' : isLoss ? 'rgba(239,68,68,0.1)' : 'rgba(245,158,11,0.12)';
-        const dirColor = s.direction === 'LONG' ? 'var(--accent)' : 'var(--danger)';
-        // Show live distance to TP/SL for open signals
+        const dirColor = (s.direction === 'LONG' || s.direction === 'BUY') ? 'var(--accent)' : 'var(--danger)';
+
+        let livePriceHTML = '<span style="color:var(--text2)">--</span>';
         let distInfo = '';
-        if (isOpen && stats.price) {
-            const price = stats.price;
-            if (s.direction === 'LONG') {
+        if (isOpen && s.livePrice) {
+            const isProfit = (s.direction === 'LONG' || s.direction === 'BUY') ? s.livePrice > s.entry : s.livePrice < s.entry;
+            const pColor = isProfit ? 'var(--accent)' : 'var(--danger)';
+            livePriceHTML = `<span style="color:${pColor};font-family:var(--mono);font-weight:bold">${s.livePrice.toFixed(dec)}</span>`;
+            
+            const price = s.livePrice;
+            if (s.direction === 'LONG' || s.direction === 'BUY') {
                 const pctToTp = ((s.tp - price) / price * 100).toFixed(2);
                 const pctToSl = ((price - s.sl) / price * 100).toFixed(2);
                 distInfo = `<span style="color:var(--text2);font-size:9px;">TP:${pctToTp}% SL:${pctToSl}%</span>`;
@@ -110,17 +154,19 @@ function renderAISignalHistory() {
                 distInfo = `<span style="color:var(--text2);font-size:9px;">TP:${pctToTp}% SL:${pctToSl}%</span>`;
             }
         }
+
         return `<tr onmouseenter="this.style.background='rgba(255,255,255,0.02)'" onmouseleave="this.style.background=''">
             <td style="padding:8px 12px;border-bottom:1px solid var(--border);color:var(--text2);font-size:11px;">${s.time}</td>
             <td style="padding:8px 12px;border-bottom:1px solid var(--border);font-weight:700;color:var(--text);font-size:11px;cursor:pointer;" onclick="selectAISignalPair('${s.symbol}')">${s.symbol.replace('USDT','/USDT')}</td>
             <td style="padding:8px 12px;border-bottom:1px solid var(--border);color:${dirColor};font-weight:700;font-size:11px;">${s.direction}</td>
             <td style="padding:8px 12px;border-bottom:1px solid var(--border);color:var(--blue);font-size:11px;">${s.entry.toFixed(dec)}</td>
+            <td style="padding:8px 12px;border-bottom:1px solid var(--border);">${livePriceHTML}</td>
             <td style="padding:8px 12px;border-bottom:1px solid var(--border);color:var(--accent);font-size:11px;">${s.tp.toFixed(dec)}</td>
             <td style="padding:8px 12px;border-bottom:1px solid var(--border);color:var(--danger);font-size:11px;">${s.sl.toFixed(dec)}</td>
             <td style="padding:8px 12px;border-bottom:1px solid var(--border);">
                 <span style="background:${statusBg};color:${statusColor};padding:2px 8px;border-radius:3px;font-size:10px;font-weight:700;">${s.status}</span>
             </td>
-            <td style="padding:8px 12px;border-bottom:1px solid var(--border);color:${isWin ? 'var(--accent)' : isLoss ? 'var(--danger)' : 'var(--text2)'};font-weight:${isOpen ? '400' : '700'};font-size:11px;">${s.pnl || (isOpen ? distInfo : '--')}</td>
+            <td style="padding:8px 12px;border-bottom:1px solid var(--border);color:${(s.pnl && s.pnl.includes('+')) || isWin ? 'var(--accent)' : (s.pnl && s.pnl.includes('-')) || isLoss ? 'var(--danger)' : 'var(--text2)'};font-weight:${isOpen ? '600' : '700'};font-size:11px;">${s.pnl || (isOpen ? distInfo : '--')}</td>
         </tr>`;
     }).join('');
 }
@@ -147,7 +193,7 @@ function _autoAddSignalsToHistory(results) {
             sl: sig.sl,
             rr: sig.rr,
             conf: sig.confidence,
-            status: 'OPEN',
+            status: 'PENDING',
             pnl: null,
             closeTime: null
         });
@@ -191,25 +237,33 @@ function syncLev(source) {
     limitLeverageInput(num);
 }
 
+function getMaxLeverage(exchange, symbol) {
+    if (exchange === 'mexc') {
+        if (symbol.includes('BTC') || symbol.includes('ETH')) return 200;
+        if (['SOLUSDT','BNBUSDT','XRPUSDT','DOGEUSDT','AVAXUSDT','LINKUSDT','ADAUSDT'].includes(symbol)) return 100;
+        return 50;
+    } else {
+        return (symbol.includes('BTC') || symbol.includes('ETH')) ? 100 : 50;
+    }
+}
+
 function updateLeverageLimits() {
     const exchange = document.getElementById('cfg-exchange').value;
     const symbol   = document.getElementById('cfg-symbol').value || 'BTCUSDT';
     const num      = document.getElementById('cfg-leverage');
     const slide    = document.getElementById('cfg-lev-slider');
-    let maxLev;
-    if (exchange === 'mexc') {
-        if (symbol.includes('BTC') || symbol.includes('ETH')) { maxLev = 200; }
-        else if (['SOLUSDT','BNBUSDT','XRPUSDT','DOGEUSDT','AVAXUSDT','LINKUSDT','ADAUSDT'].includes(symbol)) { maxLev = 100; }
-        else { maxLev = 50; }
-    } else {
-        maxLev = (symbol.includes('BTC') || symbol.includes('ETH')) ? 100 : 50;
-    }
+    
+    let maxLev = getMaxLeverage(exchange, symbol);
+    
     num.max = maxLev; slide.max = maxLev;
-    if (parseInt(num.value) > maxLev) {
-        num.value = maxLev; slide.value = maxLev;
-        document.getElementById('lev-val-display').textContent = maxLev + 'x';
-        saveToLocal();
-    }
+    num.setAttribute('max', maxLev); slide.setAttribute('max', maxLev);
+    
+    let currVal = parseInt(num.value) || 10;
+    if (currVal > maxLev) currVal = maxLev;
+    
+    num.value = currVal; slide.value = currVal;
+    document.getElementById('lev-val-display').textContent = currVal + 'x';
+    saveToLocal();
     const levDisp = document.getElementById('lev-val-display');
     if (levDisp) levDisp.title = `Max ${symbol} on ${exchange}: ${maxLev}x`;
 }
@@ -224,15 +278,23 @@ function limitLeverageInput(el) {
     saveToLocal();
 }
 
-function saveSimState() { Storage.set('botSimHist', { tradeHistory, totalPnl, signalCount, activeTrade }); }
+function _getSimHistKey() {
+    const sel = document.getElementById('cfg-style');
+    return 'botSimHist_' + (sel ? sel.value : 'scalping');
+}
+
+function saveSimState() { 
+    Storage.set(_getSimHistKey(), { tradeHistory, totalPnl, signalCount, activeTrade }); 
+}
 
 function loadSimState() {
     try {
-        const d = Storage.get('botSimHist');
-        if (d) { tradeHistory = d.tradeHistory || []; totalPnl = d.totalPnl || 0; signalCount = d.signalCount || 0; activeTrade = d.activeTrade || null; updateTradeStats(); renderTradesTable(); }
+        const d = Storage.get(_getSimHistKey());
+        if (d) { tradeHistory = d.tradeHistory || []; totalPnl = d.totalPnl || 0; signalCount = d.signalCount || 0; activeTrade = d.activeTrade || null; updateTradeStats(); renderTradesTable(); renderFullTradesTable(); }
+        else { tradeHistory = []; totalPnl = 0; signalCount = 0; activeTrade = null; updateTradeStats(); renderTradesTable(); renderFullTradesTable(); }
         const savedBal = Storage.get('botInitBalance');
         if (savedBal) stats.initBalance = parseFloat(savedBal);
-    } catch(e) {}
+    } catch(e) { console.error('SimState Load Error', e); }
 }
 
 function resetHistory() {
@@ -253,7 +315,7 @@ const PARSERS = [
   { re: /Harga Real-Time \w+: ([\d.]+)/, fn(m) {
       const price = parseFloat(m[1]); stats.prevPrice = stats.price; stats.price = price;
       addPricePoint(price, null, null, null);
-      if (activeTrade) checkTradeOutcome(price); updatePriceStats();
+      updatePriceStats();
   } },
   { re: /\[OI\]\s+\S+\s+oi=([\d.]+)/, fn(m) {
       const raw = parseFloat(m[1]);
@@ -264,21 +326,20 @@ const PARSERS = [
       pendingTradeParams = { entry: parseFloat(m[1]), sl: parseFloat(m[2]), tp: parseFloat(m[3]), rr: parseFloat(m[4]), conf: parseFloat(m[5]) };
   } },
   { re: /\[Executor\]   (BUY|SELL)\s/, fn(m) { pendingAction = m[1]; } },
-  { re: /\[StateDB\] Saved trade row_id/, fn() {
-      if (pendingTradeParams && pendingAction) { openDryTrade(pendingAction, pendingTradeParams); pendingTradeParams = null; pendingAction = null; }
-  } },
-  { re: /\[Paper\]\s+.* Virtual Order opened:\s+(BUY|SELL)/, fn(m) {
-      const action = m[1];
-      if (pendingTradeParams) { openDryTrade(action, pendingTradeParams); pendingTradeParams = null; pendingAction = null; }
-      else if (stats.price) { addSignalMarker(action, stats.price); signalCount++; saveSimState(); updateTradeStats(); }
+  // Removed StateDB regex handler to prevent duplicate Mock trades
+  { re: /\[Paper\]\s+.* LIMIT Order placed:\s+(BUY|SELL)/, fn(m) {
+      // Just log or handle if needed
   } },
   { re: /\[ConsensusEngine\] Hasil: (BUY|SELL)/, fn(m) {
-      const action = m[1]; signalCount++; saveSimState(); updateTradeStats();
-      if (stats.price) addSignalMarker(action, stats.price);
   } },
-  { re: /\[main\] Signal: (BUY|SELL) conf=([\d.]+) entry=([\d.]+) TP=([\d.]+) SL=([\d.]+) RR=([\d.]+)/, fn(m) {
+  { re: /\[main\].*?Signal:\s+(BUY|SELL)\s+conf=([\d.]+)\s+entry=([\d.]+)\s+TP=([\d.]+)\s+SL=([\d.]+)\s+RR=([\d.]+)/, fn(m) {
       pendingAction = m[1];
       pendingTradeParams = { entry: parseFloat(m[3]), sl: parseFloat(m[5]), tp: parseFloat(m[4]), rr: parseFloat(m[6]), conf: parseFloat(m[2]) };
+      activeTrade = {
+          action: pendingAction, limitPrice: pendingTradeParams.entry, entry: null, tp: pendingTradeParams.tp, sl: pendingTradeParams.sl, rr: pendingTradeParams.rr, status: 'PENDING', time: Date.now()
+      };
+      saveSimState(); updateTradeStats(); renderTradesTable(); renderFullTradesTable();
+      setTpSlLines(activeTrade.limitPrice, activeTrade.tp, activeTrade.sl);
   } }
 ];
 
@@ -296,13 +357,27 @@ function isLikelyTimestamp(v) {
 
 function openDryTrade(action, params) {
     if (activeTrade) closeTrade(null, null);
-    activeTrade = { action, ...params, time: new Date().toLocaleTimeString() };
+    activeTrade = { action, ...params, time: new Date().toLocaleTimeString(), status: 'OPEN' };
     addSignalMarker(action, params.entry); setTpSlLines(params.entry, params.tp, params.sl);
     saveSimState(); updateTradeStats(); renderTradesTable(); renderFullTradesTable();
 }
 
 function checkTradeOutcome(currentPrice) {
     if (!activeTrade) return;
+
+    if (activeTrade.status === 'PENDING') {
+        if ((activeTrade.action === 'BUY' && currentPrice <= activeTrade.limitPrice) ||
+            (activeTrade.action === 'SELL' && currentPrice >= activeTrade.limitPrice)) {
+            activeTrade.status = 'OPEN';
+            activeTrade.entry = activeTrade.limitPrice;
+            setTpSlLines(activeTrade.entry, activeTrade.tp, activeTrade.sl);
+            saveSimState(); updateTradeStats(); renderTradesTable();
+        } else if (Date.now() - activeTrade.time > 1800000) { // 30 mins timeout
+            closeTrade('TIMEOUT', null);
+        }
+        return;
+    }
+
     const { action, entry, tp, sl } = activeTrade;
     let result = null, exitPrice = null;
     if (action === 'BUY') { if (currentPrice >= tp) { result = 'WIN'; exitPrice = tp; } else if (currentPrice <= sl) { result = 'LOSS'; exitPrice = sl; } }
@@ -315,7 +390,7 @@ function closeTrade(result, exitPrice) {
     let pnl_pct = 0;
     if (result === 'WIN')  pnl_pct =  stats.risk_pct * activeTrade.rr * 100;
     if (result === 'LOSS') pnl_pct = -stats.risk_pct * 100;
-    if (result) {
+    if (result && result !== 'TIMEOUT') {
         tradeHistory.unshift({ time: activeTrade.time, action: activeTrade.action, entry: activeTrade.entry, tp: activeTrade.tp, sl: activeTrade.sl, result, pnl_pct });
         totalPnl += pnl_pct;
         if (tradeHistory.length > 50) tradeHistory.pop();
@@ -357,15 +432,18 @@ function updateLSRStats() {
 }
 
 function updateBalanceStats() {
-    if (!stats.balance) return;
-    const balEl = document.getElementById('stat-balance');
+    if (stats.balance === undefined) return;
+    const balTextEl = document.getElementById('stat-bal-text');
     const riskEl = document.getElementById('stat-risk');
-    if (balEl) balEl.childNodes[0].nodeValue = stats.balance.toLocaleString('en', { maximumFractionDigits: 2 }) + ' USDT ';
+    if (balTextEl) balTextEl.textContent = stats.balance.toLocaleString('en', { maximumFractionDigits: 2 }) + ' USDT ';
     if (riskEl) riskEl.textContent = 'Risk ' + (stats.risk_pct * 100).toFixed(1) + '% / trade';
-    if (stats.initBalance && stats.balance !== stats.initBalance) {
+    if (stats.initBalance && stats.balance !== stats.initBalance && stats.initBalance > 0 && stats.balance > 0) {
         const diff = ((stats.balance - stats.initBalance) / stats.initBalance) * 100;
         const span = document.getElementById('stat-bal-pct');
         if (span) { span.textContent = `(${diff > 0 ? '+' : ''}${diff.toFixed(2)}%)`; span.style.color = diff > 0 ? 'var(--accent)' : 'var(--danger)'; }
+    } else {
+        const span = document.getElementById('stat-bal-pct');
+        if (span) { span.textContent = '(0.00%)'; span.style.color = 'var(--text2)'; }
     }
     const isDry = document.getElementById('cfg-dryrun')?.checked;
     if (riskEl && isDry) {
@@ -374,15 +452,18 @@ function updateBalanceStats() {
 }
 
 function updateTradeStats() {
-    const wins = tradeHistory.filter(t => t.result === 'WIN').length;
-    const total = tradeHistory.length;
+    let srcHistory = _goTradeHistory || [];
+    const wins = srcHistory.filter(t => t.status === 'CLOSED_TP' || (t.pnl || 0) > 0).length;
+    const total = srcHistory.length;
     const wr = total ? (wins / total * 100).toFixed(1) : '--';
-    const pnlStr = totalPnl >= 0 ? '+' + totalPnl.toFixed(2) : totalPnl.toFixed(2);
+    let pnlSum = 0; srcHistory.forEach(t => pnlSum += (t.pnl || 0));
+    const pnlStr = pnlSum >= 0 ? '+' + pnlSum.toFixed(2) : pnlSum.toFixed(2);
     const wrEl = document.getElementById('stat-winrate'), pnlEl = document.getElementById('stat-pnl');
     if (wrEl) { wrEl.textContent = total ? wr + '%' : '--'; wrEl.className = 'stat-value ' + (total ? (wins/total >= 0.5 ? 'up' : 'down') : ''); }
-    if (pnlEl) { pnlEl.textContent = total ? pnlStr + '%' : '+0.00%'; pnlEl.className = 'stat-value ' + (totalPnl > 0 ? 'up' : totalPnl < 0 ? 'down' : ''); }
+    if (pnlEl) { pnlEl.textContent = total ? pnlStr + '%' : '+0.00%'; pnlEl.className = 'stat-value ' + (pnlSum > 0 ? 'up' : pnlSum < 0 ? 'down' : ''); }
     const tradesEl = document.getElementById('stat-trades'), pnlSubEl = document.getElementById('stat-pnl-sub');
-    if (tradesEl) tradesEl.textContent = total + ' closed' + (activeTrade ? '  1 open' : '');
+    if (tradesEl) tradesEl.textContent = total + ' closed' + (_goActiveTrades && _goActiveTrades.length > 0 ? '  ' + _goActiveTrades.length + ' open' : '');
+    // signalCount is still tracked from ws ticker logs
     if (pnlSubEl) pnlSubEl.textContent = signalCount + ' signals fired';
 }
 
@@ -530,21 +611,54 @@ startChart();
 
 // ── Chart price lines from Go engine API ─────────────────────────────────────
 let _chartLines = [];
+let _goActiveTrades = [];
+let _goTradeHistory = [];
+
 async function fetchPositions() {
     if (!_candleSeries) return;
     try {
         const r = await fetch('/api/positions'); if (!r.ok) return;
         const d = await r.json();
         if (_chartLines.length > 0) { _chartLines.forEach(l => { try { _candleSeries.removePriceLine(l); } catch(e) {} }); _chartLines = []; }
-        if (d.active && d.active.length > 0) {
-            const pos = d.active[0];
+        
+        _goActiveTrades = d.active || [];
+        _goTradeHistory = d.history || [];
+
+        if (_goActiveTrades.length > 0) {
+            const pos = _goActiveTrades[0];
             try {
-                _chartLines.push(_candleSeries.createPriceLine({ price: pos.entry_price, color: '#3b82f6', lineWidth: 2, lineStyle: 0, axisLabelVisible: true, title: `ENTRY ${pos.side}` }));
-                _chartLines.push(_candleSeries.createPriceLine({ price: pos.take_profit, color: '#00e5a0', lineWidth: 1, lineStyle: 2, axisLabelVisible: true, title: 'TP' }));
-                _chartLines.push(_candleSeries.createPriceLine({ price: pos.stop_loss,   color: '#ef4444', lineWidth: 1, lineStyle: 2, axisLabelVisible: true, title: 'SL' }));
+                // Style marker lebih proper
+                const markerPrice = pos.status === 'PENDING' ? (pos.limit_price || pos.entry_price) : pos.entry_price;
+                let entryTitle = `ENTRY ${pos.side}`;
+                if (pos.status === 'OPEN') {
+                    const pnlSign = pos.pnl >= 0 ? '+' : '';
+                    entryTitle = `${pos.side} (${pnlSign}${pos.pnl.toFixed(2)}%)`;
+                } else {
+                    entryTitle = `PENDING ${pos.side}`;
+                }
+                
+                _chartLines.push(_candleSeries.createPriceLine({ price: markerPrice, color: '#3b82f6', lineWidth: 1, lineStyle: 0, axisLabelVisible: false, title: entryTitle }));
+                _chartLines.push(_candleSeries.createPriceLine({ price: pos.take_profit, color: '#10b981', lineWidth: 1, lineStyle: 2, axisLabelVisible: false, title: 'TP' }));
+                _chartLines.push(_candleSeries.createPriceLine({ price: pos.stop_loss,   color: '#ef4444', lineWidth: 1, lineStyle: 2, axisLabelVisible: false, title: 'SL' }));
+                
+                // Set the global activeTrade for other UI elements
+                activeTrade = {
+                    action: pos.side,
+                    entry: markerPrice,
+                    tp: pos.take_profit,
+                    sl: pos.stop_loss,
+                    status: pos.status
+                };
             } catch(e) {}
-            renderTradesTableGo(d.active, d.history || []); _showChartLegend();
-        } else { renderTradesTableGo([], d.history || []); }
+            renderTradesTableGo(_goActiveTrades, _goTradeHistory); _showChartLegend();
+        } else { 
+            activeTrade = null;
+            renderTradesTableGo([], _goTradeHistory); 
+        }
+        updateTradeStats(); // update header stats based on _goTradeHistory
+        
+        const pane = document.getElementById('pane-trades');
+        if (pane && pane.classList.contains('active')) renderFullTradesTable();
     } catch(e) {}
 }
 
@@ -553,7 +667,10 @@ function renderTradesTableGo(active, history) {
     let html = '';
     if (active && active.length > 0) {
         const p = active[0], cls = p.side === 'BUY' ? 'trade-win' : 'trade-loss', pnlColor = (p.pnl || 0) >= 0 ? 'trade-win' : 'trade-loss', pnlSign = (p.pnl || 0) >= 0 ? '+' : '';
-        html += `<tr style="background:rgba(30,41,59,0.5)"><td>${p.time || '--'}</td><td class="${cls}">${p.side} (LIVE)</td><td>${(p.entry_price||0).toFixed(4)}</td><td class="trade-win">${(p.take_profit||0).toFixed(4)}</td><td class="trade-loss">${(p.stop_loss||0).toFixed(4)}</td><td style="color:var(--accent)">OPEN</td><td class="${pnlColor}" style="font-weight:bold">${pnlSign}${(p.pnl||0).toFixed(2)}%</td></tr>`;
+        const status = p.status || 'OPEN';
+        const entryDisplay = status === 'PENDING' ? (p.limit_price || p.entry_price || 0) : (p.entry_price || 0);
+        const statusColor = status === 'PENDING' ? 'var(--warn)' : 'var(--accent)';
+        html += `<tr style="background:rgba(30,41,59,0.5)"><td>${p.time || '--'}</td><td class="${cls}">${p.side} (LIVE)</td><td>${entryDisplay.toFixed(4)}</td><td class="trade-win">${(p.take_profit||0).toFixed(4)}</td><td class="trade-loss">${(p.stop_loss||0).toFixed(4)}</td><td style="color:${statusColor}">${status}</td><td class="${pnlColor}" style="font-weight:bold">${pnlSign}${(p.pnl||0).toFixed(2)}%</td></tr>`;
     }
     if (history && history.length > 0) {
         history.slice(0, 20).forEach(p => {
@@ -561,24 +678,14 @@ function renderTradesTableGo(active, history) {
             html += `<tr><td>${p.time||'--'}</td><td class="${cls}">${p.side}</td><td>${(p.entry_price||0).toFixed(4)}</td><td>${(p.take_profit||0).toFixed(4)}</td><td>${(p.stop_loss||0).toFixed(4)}</td><td class="${cls}">${p.status||'--'}</td><td class="${pnlColor}">${pnlSign}${(p.pnl||0).toFixed(2)}%</td></tr>`;
         });
     }
-    if (html === '') html = '<tr><td colspan="7" style="text-align:center;padding:2rem;color:#64748B;">No trades yet — Start bot to begin paper trading</td></tr>';
+    // MOCK history rendering removed to prevent duplicates and confusion
+    if (html === '') html = '<tr><td colspan="7" style="text-align:center;padding:2rem;color:#64748B;">Belum ada trade / history</td></tr>';
     tbody.innerHTML = html;
 }
 
 function renderTradesTable() {
-    const tbody = document.getElementById('trades-tbody'); if (!tbody) return;
-    if (_chartLines.length > 0 && activeTrade === null && tradeHistory.length === 0) return;
-    if (!tradeHistory.length && !activeTrade) { tbody.innerHTML = '<tr><td colspan="7" style="color:var(--text2);text-align:center;padding:10px">Belum ada trade</td></tr>'; return; }
-    let rows = '';
-    if (activeTrade) {
-        const dec = activeTrade.entry < 1 ? 6 : activeTrade.entry < 10 ? 4 : 4;
-        rows += `<tr><td>${activeTrade.time}</td><td class="trade-open">${activeTrade.action}</td><td>${activeTrade.entry.toFixed(dec)}</td><td class="trade-win">${activeTrade.tp.toFixed(dec)}</td><td class="trade-loss">${activeTrade.sl.toFixed(dec)}</td><td class="trade-open">OPEN</td><td class="trade-open">--</td></tr>`;
-    }
-    tradeHistory.slice(0, 20).forEach(t => {
-        const cls = t.result === 'WIN' ? 'trade-win' : 'trade-loss', dec = t.entry < 1 ? 6 : t.entry < 10 ? 4 : 4, pnl = (t.pnl_pct >= 0 ? '+' : '') + t.pnl_pct.toFixed(2) + '%';
-        rows += `<tr><td>${t.time}</td><td class="${cls}">${t.action}</td><td>${t.entry.toFixed(dec)}</td><td>${t.tp.toFixed(dec)}</td><td>${t.sl.toFixed(dec)}</td><td class="${cls}">${t.result}</td><td class="${cls}">${pnl}</td></tr>`;
-    });
-    tbody.innerHTML = rows;
+    // [FIX-TRADE-TABLE] Disabled legacy JS simulator table overwriting the Go backend table
+    return;
 }
 
 // ── switchTab ─────────────────────────────────────────────────────────────────
@@ -610,6 +717,15 @@ function switchTab(name, btn) {
     if (name === 'insight') ensureSignalPaneReady();
     if (name === 'trades') renderFullTradesTable();
 }
+
+window.addEventListener('resize', () => {
+    if (_lwChart && !isChartHidden) {
+        const wrapper = document.getElementById('chart-wrapper');
+        if (wrapper && wrapper.clientWidth > 10) {
+            try { _lwChart.resize(wrapper.clientWidth, wrapper.clientHeight); } catch(e) {}
+        }
+    }
+});
 
 function setFilter(btn) { document.querySelectorAll('.fbtn').forEach(b => b.classList.remove('active')); btn.classList.add('active'); filterLevel = btn.dataset.lvl; renderLogs(); }
 function toggleAutoScroll() { autoScroll = !autoScroll; const btn = document.getElementById('btn-autoscroll'); if (btn) { btn.style.borderColor = autoScroll ? 'var(--accent)' : ''; btn.style.color = autoScroll ? 'var(--accent)' : ''; } if (autoScroll) renderLogs(); }
@@ -678,13 +794,13 @@ function saveToLocal() {
     const state = {
         SYMBOL:        document.getElementById('cfg-symbol').value,
         EXCHANGE:      document.getElementById('cfg-exchange').value,
-        EXCHANGE_MODE: document.getElementById('cfg-mode').value,
+        EXCHANGE_MODE: "REAL",
         TRADING_STYLE: document.getElementById('cfg-style').value,
         TARGET_TYPE:   document.getElementById('cfg-target-type').value,
         LEVERAGE:      document.getElementById('cfg-leverage').value,
         RISK_PCT:      document.getElementById('cfg-risk').value,
         USE_MOCK_OHLCV: document.getElementById('cfg-mock').checked,
-        DRY_RUN:       document.getElementById('cfg-dryrun').checked
+        DRY_RUN:       document.getElementById('cfg-dryrun').checked ? '1' : '0',
     };
     Storage.set('botUIState', state);
 }
@@ -704,20 +820,38 @@ function collectEnv() {
         SYMBOL:              document.getElementById('cfg-symbol').value.trim(),
         LEVERAGE:            document.getElementById('cfg-leverage').value,
         EXCHANGE:            document.getElementById('cfg-exchange').value,
-        EXCHANGE_MODE:       document.getElementById('cfg-mode').value,
+        EXCHANGE_MODE:       "REAL",
         TRADING_STYLE:       document.getElementById('cfg-style').value,
         TARGET_TYPE:         document.getElementById('cfg-target-type').value,
         RISK_PCT:            (parseInt(document.getElementById('cfg-risk').value) / 100).toString(),
         USE_MOCK_OHLCV:      document.getElementById('cfg-mock').checked ? '1' : '0',
         DRY_RUN:             document.getElementById('cfg-dryrun').checked ? '1' : '0',
-        BYBIT_DEMO_API_KEY:    keyVal('key-bybit-demo-key'),
-        BYBIT_DEMO_API_SECRET: keyVal('key-bybit-demo-secret'),
         BYBIT_REAL_API_KEY:    keyVal('key-bybit-real-key'),
         BYBIT_REAL_API_SECRET: keyVal('key-bybit-real-secret'),
         MEXC_API_KEY:          keyVal('key-mexc-key'),
         MEXC_API_SECRET:       keyVal('key-mexc-secret')
     };
 }
+
+document.getElementById('btn-inject').addEventListener('click', () => {
+    fetch('/api/virtual/inject', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ amount: 1000 })
+    }).then(res => res.json()).then(data => {
+        if (data.success) {
+            stats.balance = data.balance;
+            if (!stats.initBalance) {
+                stats.initBalance = data.balance;
+            } else {
+                stats.initBalance += 1000;
+            }
+            Storage.set('botInitBalance', stats.initBalance);
+            updateBalanceStats();
+            alert("Berhasil inject $1,000 USDT ke Virtual Balance!");
+        }
+    });
+});
 
 async function saveConfig() {
     try {
@@ -746,13 +880,14 @@ async function loadConfig() {
             _symbolAtBotStart = sym;
         }
         if (local.LEVERAGE || e.LEVERAGE) {
+            updateLeverageLimits();
             const lev = local.LEVERAGE || e.LEVERAGE;
             document.getElementById('cfg-leverage').value = lev;
             document.getElementById('cfg-lev-slider').value = lev;
             document.getElementById('lev-val-display').textContent = lev + 'x';
         }
         if (local.EXCHANGE || e.EXCHANGE)           document.getElementById('cfg-exchange').value = local.EXCHANGE || e.EXCHANGE;
-        if (local.EXCHANGE_MODE || e.EXCHANGE_MODE) document.getElementById('cfg-mode').value = local.EXCHANGE_MODE || e.EXCHANGE_MODE;
+        // EXCHANGE_MODE is forced to REAL for now, DryRun is handled via virtual balance
         if (local.TRADING_STYLE || e.TRADING_STYLE) document.getElementById('cfg-style').value = local.TRADING_STYLE || e.TRADING_STYLE;
         if (local.TARGET_TYPE || e.TARGET_TYPE)     document.getElementById('cfg-target-type').value = local.TARGET_TYPE || e.TARGET_TYPE;
         let riskRaw = local.RISK_PCT || e.RISK_PCT;
@@ -766,7 +901,7 @@ async function loadConfig() {
         }
         if (local.USE_MOCK_OHLCV !== undefined) document.getElementById('cfg-mock').checked = local.USE_MOCK_OHLCV;
         else if (e.USE_MOCK_OHLCV) document.getElementById('cfg-mock').checked = e.USE_MOCK_OHLCV === '1';
-        if (local.DRY_RUN !== undefined) document.getElementById('cfg-dryrun').checked = local.DRY_RUN;
+        if (local.DRY_RUN !== undefined) document.getElementById('cfg-dryrun').checked = (local.DRY_RUN === '1' || local.DRY_RUN === true);
         else if (e.DRY_RUN) document.getElementById('cfg-dryrun').checked = e.DRY_RUN === '1';
 
         function loadKey(id, val) {
@@ -775,8 +910,6 @@ async function loadConfig() {
             el.addEventListener('focus', function() { if (el.value === val) el.value = ''; }, { once: true });
             el.addEventListener('blur', function() { if (el.value === '') el.value = val; });
         }
-        loadKey('key-bybit-demo-key',    e.BYBIT_DEMO_API_KEY);
-        loadKey('key-bybit-demo-secret', e.BYBIT_DEMO_API_SECRET);
         loadKey('key-bybit-real-key',    e.BYBIT_REAL_API_KEY);
         loadKey('key-bybit-real-secret', e.BYBIT_REAL_API_SECRET);
         loadKey('key-mexc-key',          e.MEXC_API_KEY);
@@ -838,31 +971,36 @@ let _wsTicker = null;
 function _getLiveSymbol() { const sel = document.getElementById('cfg-symbol'); return (sel && sel.value) ? sel.value.replace('_', '') : 'BTCUSDT'; }
 
 function connectLivePriceWS() {
-    const sym = _getLiveSymbol();
-    if (_wsTicker) { _wsTicker.close(); _wsTicker = null; }
+    const sym = _getLiveSymbol().toUpperCase(); // bybit needs uppercase
+    if (_wsTicker) { 
+        _wsTicker.onclose = null; 
+        _wsTicker.close(); 
+        _wsTicker = null; 
+    }
     _wsTicker = new WebSocket('wss://stream.bytick.com/v5/public/linear');
-    _wsTicker.onopen = () => _wsTicker.send(JSON.stringify({ "op": "subscribe", "args": [`tickers.${sym}`] }));
+    _wsTicker.onopen = () => {
+        _wsTicker.send(JSON.stringify({"op":"subscribe","args":[`tickers.${sym}`]}));
+    };
     _wsTicker.onmessage = (msg) => {
         try {
-            const data = JSON.parse(msg.data);
-            if (data?.topic === `tickers.${sym}` && data?.data) {
-                const ticker = data.data;
-                if (ticker.lastPrice !== undefined) {
-                    const price = parseFloat(ticker.lastPrice);
+            const payload = JSON.parse(msg.data);
+            if (payload.topic === `tickers.${sym}` && payload.data) {
+                const data = payload.data;
+                if (data.lastPrice) {
+                    const price = parseFloat(data.lastPrice);
                     if (price && !isNaN(price)) {
                         stats.prevPrice = stats.price; stats.price = price;
                         addPricePoint(price, null, null, null);
-                        if (activeTrade) checkTradeOutcome(price);
                         updatePriceStats();
-                        // [FIX-AI-4] Track AI signal outcomes on every WS tick
                         _trackAISignalOutcomes(price);
                     }
                 }
-                if (ticker.price24hPcnt !== undefined) {
-                    const raw = parseFloat(ticker.price24hPcnt);
+                if (data.price24hPcnt !== undefined) {
+                    const raw = parseFloat(data.price24hPcnt) * 100.0;
                     if (!isNaN(raw)) {
-                        const pct24h = raw * 100, deltaEl = document.getElementById('hdr-delta');
-                        if (deltaEl) { const sign = pct24h >= 0 ? '+' : ''; deltaEl.textContent = `${sign}${pct24h.toFixed(2)}% 24h`; deltaEl.className = 'price-delta ' + (pct24h >= 0 ? 'up' : 'down'); deltaEl.style.display = ''; }
+                        stats.pct24h = raw;
+                        const deltaEl = document.getElementById('hdr-delta');
+                        if (deltaEl) { const sign = raw >= 0 ? '+' : ''; deltaEl.textContent = `${sign}${raw.toFixed(2)}% 24h`; deltaEl.className = 'price-delta ' + (raw >= 0 ? 'up' : 'down'); deltaEl.style.display = ''; }
                     }
                 }
             }
@@ -883,15 +1021,16 @@ async function fetchAIInsight() {
             if (d.lsr_val > 1.05) biasTxt = 'LONG_HEAVY'; else if (d.lsr_val < 0.95) biasTxt = 'SHORT_HEAVY';
             stats.bias = biasTxt; updateLSRStats();
         }
-        if (d.balance > 0) {
+        if (d.balance !== undefined) {
             stats.balance = d.balance;
-            if (!stats.initBalance) {
+            if (stats.initBalance === undefined || stats.initBalance <= 0) {
                 const savedBal = Storage.get('botInitBalance');
-                if (savedBal) stats.initBalance = parseFloat(savedBal);
+                if (savedBal && parseFloat(savedBal) > 0) stats.initBalance = parseFloat(savedBal);
                 else { stats.initBalance = d.balance; Storage.set('botInitBalance', d.balance); }
             }
             updateBalanceStats();
         }
+        if (d.atr !== undefined) { stats.atr = d.atr; updatePriceStats(); }
         if (d.last_price && !stats.price) { stats.price = d.last_price; updatePriceStats(); }
     } catch(e) {}
 }
@@ -899,14 +1038,6 @@ async function fetchAIInsight() {
 // ══════════════════════════════════════════════════════════════════════════════
 // AI SIGNAL SCANNER
 // ══════════════════════════════════════════════════════════════════════════════
-
-const AI_SIGNAL_PAIRS = [
-  'BTCUSDT','ETHUSDT','SOLUSDT','BNBUSDT','XRPUSDT',
-  'DOGEUSDT','PEPEUSDT','AVAXUSDT','LINKUSDT','ADAUSDT',
-  'DOTUSDT','MATICUSDT','LTCUSDT','UNIUSDT','ATOMUSDT',
-  'NEARUSDT','APTUSDT','ARBUSDT','OPUSDT','INJUSDT',
-  'SUIUSDT','SEIUSDT','TIAUSDT','JUPUSDT','WIFUSDT'
-];
 
 let _aiSignalTimer = null;
 let _aiSignalPaneReady = false;
@@ -982,59 +1113,98 @@ function _calcATR(candles, period = 14) {
     return atr;
 }
 
-function _analyzeSignal(symbol, candles) {
-    if (candles.length < 35) return null;
+function _calcStdDev(arr, period) {
+    if (arr.length < period) return 0;
+    const slice = arr.slice(-period);
+    const mean = slice.reduce((a,b)=>a+b,0)/slice.length;
+    const variance = slice.reduce((a,b)=>a+Math.pow(b-mean,2),0)/slice.length;
+    return Math.sqrt(variance);
+}
+
+function _analyzeSignal(symbol, candles, style) {
+    if (candles.length < 50) return null;
     const closes = candles.map(c => c.c), price = closes[closes.length - 1];
     const rsi = _calcRSI(closes), ema9 = _calcEMA(closes, 9), ema21 = _calcEMA(closes, 21), ema50 = _calcEMA(closes, 50), atr = _calcATR(candles);
     if (atr < 1e-8) return null;
-    const recentVols = candles.slice(-5).map(c => c.v), histVols = candles.slice(-25, -5).map(c => c.v);
-    const avgVol = histVols.reduce((s, v) => s + v, 0) / (histVols.length || 1), lastVol = recentVols.reduce((s, v) => s + v, 0) / recentVols.length, volRatio = lastVol / (avgVol || 1);
+    
+    // Strict Noise Veto
+    const stdDev = _calcStdDev(closes, 20);
+    const noise = stdDev / (atr || 1);
+    
+    let noiseVeto = 1.50;
+    let minConf = 0.20;
+    let tpMult = 1.2;
+    let slMult = 1.0;
+    let minRR = 1.0;
+    
+    if (style === 'daytrade') { noiseVeto = 1.20; minConf = 0.25; tpMult = 2.0; slMult = 1.2; minRR = 1.2; }
+    else if (style === 'sniper') { noiseVeto = 1.00; minConf = 0.30; tpMult = 3.0; slMult = 1.5; minRR = 1.5; }
+    
+    if (noise > noiseVeto) return null;
+    
+    const emaBullAlign = ema9 > ema21 && ema21 > ema50;
+    const emaBearAlign = ema9 < ema21 && ema21 < ema50;
+    
     let bullScore = 0, bearScore = 0; const reasons = [];
-    if      (rsi <= 25) { bullScore += 3; reasons.push(`RSI ${rsi.toFixed(0)} (oversold++)`); }
-    else if (rsi <= 35) { bullScore += 2; reasons.push(`RSI ${rsi.toFixed(0)} (oversold)`); }
-    else if (rsi <= 45) { bullScore += 1; }
-    else if (rsi >= 75) { bearScore += 3; reasons.push(`RSI ${rsi.toFixed(0)} (overbought++)`); }
-    else if (rsi >= 65) { bearScore += 2; reasons.push(`RSI ${rsi.toFixed(0)} (overbought)`); }
-    else if (rsi >= 55) { bearScore += 1; }
-    const emaBullAlign = ema9 > ema21 && ema21 > ema50, emaBearAlign = ema9 < ema21 && ema21 < ema50;
-    if      (emaBullAlign) { bullScore += 2; reasons.push('EMA bull align'); }
-    else if (emaBearAlign) { bearScore += 2; reasons.push('EMA bear align'); }
-    else if (ema9 > ema21) { bullScore += 1; } else { bearScore += 1; }
-    if      (price > ema50 * 1.002) { bullScore += 1; }
-    else if (price < ema50 * 0.998) { bearScore += 1; }
-    if (volRatio > 1.8) { const last = candles[candles.length - 1]; if (last.c > last.o) { bullScore += 1; reasons.push(`Vol ${volRatio.toFixed(1)}x spike`); } else { bearScore += 1; reasons.push(`Vol ${volRatio.toFixed(1)}x spike`); } }
-    const last = candles[candles.length - 1], prev = candles[candles.length - 2], prev2 = candles[candles.length - 3];
-    if (last.c > last.o && prev.c < prev.o && last.c > prev.o && last.o < prev.c) { bullScore += 2; reasons.push('Bullish engulf'); }
-    if (last.c < last.o && prev.c > prev.o && last.c < prev.o && last.o > prev.c) { bearScore += 2; reasons.push('Bearish engulf'); }
-    if (prev2.c < prev2.o && Math.abs(prev.c - prev.o) < atr * 0.3 && last.c > last.o && last.c > (prev2.o + prev2.c) / 2) { bullScore += 2; reasons.push('Morning star'); }
-    if (prev2.c > prev2.o && Math.abs(prev.c - prev.o) < atr * 0.3 && last.c < last.o && last.c < (prev2.o + prev2.c) / 2) { bearScore += 2; reasons.push('Evening star'); }
-    let trendConflict = false;
-    if (emaBearAlign && bullScore > bearScore) { bullScore = Math.max(0, bullScore - 3); reasons.push('⚠ EMA downtrend conflict'); trendConflict = true; }
-    if (emaBullAlign && bearScore > bullScore) { bearScore = Math.max(0, bearScore - 3); reasons.push('⚠ EMA uptrend conflict'); trendConflict = true; }
-    if (price < ema50 * 0.99 && bullScore > bearScore) { bullScore = Math.max(0, bullScore - 2); if (!trendConflict) reasons.push('Price < EMA50 (bull penalized)'); }
-    if (price > ema50 * 1.01 && bearScore > bullScore) { bearScore = Math.max(0, bearScore - 2); if (!trendConflict) reasons.push('Price > EMA50 (bear penalized)'); }
-    const minScore = 3;
-    if (bullScore < minScore && bearScore < minScore) return null;
+    
+    if (rsi <= 30) { bullScore += 3; reasons.push(`RSI ${rsi.toFixed(0)}`); }
+    if (rsi >= 70) { bearScore += 3; reasons.push(`RSI ${rsi.toFixed(0)}`); }
+    
+    const last = candles[candles.length - 1], prev = candles[candles.length - 2];
+    if (last.c > last.o && prev.c < prev.o && last.c > prev.o && last.o < prev.c) { bullScore += 2; reasons.push('Bull engulf'); }
+    if (last.c < last.o && prev.c > prev.o && last.c < prev.o && last.o > prev.c) { bearScore += 2; reasons.push('Bear engulf'); }
+    
+    if (bullScore < 1 && bearScore < 1) return null;
     if (Math.abs(bullScore - bearScore) < 1) return null;
-    const isBull = bullScore > bearScore, direction = isBull ? 'LONG' : 'SHORT', score = isBull ? bullScore : bearScore;
-    const confidence = Math.min(0.95, 0.35 + score * 0.08);
-    const slMult = 1.2, tpMult = rsi < 40 || rsi > 60 ? 2.8 : 2.2;
+    
+    const isBull = bullScore > bearScore, direction = isBull ? 'LONG' : 'SHORT';
+    let score = isBull ? bullScore : bearScore;
+    
+    // SOFT EMA VETO
+    if (isBull && emaBearAlign) score -= 1;
+    if (!isBull && emaBullAlign) score -= 1;
+    if (score < 1) return null;
+    
+    const confidence = Math.min(0.95, 0.25 + score * 0.05);
+    if (confidence < minConf) return null;
+    
     const entry = price, sl = isBull ? price - atr * slMult : price + atr * slMult, tp = isBull ? price + atr * tpMult : price - atr * tpMult, rr = Math.abs(tp - entry) / Math.abs(sl - entry);
-    if (rr < 1.5) return null;
-    return { symbol, direction, confidence, entry, tp, sl, rr, rsi, reasons, price, ema9, ema21, ema50, volRatio, trendConflict, emaBullAlign, emaBearAlign };
+    if (rr < minRR) return null;
+    
+    const volRatio = 1.0; // Simplified for UI
+    return { symbol, direction, confidence, entry, tp, sl, rr, rsi, reasons, price, ema9, ema21, ema50, volRatio, trendConflict: false, emaBullAlign, emaBearAlign };
 }
 
 async function runAISignalScan() {
     ensureSignalPaneReady();
     const statusEl = document.getElementById('ai-scan-status'), gridEl = document.getElementById('ai-signal-grid'), statsEl = document.getElementById('ai-signal-stats');
     if (!gridEl) return;
-    const tf = _aiScanTF;
+    
+    const style = document.getElementById('cfg-style')?.value || 'scalping';
+    let tf = '5';
+    if (style === 'daytrade') tf = '15';
+    else if (style === 'sniper') tf = '60';
+    _aiScanTF = tf;
+    
+    // Update active button visually
+    document.querySelectorAll('.ai-tf-btn').forEach(b => {
+        b.style.background = b.dataset.tf === tf ? 'var(--blue-d)' : 'transparent';
+        b.style.color = b.dataset.tf === tf ? '#fff' : 'var(--text2)';
+    });
+
+    if (statusEl) statusEl.textContent = `⟳ Fetching Pairs...`;
+    gridEl.innerHTML = `<div style="color:var(--text2);font-family:var(--mono);font-size:12px;padding:24px;text-align:center;grid-column:1/-1;">⟳ Mencari top volume pairs...</div>`;
+    
+    const sel = document.getElementById('cfg-symbol');
+    let pairsToScan = sel ? Array.from(sel.options).map(o => o.value) : ['BTCUSDT','ETHUSDT'];
+
     if (statusEl) statusEl.textContent = `⟳ Scanning ${tf}m...`;
-    gridEl.innerHTML = `<div style="color:var(--text2);font-family:var(--mono);font-size:12px;padding:24px;text-align:center;grid-column:1/-1;">⟳ Mengambil data ${AI_SIGNAL_PAIRS.length} pair (TF: ${tf}m)...</div>`;
+    gridEl.innerHTML = `<div style="color:var(--text2);font-family:var(--mono);font-size:12px;padding:24px;text-align:center;grid-column:1/-1;">⟳ Mengambil data ${pairsToScan.length} pair (TF: ${tf}m)...</div>`;
+    
     const results = []; let scanned = 0, errors = 0;
     const batchSize = 5;
-    for (let i = 0; i < AI_SIGNAL_PAIRS.length; i += batchSize) {
-        const batch = AI_SIGNAL_PAIRS.slice(i, i + batchSize);
+    for (let i = 0; i < pairsToScan.length; i += batchSize) {
+        const batch = pairsToScan.slice(i, i + batchSize);
         const batchResults = await Promise.allSettled(batch.map(async pair => {
             const resp = await fetch(`https://api.bytick.com/v5/market/kline?category=linear&symbol=${pair}&interval=${tf}&limit=100`, { signal: AbortSignal.timeout(6000) });
             if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
@@ -1042,7 +1212,7 @@ async function runAISignalScan() {
             if (d.retCode !== 0 || !d.result?.list?.length) throw new Error('no data');
             const candles = d.result.list.slice().reverse().map(c => ({ o: parseFloat(c[1]), h: parseFloat(c[2]), l: parseFloat(c[3]), c: parseFloat(c[4]), v: parseFloat(c[5]) }));
             scanned++;
-            return _analyzeSignal(pair, candles);
+            return _analyzeSignal(pair, candles, style);
         }));
         for (const res of batchResults) { if (res.status === 'fulfilled' && res.value) results.push(res.value); else if (res.status === 'rejected') errors++; }
         if (results.length > 0) _renderAISignals(results, scanned, tf);
@@ -1050,7 +1220,7 @@ async function runAISignalScan() {
     _renderAISignals(results, scanned, tf);
     _renderAIScanStats(results, scanned, errors, statsEl);
     const ts = new Date().toLocaleTimeString();
-    if (statusEl) statusEl.textContent = `✓ ${scanned}/${AI_SIGNAL_PAIRS.length} @ ${ts} | ${results.length} signal | TF:${tf}m`;
+    if (statusEl) statusEl.textContent = `✓ ${scanned}/${pairsToScan.length} @ ${ts} | ${results.length} signal | TF:${tf}m`;
     if (results.length > 0) {
         Storage.set('aiLastScanResults', { results, ts, scanned });
         // [FIX-AI-1] Auto-add ALL signals to history — no click needed
@@ -1119,7 +1289,7 @@ function selectAISignalPair(symbol) {
         // [FIX-AI-5] Only add to history if not already OPEN (auto-scan already added it)
         const alreadyTracked = _aiSignalHistory.some(h => h.symbol === sig.symbol && h.status === 'OPEN');
         if (!alreadyTracked) {
-            _aiSignalHistory.unshift({ time: new Date().toLocaleTimeString(), symbol: sig.symbol, direction: sig.direction, entry: sig.entry, tp: sig.tp, sl: sig.sl, rr: sig.rr, conf: sig.confidence, status: 'OPEN', pnl: null, closeTime: null });
+            _aiSignalHistory.unshift({ time: new Date().toLocaleTimeString(), symbol: sig.symbol, direction: sig.direction, entry: sig.entry, tp: sig.tp, sl: sig.sl, rr: sig.rr, conf: sig.confidence, status: 'PENDING', pnl: null, closeTime: null });
             if (_aiSignalHistory.length > 300) _aiSignalHistory.pop();
             _saveAISignalHistory();
         }
@@ -1140,7 +1310,7 @@ function ensureSignalPaneReady() {
       <div style="display:flex;align-items:center;justify-content:space-between;padding:12px 16px;flex-shrink:0;border-bottom:1px solid var(--border);background:var(--bg2);">
         <div>
           <div style="font-family:var(--mono);color:var(--accent);font-size:13px;font-weight:600;letter-spacing:2px;">🎯 AI SIGNAL SCANNER</div>
-          <div style="font-family:var(--mono);font-size:9px;color:var(--text2);margin-top:2px;">${AI_SIGNAL_PAIRS.length} pairs · Auto-track WIN/LOSS via live price · Klik kartu → chart</div>
+          <div style="font-family:var(--mono);font-size:9px;color:var(--text2);margin-top:2px;">Top 50 pairs · Auto-track WIN/LOSS via live price · Klik kartu → chart</div>
         </div>
         <div style="display:flex;gap:8px;align-items:center;flex-shrink:0;">
           <div style="display:flex;gap:2px;background:var(--bg);border:1px solid var(--border);border-radius:4px;padding:2px;">
@@ -1158,7 +1328,7 @@ function ensureSignalPaneReady() {
 
       <div id="ai-signal-grid" style="padding:12px 16px;display:grid;gap:8px;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));flex-shrink:0;">
         <div style="color:var(--text2);font-family:var(--mono);font-size:12px;padding:24px;text-align:center;grid-column:1/-1;border:1px dashed var(--border);border-radius:6px;">
-          Klik <strong style="color:var(--accent)">⚡ SCAN</strong> untuk analisa ${AI_SIGNAL_PAIRS.length} pair<br>
+          Klik <strong style="color:var(--accent)">⚡ SCAN</strong> untuk analisa Top 50 pair<br>
           <span style="font-size:10px;opacity:0.6;margin-top:4px;display:block;">Semua signal otomatis masuk history · WIN/LOSS dihitung saat price hit TP/SL via live price</span>
         </div>
       </div>
@@ -1179,6 +1349,7 @@ function ensureSignalPaneReady() {
                 <th style="text-align:left;padding:7px 12px;color:var(--text2);font-weight:600;font-size:9px;letter-spacing:1.5px;border-bottom:1px solid var(--border);">Pair</th>
                 <th style="text-align:left;padding:7px 12px;color:var(--text2);font-weight:600;font-size:9px;letter-spacing:1.5px;border-bottom:1px solid var(--border);">Dir</th>
                 <th style="text-align:left;padding:7px 12px;color:var(--text2);font-weight:600;font-size:9px;letter-spacing:1.5px;border-bottom:1px solid var(--border);">Entry</th>
+                <th style="text-align:left;padding:7px 12px;color:var(--text2);font-weight:600;font-size:9px;letter-spacing:1.5px;border-bottom:1px solid var(--border);">Live</th>
                 <th style="text-align:left;padding:7px 12px;color:var(--text2);font-weight:600;font-size:9px;letter-spacing:1.5px;border-bottom:1px solid var(--border);">TP</th>
                 <th style="text-align:left;padding:7px 12px;color:var(--text2);font-weight:600;font-size:9px;letter-spacing:1.5px;border-bottom:1px solid var(--border);">SL</th>
                 <th style="text-align:left;padding:7px 12px;color:var(--text2);font-weight:600;font-size:9px;letter-spacing:1.5px;border-bottom:1px solid var(--border);">Status</th>
@@ -1239,23 +1410,46 @@ function initTradesTab() {
 
 function renderFullTradesTable() {
     const tbody = document.getElementById('trades-full-tbody'); if (!tbody) return;
-    const wins = tradeHistory.filter(t => t.result === 'WIN').length, losses = tradeHistory.filter(t => t.result === 'LOSS').length, total = tradeHistory.length, pnlSign = totalPnl >= 0 ? '+' : '';
+    const wins = _goTradeHistory.filter(t => t.status === 'CLOSED_TP' || (t.pnl||0) > 0).length;
+    const losses = _goTradeHistory.filter(t => t.status === 'CLOSED_SL' || (t.pnl||0) < 0).length;
+    const total = _goTradeHistory.length;
+    
+    let computedPnl = 0;
+    _goTradeHistory.forEach(t => computedPnl += (t.pnl || 0));
+    const pnlSign = computedPnl >= 0 ? '+' : '';
+    
     const el = (id) => document.getElementById(id);
-    if (el('ts-total'))  el('ts-total').textContent  = total + (activeTrade ? ' +1' : '');
+    if (el('ts-total'))  el('ts-total').textContent  = total + (_goActiveTrades.length ? ' +1' : '');
     if (el('ts-wr'))     el('ts-wr').textContent      = total ? (wins/total*100).toFixed(1) + '%' : '--';
-    if (el('ts-pnl'))  { el('ts-pnl').textContent = pnlSign + totalPnl.toFixed(2) + '%'; el('ts-pnl').style.color = totalPnl > 0 ? 'var(--accent)' : totalPnl < 0 ? 'var(--danger)' : 'var(--text)'; }
+    if (el('ts-pnl'))  { el('ts-pnl').textContent = pnlSign + computedPnl.toFixed(2) + '%'; el('ts-pnl').style.color = computedPnl > 0 ? 'var(--accent)' : computedPnl < 0 ? 'var(--danger)' : 'var(--text)'; }
     if (el('ts-wins'))   el('ts-wins').textContent   = wins;
     if (el('ts-losses')) el('ts-losses').textContent = losses;
+    
     let rows = '';
-    if (activeTrade) {
-        const dec = activeTrade.entry < 1 ? 6 : activeTrade.entry < 10 ? 4 : 2;
-        rows += `<tr style="background:rgba(245,158,11,0.04)"><td style="padding:12px 20px;border-bottom:1px solid var(--border);color:var(--text)">${activeTrade.time}</td><td style="padding:12px 20px;border-bottom:1px solid var(--border)" class="trade-open">${activeTrade.action}</td><td style="padding:12px 20px;border-bottom:1px solid var(--border);color:var(--text)">${activeTrade.entry.toFixed(dec)}</td><td style="padding:12px 20px;border-bottom:1px solid var(--border)" class="trade-win">${activeTrade.tp.toFixed(dec)}</td><td style="padding:12px 20px;border-bottom:1px solid var(--border)" class="trade-loss">${activeTrade.sl.toFixed(dec)}</td><td style="padding:12px 20px;border-bottom:1px solid var(--border)"><span style="display:inline-block;padding:3px 8px;border-radius:3px;font-size:10px;font-weight:700;letter-spacing:1px;background:rgba(245,158,11,0.15);color:var(--warn);border:1px solid rgba(245,158,11,0.3);">OPEN</span></td><td style="padding:12px 20px;border-bottom:1px solid var(--border)" class="trade-open">pending</td></tr>`;
+    if (_goActiveTrades.length > 0) {
+        const activeTrade = _goActiveTrades[0];
+        const dec = activeTrade.entry_price < 1 ? 6 : activeTrade.entry_price < 10 ? 4 : 2;
+        const curPnl = activeTrade.pnl || 0;
+        const curPnlColor = curPnl >= 0 ? 'trade-win' : 'trade-loss';
+        const curPnlSign = curPnl >= 0 ? '+' : '';
+        const status = activeTrade.status || 'OPEN';
+        const entryDisplay = status === 'PENDING' ? (activeTrade.limit_price || activeTrade.entry_price || 0) : (activeTrade.entry_price || 0);
+        const statusColor = status === 'PENDING' ? 'var(--warn)' : 'var(--accent)';
+        rows += `<tr style="background:rgba(245,158,11,0.04)"><td style="padding:12px 20px;border-bottom:1px solid var(--border);color:var(--text)">${activeTrade.time||'--'}</td><td style="padding:12px 20px;border-bottom:1px solid var(--border)" class="${activeTrade.side==='BUY'?'trade-win':'trade-loss'}">${activeTrade.side}</td><td style="padding:12px 20px;border-bottom:1px solid var(--border);color:var(--text)">${entryDisplay.toFixed(dec)}</td><td style="padding:12px 20px;border-bottom:1px solid var(--border)" class="trade-win">${(activeTrade.take_profit||0).toFixed(dec)}</td><td style="padding:12px 20px;border-bottom:1px solid var(--border)" class="trade-loss">${(activeTrade.stop_loss||0).toFixed(dec)}</td><td style="padding:12px 20px;border-bottom:1px solid var(--border)"><span style="display:inline-block;padding:3px 8px;border-radius:3px;font-size:10px;font-weight:700;letter-spacing:1px;background:rgba(245,158,11,0.15);color:${statusColor};border:1px solid rgba(245,158,11,0.3);">${status}</span></td><td style="padding:12px 20px;border-bottom:1px solid var(--border)" class="${curPnlColor}">${curPnlSign}${curPnl.toFixed(2)}%</td></tr>`;
     }
-    tradeHistory.forEach(t => {
-        const isWin = t.result === 'WIN', cls = isWin ? 'trade-win' : 'trade-loss', dec = t.entry < 1 ? 6 : t.entry < 10 ? 4 : 2, pnl = (t.pnl_pct >= 0 ? '+' : '') + t.pnl_pct.toFixed(2) + '%';
-        const badgeBg = isWin ? 'rgba(0,229,160,0.12)' : 'rgba(239,68,68,0.1)', badgeClr = isWin ? 'var(--accent)' : 'var(--danger)', badgeBdr = isWin ? 'rgba(0,229,160,0.3)' : 'rgba(239,68,68,0.3)';
-        rows += `<tr onmouseenter="this.style.background='rgba(255,255,255,0.02)'" onmouseleave="this.style.background=''"><td style="padding:12px 20px;border-bottom:1px solid var(--border);color:var(--text2)">${t.time}</td><td style="padding:12px 20px;border-bottom:1px solid var(--border)" class="${cls}">${t.action}</td><td style="padding:12px 20px;border-bottom:1px solid var(--border);color:var(--text)">${t.entry.toFixed(dec)}</td><td style="padding:12px 20px;border-bottom:1px solid var(--border)" class="trade-win">${t.tp.toFixed(dec)}</td><td style="padding:12px 20px;border-bottom:1px solid var(--border)" class="trade-loss">${t.sl.toFixed(dec)}</td><td style="padding:12px 20px;border-bottom:1px solid var(--border)"><span style="display:inline-block;padding:3px 8px;border-radius:3px;font-size:10px;font-weight:700;letter-spacing:1px;background:${badgeBg};color:${badgeClr};border:1px solid ${badgeBdr};">${t.result}</span></td><td style="padding:12px 20px;border-bottom:1px solid var(--border)" class="${cls}">${pnl}</td></tr>`;
+    _goTradeHistory.forEach(t => {
+        const isWin = (t.pnl || 0) >= 0;
+        const cls = isWin ? 'trade-win' : 'trade-loss';
+        const dec = t.entry_price < 1 ? 6 : t.entry_price < 10 ? 4 : 2;
+        const pnl = (t.pnl >= 0 ? '+' : '') + (t.pnl||0).toFixed(2) + '%';
+        const badgeBg = isWin ? 'rgba(0,229,160,0.12)' : 'rgba(239,68,68,0.1)';
+        const badgeClr = isWin ? 'var(--accent)' : 'var(--danger)';
+        const badgeBdr = isWin ? 'rgba(0,229,160,0.3)' : 'rgba(239,68,68,0.3)';
+        rows += `<tr onmouseenter="this.style.background='rgba(255,255,255,0.02)'" onmouseleave="this.style.background=''"><td style="padding:12px 20px;border-bottom:1px solid var(--border);color:var(--text2)">${t.time||'--'}</td><td style="padding:12px 20px;border-bottom:1px solid var(--border)" class="${t.side==='BUY'?'trade-win':'trade-loss'}">${t.side}</td><td style="padding:12px 20px;border-bottom:1px solid var(--border);color:var(--text)">${(t.entry_price||0).toFixed(dec)}</td><td style="padding:12px 20px;border-bottom:1px solid var(--border)" class="trade-win">${(t.take_profit||0).toFixed(dec)}</td><td style="padding:12px 20px;border-bottom:1px solid var(--border)" class="trade-loss">${(t.stop_loss||0).toFixed(dec)}</td><td style="padding:12px 20px;border-bottom:1px solid var(--border)"><span style="display:inline-block;padding:3px 8px;border-radius:3px;font-size:10px;font-weight:700;letter-spacing:1px;background:${badgeBg};color:${badgeClr};border:1px solid ${badgeBdr};">${t.status}</span></td><td style="padding:12px 20px;border-bottom:1px solid var(--border)" class="${cls}">${pnl}</td></tr>`;
     });
+    
+    // MOCK history rendering removed
+    
     if (!rows) rows = `<tr><td colspan="7" style="text-align:center;padding:3rem;color:var(--text2);font-family:var(--mono);font-size:13px;">No closed trades yet</td></tr>`;
     tbody.innerHTML = rows;
 }
@@ -1263,6 +1457,14 @@ function renderFullTradesTable() {
 // ── BOOT SEQUENCE ─────────────────────────────────────────────────────────────
 loadConfig();
 loadSimState();
+
+const styleSelect = document.getElementById('cfg-style');
+if (styleSelect) {
+    styleSelect.addEventListener('change', () => {
+        loadSimState();
+        renderFullTradesTable();
+    });
+}
 loadBybitPairs('bybit');
 _loadAISignalHistory();
 ensureSignalPaneReady();
@@ -1279,3 +1481,77 @@ setInterval(poll, 1500);
 setInterval(fetchAIInsight, 3000);
 setTimeout(connectLivePriceWS, 1000);
 setInterval(fetchPositions, 1000);
+
+// [FIX-AI-LIVE] Background polling for AI Signal Live Prices
+async function _updateAISignalLivePrices() {
+    const openSymbols = [...new Set(_aiSignalHistory.filter(s => s.status === 'OPEN' || s.status === 'PENDING').map(s => s.symbol))];
+    if (!openSymbols.length) return;
+    
+    // Batch into chunks of 10 if too many
+    try {
+        const url = `/api/proxy/tickers?symbol=${openSymbols.join(',')}`;
+        const r = await fetch(url);
+        const d = await r.json();
+        if (d && d.result && d.result.list) {
+            let changed = false;
+            d.result.list.forEach(tick => {
+                const price = parseFloat(tick.lastPrice);
+                _aiSignalHistory.forEach(sig => {
+                    if ((sig.status === 'OPEN' || sig.status === 'PENDING') && sig.symbol === tick.symbol) {
+                        sig.livePrice = price;
+                        // Gunakan leverage dinamis proporsional
+                        const exchange = document.getElementById('cfg-exchange').value || 'mexc';
+                        const activeSym = document.getElementById('cfg-symbol').value || 'BTCUSDT';
+                        const userLev = stats.leverage || 10;
+                        const levRatio = userLev / getMaxLeverage(exchange, activeSym);
+                        const lev = Math.max(1, Math.round(getMaxLeverage(exchange, sig.symbol) * levRatio));
+                        
+                        // Limit Order Trigger Logic for AI Insight
+                        if (sig.status === 'PENDING') {
+                            if ((sig.direction === 'LONG' || sig.direction === 'BUY') && price <= sig.entry) {
+                                sig.status = 'OPEN';
+                            } else if ((sig.direction === 'SHORT' || sig.direction === 'SELL') && price >= sig.entry) {
+                                sig.status = 'OPEN';
+                            }
+                        }
+
+                        // Cek TP / SL sekalian supaya bisa running background tanpa di-trigger manual!
+                        if (sig.status === 'OPEN') {
+                            if (sig.direction === 'LONG' || sig.direction === 'BUY') {
+                                if (price >= sig.tp) { sig.status = 'WIN'; sig.pnl = '+' + (((sig.tp - sig.entry) / sig.entry) * 100 * lev).toFixed(2) + '%'; sig.closeTime = new Date().toLocaleTimeString(); changed = true; }
+                                else if (price <= sig.sl) { sig.status = 'LOSS'; sig.pnl = (((sig.sl - sig.entry) / sig.entry) * 100 * lev).toFixed(2) + '%'; sig.closeTime = new Date().toLocaleTimeString(); changed = true; }
+                            } else {
+                                if (price <= sig.tp) { sig.status = 'WIN'; sig.pnl = '+' + (((sig.entry - sig.tp) / sig.entry) * 100 * lev).toFixed(2) + '%'; sig.closeTime = new Date().toLocaleTimeString(); changed = true; }
+                                else if (price >= sig.sl) { sig.status = 'LOSS'; sig.pnl = (((sig.entry - sig.sl) / sig.entry) * 100 * lev).toFixed(2) + '%'; sig.closeTime = new Date().toLocaleTimeString(); changed = true; }
+                            }
+                        }
+
+                        if (sig.status === 'OPEN') {
+                            // Calculate Live PnL Percentage
+                            let unrealizedPct = 0;
+                            if (sig.direction === 'LONG' || sig.direction === 'BUY') {
+                                unrealizedPct = ((price - sig.entry) / sig.entry) * 100.0 * lev;
+                                const maxWin = ((sig.tp - sig.entry) / sig.entry) * 100.0 * lev;
+                                const maxLoss = ((sig.sl - sig.entry) / sig.entry) * 100.0 * lev;
+                                if (unrealizedPct > maxWin) unrealizedPct = maxWin;
+                                if (unrealizedPct < maxLoss) unrealizedPct = maxLoss;
+                            } else {
+                                unrealizedPct = ((sig.entry - price) / sig.entry) * 100.0 * lev;
+                                const maxWin = ((sig.entry - sig.tp) / sig.entry) * 100.0 * lev;
+                                const maxLoss = ((sig.entry - sig.sl) / sig.entry) * 100.0 * lev;
+                                if (unrealizedPct > maxWin) unrealizedPct = maxWin;
+                                if (unrealizedPct < maxLoss) unrealizedPct = maxLoss;
+                            }
+                            const sign = unrealizedPct >= 0 ? '+' : '';
+                            sig.pnl = `${sign}${unrealizedPct.toFixed(2)}%`;
+                            changed = true;
+                        }
+                    }
+                });
+            });
+            if (changed) { _saveAISignalHistory(); renderAISignalHistory(); }
+        }
+    } catch(e) {}
+}
+setInterval(_updateAISignalLivePrices, 2000);
+
