@@ -1,0 +1,75 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    /* Dark quant-terminal theme (forced dark) */
+    --background: 222 47% 4%;
+    --foreground: 210 24% 90%;
+
+    --panel: 222 38% 7%;
+    --card: 222 38% 7%;
+    --card-foreground: 210 24% 90%;
+
+    --popover: 222 40% 9%;
+    --popover-foreground: 210 24% 90%;
+
+    --primary: 174 70% 47%;
+    --primary-foreground: 200 60% 6%;
+
+    --muted: 220 22% 14%;
+    --muted-foreground: 215 14% 55%;
+
+    --accent: 174 70% 47%;
+    --accent-foreground: 200 60% 6%;
+
+    --border: 220 24% 13%;
+    --grid: 220 22% 11%;
+    --ring: 174 70% 47%;
+
+    --positive: 152 62% 46%;
+    --negative: 358 70% 58%;
+    --warning: 38 92% 56%;
+    --flash: 174 70% 47%;
+
+    --radius: 0.4rem;
+  }
+}
+
+@layer base {
+  * {
+    border-color: hsl(var(--border));
+  }
+  html {
+    background-color: hsl(var(--background));
+  }
+  body {
+    background-color: hsl(var(--background));
+    color: hsl(var(--foreground));
+    font-feature-settings: "rlig" 1, "calt" 1, "tnum" 1;
+  }
+  /* tabular numerics everywhere numbers matter */
+  .tabular {
+    font-variant-numeric: tabular-nums;
+  }
+}
+
+/* thin scrollbars for dense panels */
+.scroll-thin::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+.scroll-thin::-webkit-scrollbar-thumb {
+  background: hsl(var(--muted));
+  border-radius: 9999px;
+}
+.scroll-thin::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+/* subtle dotted background grid for the terminal feel */
+.bg-terminal-grid {
+  background-image: radial-gradient(hsl(var(--grid)) 1px, transparent 1px);
+  background-size: 22px 22px;
+}
