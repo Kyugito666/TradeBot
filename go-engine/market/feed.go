@@ -88,6 +88,7 @@ type State struct {
 	// Sentiment (dari RSS goroutine — Linguist input)
 	SentimentScore float32
 	NewsCount      uint32
+	Pct24h         float64
 
 	// [FIX-F1] Symbol DIHAPUS dari State — dipindah ke atomic.Value di Feed
 	// agar UpdateSymbol() tidak perlu lock State mutex
@@ -110,12 +111,21 @@ type Feed struct {
 	// Buffer=1 agar UpdateSymbol() tidak block jika WS sedang reconnect.
 	symChangeCh     chan struct{}
 	symChangeRestCh chan struct{}
+
+	isBacktesting atomic.Bool
+}
+
+func (f *Feed) SetBacktesting(v bool) {
+	f.isBacktesting.Store(v)
+}
+
+func (f *Feed) IsBacktesting() bool {
+	return f.isBacktesting.Load()
 }
 
 // New membuat Feed baru. Symbol awal dari parameter, bisa diganti via UpdateSymbol().
-func New(bridge *shm.Bridge, symbol, ohlcvTF string, limit int) *Feed {
+func New(symbol, ohlcvTF string, limit int) *Feed {
 	f := &Feed{
-		bridge:          bridge,
 		client:          &http.Client{Timeout: 10 * time.Second},
 		ohlcvTF:         ohlcvTF,
 		limit:           limit,
@@ -186,6 +196,7 @@ func (f *Feed) Run(ctx context.Context) {
 		log.Printf("[Feed] Initial OHLCV fetch failed: %v", err)
 	}
 	_ = f.fetchAux(f.getSymbol())
+	_ = f.fetch24h(f.getSymbol())
 
 	var wg sync.WaitGroup
 
@@ -394,8 +405,6 @@ func (f *Feed) wsConnect(ctx context.Context, symbol string) error {
 		}
 		f.state.mu.Unlock()
 
-		// [FIX-F1] Flush SHM dengan symbol terbaru, bukan symbol parameter lama
-		f.flushToSHM(f.getSymbol())
 	}
 }
 
@@ -465,18 +474,30 @@ func (f *Feed) fetchOHLCV(symbol string) error {
 func (f *Feed) fetchAux(symbol string) error {
 	oiURL := fmt.Sprintf("%s/v5/market/open-interest?category=linear&symbol=%s&intervalTime=5min&limit=1",
 		bybitRESTMain, symbol)
-	if oi, err := fetchSpecificFloat(f.client, oiURL, "openInterest"); err == nil && oi > 0 {
-		if oi < 1e10 {
-			// [FIX-F3] Drop jika symbol sudah berubah
-			if f.getSymbol() != symbol {
-				return nil
-			}
+	if oi, err := fetchSpecificFloat(f.client, oiURL, "openInterest"); err == nil && oi > 0 && oi < 1e10 {
+		if f.getSymbol() == symbol {
 			f.state.mu.Lock()
 			f.state.OI = oi
 			f.state.mu.Unlock()
-			log.Printf("[OI] %s oi=%.2f (contracts)", symbol, oi)
-		} else {
-			log.Printf("[OI] %s SKIP suspicious value=%.0f (looks like timestamp)", symbol, oi)
+			log.Printf("[OI] %s oi=%.2f (Bybit)", symbol, oi)
+		}
+	} else {
+		// Fallback to Binance
+		binanceOIURL := fmt.Sprintf("https://fapi.binance.com/fapi/v1/openInterest?symbol=%s", symbol)
+		resp, bErr := f.client.Get(binanceOIURL)
+		if bErr == nil {
+			defer resp.Body.Close()
+			var bData struct {
+				OpenInterest float64 `json:"openInterest,string"`
+			}
+			if json.NewDecoder(resp.Body).Decode(&bData) == nil && bData.OpenInterest > 0 {
+				if f.getSymbol() == symbol {
+					f.state.mu.Lock()
+					f.state.OI = bData.OpenInterest
+					f.state.mu.Unlock()
+					log.Printf("[OI] %s oi=%.2f (Binance Fallback)", symbol, bData.OpenInterest)
+				}
+			}
 		}
 	}
 
@@ -484,13 +505,30 @@ func (f *Feed) fetchAux(symbol string) error {
 		bybitRESTMain, symbol)
 	if buy, sell, err := fetchLSR(f.client, lsrURL); err == nil && sell > 0 {
 		lsr := buy / sell
-		if f.getSymbol() != symbol {
-			return nil
+		if f.getSymbol() == symbol {
+			f.state.mu.Lock()
+			f.state.LSR = lsr
+			f.state.mu.Unlock()
+			log.Printf("[WHALE] %s LSR=%.4f bias=%s (Bybit)", symbol, lsr, lsrBiasLabel(lsr))
 		}
-		f.state.mu.Lock()
-		f.state.LSR = lsr
-		f.state.mu.Unlock()
-		log.Printf("[WHALE] %s LSR=%.4f bias=%s", symbol, lsr, lsrBiasLabel(lsr))
+	} else {
+		// Fallback to Binance LSR
+		binanceLSRURL := fmt.Sprintf("https://fapi.binance.com/futures/data/globalLongShortAccountRatio?symbol=%s&period=5m&limit=1", symbol)
+		resp, bErr := f.client.Get(binanceLSRURL)
+		if bErr == nil {
+			defer resp.Body.Close()
+			var bData []struct {
+				LongShortRatio float64 `json:"longShortRatio,string"`
+			}
+			if json.NewDecoder(resp.Body).Decode(&bData) == nil && len(bData) > 0 {
+				if f.getSymbol() == symbol {
+					f.state.mu.Lock()
+					f.state.LSR = bData[0].LongShortRatio
+					f.state.mu.Unlock()
+					log.Printf("[WHALE] %s LSR=%.4f bias=%s (Binance Fallback)", symbol, bData[0].LongShortRatio, lsrBiasLabel(bData[0].LongShortRatio))
+				}
+			}
+		}
 	}
 
 	frURL := fmt.Sprintf("%s/v5/market/funding/history?category=linear&symbol=%s&limit=1",
@@ -504,6 +542,29 @@ func (f *Feed) fetchAux(symbol string) error {
 		f.state.mu.Unlock()
 	}
 
+	tickURL := fmt.Sprintf("%s/v5/market/tickers?category=linear&symbol=%s", bybitRESTMain, symbol)
+	if pct, err := fetchSpecificFloat(f.client, tickURL, "price24hPcnt"); err == nil {
+		if f.getSymbol() != symbol {
+			return nil
+		}
+		f.state.mu.Lock()
+		f.state.Pct24h = pct * 100.0 // bybit returns 0.01 for 1%
+		f.state.mu.Unlock()
+	}
+
+	return nil
+}
+
+func (f *Feed) fetch24h(symbol string) error {
+	url := fmt.Sprintf("%s/v5/market/tickers?category=linear&symbol=%s", bybitRESTMain, symbol)
+	if pct, err := fetchSpecificFloat(f.client, url, "price24hPcnt"); err == nil {
+		f.state.mu.Lock()
+		f.state.Pct24h = pct * 100.0 // bybit returns 0.01 for 1%
+		f.state.mu.Unlock()
+	} else {
+		// Fallback for some reason
+		log.Printf("[Feed] Failed to fetch initial 24h Pct for %s: %v", symbol, err)
+	}
 	return nil
 }
 
@@ -520,16 +581,15 @@ func lsrBiasLabel(lsr float64) string {
 
 var flushSeq uint64
 
-func (f *Feed) flushToSHM(symbol string) {
+func (f *Feed) GetMarketData(symbol string) *shm.MarketData {
 	f.state.mu.RLock()
 	s := f.state
 	f.state.mu.RUnlock()
 
 	if s.Price <= 0 || len(s.Candles) == 0 {
-		return
+		return nil
 	}
 
-	// [FIX-F1] Encode symbol terbaru ke SHM (bukan symbol stale dari state)
 	var sym [16]byte
 	copy(sym[:], symbol)
 
@@ -553,8 +613,7 @@ func (f *Feed) flushToSHM(symbol string) {
 		TsMs:           time.Now().UnixMilli(),
 	}
 
-	f.bridge.WriteMarket(md)
-	atomic.AddUint64(&flushSeq, 1)
+	return md
 }
 
 // ── Math helpers ──────────────────────────────────────────────────────────────

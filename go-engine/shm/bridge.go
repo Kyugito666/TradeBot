@@ -47,10 +47,10 @@ const (
 
 	// MarketData layout
 	offMarket   = 64
-	maxCandles  = 200
+	maxCandles  = 1000
 	candleBytes = 48 // 6 × float64/int64
 	symLen      = 16
-	agentCount  = 9
+	agentCount  = 13
 	reasonLen   = 256
 
 	offSymbol   = offMarket
@@ -71,23 +71,23 @@ const (
 	offShortLiq = offLongLiq + 8                      // 9776
 	offSentF32  = offShortLiq + 8                     // 9784
 	offNewsCnt  = offSentF32 + 4                      // 9788
-	offMktTs    = offNewsCnt + 4                      // 9792 (8-byte aligned)
-	// MarketData ends at 9800
+	offMktTs    = offNewsCnt + 4                      // 48192 (8-byte aligned)
+	// MarketData ends at 48200
 
-	// SignalResult layout (offset 9800)
-	offSig          = 9800
+	// SignalResult layout (offset 48200)
+	offSig          = offMktTs + 8
 	offSigAction    = offSig + 0  // uint8
 	offSigVeto      = offSig + 1  // uint8
-	// _pad2 [9802..9808]
+	// _pad2 [48202..48208]
 	offSigConf      = offSig + 8   // float64
 	offSigEntry     = offSig + 16
 	offSigTP        = offSig + 24
 	offSigSL        = offSig + 32
 	offSigRR        = offSig + 40
 	offSigReason    = offSig + 48             // [256]byte
-	offSigDirs      = offSigReason + reasonLen // [9]uint8
-	// alignment padding for 8 bytes: 10104 + 9 = 10113 -> pad 7 bytes = 10120
-	offSigConvBase  = offSigDirs + agentCount + 7 // [9]float64
+	offSigDirs      = offSigReason + reasonLen // [13]uint8
+	// alignment padding for 8 bytes: 48517 + 13 = 48530 -> pad 3 bytes = 48533
+	offSigConvBase  = offSigDirs + agentCount + 3 // [13]float64
 	offSigTs        = offSigConvBase + agentCount*8
 )
 

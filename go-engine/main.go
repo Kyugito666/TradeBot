@@ -28,12 +28,15 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log"
 	"math"
+	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"syscall"
@@ -79,7 +82,7 @@ func loadConfig() Config {
 		ExchangeMode: envStr("EXCHANGE_MODE", "demo"),
 		Symbol:       envStr("SYMBOL", "SOLUSDT"),
 		OHLCVTF:      "5",
-		OHLCVLimit:   200,
+		OHLCVLimit:   1000,
 		RiskPct:      envFloat("RISK_PCT", 0.03),
 		Leverage:     envInt("LEVERAGE", 10),
 		DryRun:       envBool("DRY_RUN", false),
@@ -94,7 +97,11 @@ func loadConfig() Config {
 	}
 
 	if pwd, err := os.Getwd(); err == nil {
-		c.BaseDir = pwd
+		if filepath.Base(pwd) == "go-engine" {
+			c.BaseDir = filepath.Dir(pwd)
+		} else {
+			c.BaseDir = pwd
+		}
 	} else {
 		c.BaseDir = filepath.Dir(execPath())
 	}
@@ -197,65 +204,166 @@ func main() {
 		Advice: "Menyiapkan mesin AI & menunggu data market pertama...",
 	})
 
-	// ── Market feed ───────────────────────────────────────────────────────────
-	feed := market.New(bridge, cfg.Symbol, cfg.OHLCVTF, cfg.OHLCVLimit)
+	// ── Context ───────────────────────────────────────────────────────────────
 	mainCtx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	go feed.Run(mainCtx)
+	// ── NLP engine ───────────────────────────────────────────────────────────
+	nlpEngine := nlp.NewEngine(cfg.Symbol, 5*time.Minute)
+	// (Note: nlpEngine.Run will now be started after activeFeeds is populated)
 
-	// ── Symbol channel wiring ────────────────────────────────────────────────
-	go func() {
-		if activeSym := srv.GetActiveSymbol(); activeSym != "" && activeSym != cfg.Symbol {
-			log.Printf("[main] [FIX-PAIR-BOOT] Sync symbol from server cache: %s → %s",
-				cfg.Symbol, activeSym)
-			feed.UpdateSymbol(activeSym)
+	activePaperTrades := make(map[string]*gateway.Position)
+	paperTradeOpenedAts := make(map[string]time.Time)
+	var paperHistory []gateway.Position
+
+	type PaperTradesState struct {
+		Active   map[string]*gateway.Position `json:"active"`
+		History  []gateway.Position           `json:"history"`
+		OpenedAt map[string]time.Time         `json:"opened_at"`
+	}
+
+	stateFile := filepath.Join(cfg.BaseDir, "paper_trades.json")
+	if b, err := os.ReadFile(stateFile); err == nil {
+		var state PaperTradesState
+		if err := json.Unmarshal(b, &state); err == nil {
+			if state.Active != nil {
+				activePaperTrades = state.Active
+			}
+			paperHistory = state.History
+			if state.OpenedAt != nil {
+				paperTradeOpenedAts = state.OpenedAt
+			}
+			log.Printf("[Paper] Hydrated persistent state: actives=%d history_len=%d", len(activePaperTrades), len(paperHistory))
+			// Just send the first active one for dashboard backward compatibility, or update dashboard to handle multiple
+			var anyActive *gateway.Position
+			for _, v := range activePaperTrades {
+				anyActive = v
+				break
+			}
+			srv.UpdatePositions(anyActive, paperHistory)
 		}
+	}
 
+	savePaperState := func() {
+		state := PaperTradesState{
+			Active:   activePaperTrades,
+			History:  paperHistory,
+			OpenedAt: paperTradeOpenedAts,
+		}
+		if b, err := json.MarshalIndent(state, "", "  "); err == nil {
+			os.WriteFile(stateFile, b, 0644)
+		}
+	}
+
+	// ── Auto Screener & Feeds ───────────────────────────────────────────────
+	activeFeeds := make(map[string]*market.Feed)
+	
+	// Default starting feed
+	initialFeed := market.New(cfg.Symbol, cfg.OHLCVTF, cfg.OHLCVLimit)
+	activeFeeds[cfg.Symbol] = initialFeed
+	
+	go func() {
+		initialFeed.Run(mainCtx)
+	}()
+	go nlpEngine.Run(mainCtx, initialFeed)
+
+	go func() {
+		log.Printf("[Screener] Started. Will fetch top volatile pairs every 5 minutes.")
+		ticker := time.NewTicker(5 * time.Minute)
+		defer ticker.Stop()
+		
 		for {
 			select {
 			case <-mainCtx.Done():
 				return
-			case sym := <-srv.GetSymbolCh():
-				log.Printf("[main] [FIX-PAIR] ⚡ Pair switched → %s (live, no server restart needed)", sym)
-				feed.UpdateSymbol(sym)
-				cfg.Symbol = sym
+			case <-ticker.C:
+				if srv.IsBacktesting() { continue }
+				
+				// 1. Fetch Bybit Tickers
+				resp, err := http.Get("https://api.bytick.com/v5/market/tickers?category=linear")
+				if err != nil {
+					log.Printf("[Screener] Error fetching tickers: %v", err)
+					continue
+				}
+				
+				var res struct {
+					Result struct {
+						List []struct {
+							Symbol        string `json:"symbol"`
+							Turnover24h   string `json:"turnover24h"`
+							Price24hPcnt  string `json:"price24hPcnt"`
+						} `json:"list"`
+					} `json:"result"`
+				}
+				if err := json.NewDecoder(resp.Body).Decode(&res); err != nil {
+					resp.Body.Close()
+					continue
+				}
+				resp.Body.Close()
+				
+				// 2. Filter & Sort
+				type PairData struct {
+					Symbol string
+					Vol    float64
+					Pcnt   float64
+				}
+				var validPairs []PairData
+				for _, p := range res.Result.List {
+					if strings.Contains(p.Symbol, "-") { continue }
+					if !strings.HasSuffix(p.Symbol, "USDT") { continue }
+					
+					vol, _ := strconv.ParseFloat(p.Turnover24h, 64)
+					pcnt, _ := strconv.ParseFloat(p.Price24hPcnt, 64)
+					if vol > 5000000 { // minimum 5M daily turnover
+						validPairs = append(validPairs, PairData{Symbol: p.Symbol, Vol: vol, Pcnt: math.Abs(pcnt)})
+					}
+				}
+				
+				sort.Slice(validPairs, func(i, j int) bool {
+					return validPairs[i].Pcnt > validPairs[j].Pcnt // sort by highest volatility
+				})
+				
+				// Determine target pair(s)
+				// For now, let's keep the user's selected pair, and add top 3 volatile pairs (total 4)
+				// The dashboard handles Multi/Single mode via `srv`.
+				
+				// If we have single pair mode, we can auto-switch to the top 1 if user enables auto-filter
+				// But to keep it safe, let's just make sure activeFeeds has up to 4 feeds in multi-pair mode.
+				// Since we don't have a strict multi-pair flag in backend yet, we'll maintain the top 4.
+				
+				targetFeeds := make(map[string]bool)
+				targetFeeds[cfg.Symbol] = true // Always keep the primary symbol
+				
+				added := 0
+				for _, vp := range validPairs {
+					if added >= 3 { break }
+					if vp.Symbol != cfg.Symbol {
+						targetFeeds[vp.Symbol] = true
+						added++
+					}
+				}
+				
+				// Reconcile activeFeeds
+				for sym := range activeFeeds {
+					if !targetFeeds[sym] {
+						// We should stop this feed, but for now we just remove it from map
+						// (Proper feed cancellation requires context per feed)
+						log.Printf("[Screener] Removing feed for %s", sym)
+						delete(activeFeeds, sym)
+					}
+				}
+				
+				for sym := range targetFeeds {
+					if _, ok := activeFeeds[sym]; !ok {
+						log.Printf("[Screener] Adding new feed for %s", sym)
+						newFeed := market.New(sym, cfg.OHLCVTF, cfg.OHLCVLimit)
+						activeFeeds[sym] = newFeed
+						go newFeed.Run(mainCtx)
+					}
+				}
 			}
 		}
 	}()
-
-	// ── NLP engine ───────────────────────────────────────────────────────────
-	nlpEngine := nlp.NewEngine(cfg.Symbol, 5*time.Minute)
-	go nlpEngine.Run(mainCtx, feed)
-
-	// ── Signal loop vars ──────────────────────────────────────────────────────
-	lastRustSeq       := uint64(0)
-	lastAction        := "WAIT"
-	lastActionAt      := time.Now().Add(-10 * time.Minute)
-	cooldownUntil     := time.Time{}
-	consecutiveLosses := 0
-
-	// [FIX-DEDUP] Track last execution result untuk reset timer jika gagal
-	lastOrderFailed := false
-
-	lastActionTimeout := map[string]time.Duration{
-		"scalping":   10 * time.Minute,
-		"daytrading": 30 * time.Minute,
-		"daytrade":   30 * time.Minute,
-		"swing":      4 * time.Hour,
-		"sniper":     4 * time.Hour,
-	}
-	getLastActionTimeout := func() time.Duration {
-		style := strings.ToLower(cfg.TradingStyle)
-		if d, ok := lastActionTimeout[style]; ok {
-			return d
-		}
-		return 10 * time.Minute
-	}
-
-	var activePaperTrade   *gateway.Position
-	var paperTradeOpenedAt time.Time
-	var paperHistory       []gateway.Position
 
 	// ── Main signal loop ──────────────────────────────────────────────────────
 	go func() {
@@ -269,251 +377,234 @@ func main() {
 			default:
 			}
 
-			state := feed.State()
-			currentSym := state.Symbol
-			if currentSym == "" {
-				currentSym = cfg.Symbol
+			if srv.IsBacktesting() {
+				time.Sleep(1 * time.Second)
+				continue
 			}
 
-			// ── Paper trade TP/SL check + timeout (Lakukan SEBELUM block sig & pause) ──
 			isDryRun := srv.IsDryRun()
-			if isDryRun && activePaperTrade != nil {
-				isClosed    := false
-				closeReason := ""
-				
-				if activePaperTrade.Symbol != "" && state.Symbol != "" && activePaperTrade.Symbol != state.Symbol {
-					activePaperTrade.Status = "CANCELLED_PAIR_SWITCH"
-					isClosed = true
-					closeReason = "User switched trading pair"
-				} else if activePaperTrade.Status == "PENDING" {
-					if (activePaperTrade.Side == "BUY" && state.Price <= activePaperTrade.LimitPrice) || 
-					   (activePaperTrade.Side == "SELL" && state.Price >= activePaperTrade.LimitPrice) {
-						activePaperTrade.Status = "OPEN"
-						activePaperTrade.EntryPrice = activePaperTrade.LimitPrice
-						log.Printf("[Paper] 📈 LIMIT Order KEJEMPUT! Status PENDING -> OPEN @ %.4f", activePaperTrade.EntryPrice)
-						srv.UpdatePositions(activePaperTrade, paperHistory)
-					} else if time.Since(paperTradeOpenedAt) > 30 * time.Minute {
-						activePaperTrade.Status = "CLOSED_TIMEOUT"
-						isClosed = true
-						closeReason = "Limit Order expired (30 min)"
-					}
-				}
+			botRunning := srv.IsBotRunning()
 
-				if activePaperTrade.Status == "OPEN" {
-					unrealizedPct := 0.0
-					if activePaperTrade.Side == "BUY" {
-						unrealizedPct = ((state.Price - activePaperTrade.EntryPrice) / activePaperTrade.EntryPrice) * 100.0
-					} else if activePaperTrade.Side == "SELL" {
-						unrealizedPct = ((activePaperTrade.EntryPrice - state.Price) / activePaperTrade.EntryPrice) * 100.0
-					}
-					activePaperTrade.PnL = unrealizedPct * float64(cfg.Leverage)
-
-					if (activePaperTrade.Side == "BUY" && state.Price >= activePaperTrade.TakeProfit) ||
-						(activePaperTrade.Side == "SELL" && state.Price <= activePaperTrade.TakeProfit) {
-						activePaperTrade.Status = "CLOSED_TP"
-						isClosed    = true
-						closeReason = fmt.Sprintf("TP hit @ %.4f (target=%.4f)", state.Price, activePaperTrade.TakeProfit)
-					} else if (activePaperTrade.Side == "BUY" && state.Price <= activePaperTrade.StopLoss) ||
-						(activePaperTrade.Side == "SELL" && state.Price >= activePaperTrade.StopLoss) {
-						activePaperTrade.Status = "CLOSED_SL"
-						isClosed    = true
-						closeReason = fmt.Sprintf("SL hit @ %.4f (target=%.4f)", state.Price, activePaperTrade.StopLoss)
-					}
-
-					if !isClosed && time.Since(paperTradeOpenedAt) > MAX_PAPER_TRADE_DURATION {
-						activePaperTrade.Status = "TIMEOUT"
-						isClosed    = true
-						closeReason = fmt.Sprintf("TIMEOUT after %.0f min, price=%.4f",
-							time.Since(paperTradeOpenedAt).Minutes(), state.Price)
-					}
-				}
-
-				if isClosed {
-					log.Printf("[Paper] ✗ Trade Closed: %s | %s | PnL=%.2f%%",
-						activePaperTrade.Status, closeReason, activePaperTrade.PnL)
-					// Handle PnL for Virtual Balance
-					if isDryRun {
-						virtualBal := srv.GetVirtualBalance()
-						// Balikin margin + PnL (di mana PnL adalah persentase ROE)
-						profitUSD := activePaperTrade.Margin * (activePaperTrade.PnL / 100.0)
-						marginReturned := activePaperTrade.Margin + profitUSD
-						srv.SetVirtualBalance(virtualBal + marginReturned)
-					}
-
-					paperHistory = append([]gateway.Position{*activePaperTrade}, paperHistory...)
-					if len(paperHistory) > 50 {
-						paperHistory = paperHistory[:50]
-					}
-					activePaperTrade = nil
-					lastAction  = "WAIT"
-					lastActionAt = time.Now().Add(-getLastActionTimeout())
-				}
-
-				srv.UpdatePositions(activePaperTrade, paperHistory)
-			}
-
-			if !srv.IsBotRunning() {
-				lsr := state.LSR
-				if lsr < 1e-9 {
-					lsr = 1.0
-				}
-				pct24h := 0.0
-				if state.Price > 0 {
-					pct24h = math.Round((state.ATR14/state.Price)*100*10) / 10
-				}
-				srv.UpdateInsight(gateway.InsightData{
-					Symbol: currentSym, LastPrice: state.Price, OpenInterest: state.OI,
-					LSRVal: lsr, Pct24h: pct24h,
-					TrendState:   "MANUAL STOPPED — IDLE",
-					WhaleBias:    "NEUTRAL",
-					SignalStatus: "WAIT",
-					Advice:       "Bot Paused: Klik 'Start' di Dashboard untuk mengaktifkan trading otomatis",
-					Timestamp:    time.Now().Format("15:04:05"),
-					Balance:      balance,
-					EntryTarget:  state.Price,
-					TPTarget:     state.Price,
-					SLTarget:     state.Price,
-				})
-				time.Sleep(500 * time.Millisecond)
-				continue
-			}
-
-			// ─── BOT RUNNING (Signal dari Rust) ───────────────────────────────
-			sig := bridge.PollSignal(200 * time.Millisecond)
-			if sig == nil {
-				continue
-			}
-			if uint64(sig.TsMs) == lastRustSeq {
-				time.Sleep(10 * time.Millisecond)
-				continue
-			}
-			lastRustSeq = uint64(sig.TsMs)
-
-			dirStr := []string{"WAIT", "BUY", "SELL"}[sig.Action]
-
-			printEntry, printTP, printSL := sig.Entry, sig.TakeProfit, sig.StopLoss
-			if sig.Veto || printEntry == 0 {
-				printEntry, printTP, printSL = state.Price, state.Price, state.Price
-			}
-
-			log.Printf("[main] [%s] Signal: %s conf=%.3f entry=%.4f TP=%.4f SL=%.4f RR=%.2f veto=%v",
-				currentSym, dirStr, sig.Confidence, printEntry, printTP, printSL, sig.RiskReward, sig.Veto)
-
-			// Refresh balance
-			if b, err := fetchBalance(context.Background(), orderExecutor, cfg, srv); err == nil {
-				balance = b
-			}
-
-			updateInsight(srv, cfg, sig, balance, dirStr, feed)
-
-			if sig.Veto || dirStr == "WAIT" {
-				// if sig.Veto {
-				// 	log.Printf("[SKIP-VETO] %s", truncate(sig.VetoReason, 80))
-				// }
-				lastAction = "WAIT"
-				continue
-			}
-
-			if time.Now().Before(cooldownUntil) {
-				log.Printf("[SKIP-COOLDOWN] Circuit breaker aktif sampai %s", cooldownUntil.Format("15:04:05"))
-				continue
-			}
-
-			// [FIX-DEDUP] Jika order sebelumnya gagal, reset lastActionAt ke 3s lalu
-			// supaya signal retry bisa masuk setelah 3 detik (bukan nunggu full timeout)
-			if lastOrderFailed && dirStr == lastAction {
-				if time.Since(lastActionAt) > 3*time.Second {
-					log.Printf("[RETRY] Last order failed, allowing retry for %s", dirStr)
-					lastActionAt = time.Now().Add(-getLastActionTimeout())
-					lastOrderFailed = false
-				}
-			}
-
-			if dirStr == lastAction && time.Since(lastActionAt) < getLastActionTimeout() {
-				log.Printf("[SKIP-DEDUP] Arah %s sama, %.0f detik lalu", dirStr, time.Since(lastActionAt).Seconds())
-				continue
-			}
-
-			rrLimit := 1.0
-			switch strings.ToLower(cfg.TradingStyle) {
-			case "scalping":
-				rrLimit = 0.5
-			case "daytrading", "daytrade":
-				rrLimit = 0.8
-			case "swing", "sniper":
-				rrLimit = 1.0
-			}
-			if sig.RiskReward < rrLimit {
-				log.Printf("[SKIP-RR] RR=%.2f < %.2f (style=%s)", sig.RiskReward, rrLimit, cfg.TradingStyle)
-				continue
-			}
-
-			// Go engine tidak lagi memblokir via checkEMATrendVeto.
-			// Biarkan ConsensusEngine (Rust) yang menentukan EMA Veto (check_ema_trend_veto_v2).
-
-			if isDryRun && activePaperTrade != nil {
-				log.Printf("[SKIP-OPEN] Paper trade masih open: %s @ %.4f", activePaperTrade.Side, activePaperTrade.EntryPrice)
-				continue
-			}
-
-			lastAction  = dirStr
-			lastActionAt = time.Now()
-
-			snapSig := *sig
-			snapDir := dirStr
-
-			if isDryRun {
-				// Potong margin dari Virtual Balance
-				virtualBal := srv.GetVirtualBalance()
-				estimatedMargin := virtualBal * cfg.RiskPct
-				if virtualBal < estimatedMargin || estimatedMargin <= 0 {
-					log.Printf("[PAPER] Margin tidak cukup! Balance: %.2f, Butuh: %.2f", virtualBal, estimatedMargin)
+			for currentSym, feed := range activeFeeds {
+				md := feed.GetMarketData(currentSym)
+				if md == nil || md.Price <= 0 || len(md.Candles) == 0 {
 					continue
 				}
-				srv.SetVirtualBalance(virtualBal - estimatedMargin)
 
-				activePaperTrade = &gateway.Position{
-					Symbol:     cfg.Symbol,
-					Side:       snapDir,
-					EntryPrice: state.Price, // Harga saat order ditaruh
-					LimitPrice: snapSig.Entry,
-					TakeProfit: snapSig.TakeProfit,
-					StopLoss:   snapSig.StopLoss,
-					Time:       time.Now().Format("15:04:05"),
-					Status:     "PENDING",
-					PnL:        0.0,
-					Margin:     estimatedMargin,
-				}
-				paperTradeOpenedAt = time.Now()
-
-				log.Printf("[Paper] ✓ LIMIT Order placed: %s %s @ %.4f (Waiting for %.4f)",
-					snapDir, currentSym, state.Price, snapSig.Entry)
-				log.Printf("[Paper]   TP=%.4f SL=%.4f RR=%.2f conf=%.3f",
-					snapSig.TakeProfit, snapSig.StopLoss, snapSig.RiskReward, snapSig.Confidence)
-
-				srv.UpdatePositions(activePaperTrade, paperHistory)
-			} else {
-				go func() {
-					req := buildOrderRequest(snapSig, snapDir, currentSym)
-					execCtx, execCancel := context.WithTimeout(context.Background(), 15*time.Second)
-					defer execCancel()
-
-					if err := orderExecutor.Execute(execCtx, req); err != nil {
-						log.Printf("[main] ✗ Order execution failed: %v", err)
-						consecutiveLosses++
-						lastOrderFailed = true // [FIX-DEDUP] flag for retry
-						if consecutiveLosses >= 3 {
-							cooldownUntil      = time.Now().Add(60 * time.Minute)
-							consecutiveLosses  = 0
-							log.Printf("[main] CIRCUIT BREAKER: 3 consecutive failures, 60-min cooldown")
+				activePaperTrade := activePaperTrades[currentSym]
+				paperTradeOpenedAt := paperTradeOpenedAts[currentSym]
+				
+				if isDryRun && activePaperTrade != nil {
+					isClosed    := false
+					closeReason := ""
+					
+					if activePaperTrade.Status == "PENDING" {
+						if (activePaperTrade.Side == "BUY" && md.Price <= activePaperTrade.LimitPrice) || 
+						   (activePaperTrade.Side == "SELL" && md.Price >= activePaperTrade.LimitPrice) {
+							activePaperTrade.Status = "OPEN"
+							activePaperTrade.EntryPrice = activePaperTrade.LimitPrice
+							log.Printf("[Paper] 📈 LIMIT Order KEJEMPUT! Status PENDING -> OPEN @ %.4f", activePaperTrade.EntryPrice)
+							srv.UpdatePositions(activePaperTrade, paperHistory)
+							savePaperState()
+						} else if time.Since(paperTradeOpenedAt) > 30 * time.Minute {
+							activePaperTrade.Status = "CLOSED_TIMEOUT"
+							isClosed = true
+							closeReason = "Limit Order expired (30 min)"
 						}
-					} else {
-						log.Printf("[main] ✓ Order fired: %s %s", snapDir, currentSym)
-						consecutiveLosses = 0
-						lastOrderFailed = false
 					}
-				}()
-			}
+
+					if activePaperTrade.Status == "OPEN" {
+						unrealizedPct := 0.0
+						if activePaperTrade.Side == "BUY" {
+							unrealizedPct = ((md.Price - activePaperTrade.EntryPrice) / activePaperTrade.EntryPrice) * 100.0
+						} else if activePaperTrade.Side == "SELL" {
+							unrealizedPct = ((activePaperTrade.EntryPrice - md.Price) / activePaperTrade.EntryPrice) * 100.0
+						}
+						
+						feeImpactPct := float64(cfg.Leverage) * 0.11 
+						activePaperTrade.PnL = (unrealizedPct * float64(cfg.Leverage)) - feeImpactPct
+
+						if (activePaperTrade.Side == "BUY" && md.Price >= activePaperTrade.TakeProfit) ||
+							(activePaperTrade.Side == "SELL" && md.Price <= activePaperTrade.TakeProfit) {
+							activePaperTrade.Status = "CLOSED_TP"
+							isClosed    = true
+							closeReason = fmt.Sprintf("TP hit @ %.4f (target=%.4f)", md.Price, activePaperTrade.TakeProfit)
+						} else if (activePaperTrade.Side == "BUY" && md.Price <= activePaperTrade.StopLoss) ||
+							(activePaperTrade.Side == "SELL" && md.Price >= activePaperTrade.StopLoss) {
+							activePaperTrade.Status = "CLOSED_SL"
+							isClosed    = true
+							closeReason = fmt.Sprintf("SL hit @ %.4f (target=%.4f)", md.Price, activePaperTrade.StopLoss)
+						}
+
+						if !isClosed && time.Since(paperTradeOpenedAt) > 48 * time.Hour {
+							activePaperTrade.Status = "TIMEOUT"
+							isClosed    = true
+							closeReason = fmt.Sprintf("TIMEOUT, price=%.4f", md.Price)
+						}
+					}
+
+					if isClosed {
+						log.Printf("[Paper][%s] ✗ Trade Closed: %s | %s | PnL=%.2f%%", currentSym,
+							activePaperTrade.Status, closeReason, activePaperTrade.PnL)
+						if isDryRun {
+							virtualBal := srv.GetVirtualBalance()
+							profitUSD := activePaperTrade.Margin * (activePaperTrade.PnL / 100.0)
+							marginReturned := activePaperTrade.Margin + profitUSD
+							srv.SetVirtualBalance(virtualBal + marginReturned)
+						}
+
+						paperHistory = append([]gateway.Position{*activePaperTrade}, paperHistory...)
+						if len(paperHistory) > 50 {
+							paperHistory = paperHistory[:50]
+						}
+						delete(activePaperTrades, currentSym)
+						delete(paperTradeOpenedAts, currentSym)
+						activePaperTrade = nil
+						savePaperState()
+					}
+
+					srv.UpdatePositions(activePaperTrade, paperHistory)
+				}
+
+				bridge.WriteMarket(md)
+				
+				sig := bridge.PollSignal(50 * time.Millisecond)
+				if sig == nil {
+					continue
+				}
+
+				dirStr := []string{"WAIT", "BUY", "SELL"}[sig.Action]
+				
+				printEntry, printTP, printSL := sig.Entry, sig.TakeProfit, sig.StopLoss
+				if sig.Veto || printEntry == 0 {
+					printEntry, printTP, printSL = md.Price, md.Price, md.Price
+				}
+				
+				if dirStr != "WAIT" {
+					log.Printf("[main][%s] Signal: %s conf=%.3f entry=%.4f TP=%.4f SL=%.4f RR=%.2f veto=%v",
+						currentSym, dirStr, sig.Confidence, printEntry, printTP, printSL, sig.RiskReward, sig.Veto)
+				}
+				
+				if !botRunning {
+					if currentSym == cfg.Symbol {
+						lsr := md.LSR
+						if lsr < 1e-9 { lsr = 1.0 }
+						pct24h := md.USDTDeltaPct
+						
+						srv.UpdateInsight(gateway.InsightData{
+							Symbol: currentSym, LastPrice: md.Price, OpenInterest: md.OI,
+							LSRVal: lsr, Pct24h: pct24h,
+							TrendState:   "MANUAL STOPPED — IDLE",
+							WhaleBias:    "NEUTRAL",
+							SignalStatus: "WAIT",
+							Advice:       "Bot Paused",
+							Timestamp:    time.Now().Format("15:04:05"),
+							Balance:      balance,
+							EntryTarget:  printEntry,
+							TPTarget:     printTP,
+							SLTarget:     printSL,
+						})
+					}
+					continue
+				}
+				
+				if dirStr != "WAIT" && md.ATR14 > 0 {
+					tpMult := 2.0
+					slMult := 1.5
+					
+					switch strings.ToLower(cfg.TradingStyle) {
+					case "scalping":
+						tpMult = 1.0; slMult = 0.8
+					case "hft":
+						tpMult = 0.5; slMult = 0.3
+					case "daytrading", "daytrade":
+						tpMult = 2.0; slMult = 1.0
+					case "swing", "sniper":
+						tpMult = 5.0; slMult = 2.5
+					case "position":
+						tpMult = 10.0; slMult = 5.0
+					case "turtle":
+						tpMult = 15.0; slMult = 8.0
+					}
+					
+					if dirStr == "BUY" {
+						sig.StopLoss = sig.Entry - (md.ATR14 * slMult)
+						sig.TakeProfit = sig.Entry + (md.ATR14 * tpMult)
+					} else if dirStr == "SELL" {
+						sig.StopLoss = sig.Entry + (md.ATR14 * slMult)
+						sig.TakeProfit = sig.Entry - (md.ATR14 * tpMult)
+					}
+					
+					risk := math.Abs(sig.Entry - sig.StopLoss)
+					reward := math.Abs(sig.TakeProfit - sig.Entry)
+					if risk > 0 {
+						sig.RiskReward = reward / risk
+					}
+					
+					printEntry, printTP, printSL = sig.Entry, sig.TakeProfit, sig.StopLoss
+					
+				}
+
+				if currentSym == cfg.Symbol {
+					// We need to bypass updateInsight since it takes 'feed', which we removed bridge from.
+					// We can just inline UpdateInsight here for dashboard
+					lsr := md.LSR
+					if lsr < 1e-9 { lsr = 1.0 }
+					pct24h := md.USDTDeltaPct
+					srv.UpdateInsight(gateway.InsightData{
+						Symbol: currentSym, LastPrice: md.Price, OpenInterest: md.OI,
+						LSRVal: lsr, Pct24h: pct24h,
+						TrendState:   "ACTIVE", WhaleBias: "NEUTRAL", SignalStatus: dirStr,
+						Advice: "Tracking " + currentSym, Timestamp: time.Now().Format("15:04:05"),
+						Balance: balance, EntryTarget: sig.Entry, TPTarget: sig.TakeProfit, SLTarget: sig.StopLoss,
+					})
+				}
+
+				if sig.Veto || dirStr == "WAIT" {
+					continue
+				}
+				
+				rrLimit := 1.0
+				if md.ATR14 > (md.Price * 0.05) { rrLimit -= 0.2 }
+				if md.ATR14 < (md.Price * 0.01) { rrLimit += 0.2 }
+				if sig.RiskReward < rrLimit { continue }
+
+				if isDryRun && activePaperTrades[currentSym] != nil {
+					continue 
+				}
+
+				if isDryRun {
+					virtualBal := srv.GetVirtualBalance()
+					estimatedMargin := virtualBal * cfg.RiskPct
+					if virtualBal < estimatedMargin || estimatedMargin <= 0 {
+						continue
+					}
+					srv.SetVirtualBalance(virtualBal - estimatedMargin)
+
+					newTrade := &gateway.Position{
+						Symbol:     currentSym,
+						Side:       dirStr,
+						EntryPrice: md.Price,
+						LimitPrice: sig.Entry,
+						TakeProfit: sig.TakeProfit,
+						StopLoss:   sig.StopLoss,
+						Time:       time.Now().Format("15:04:05"),
+						Status:     "PENDING",
+						PnL:        0.0,
+						Margin:     estimatedMargin,
+					}
+					activePaperTrades[currentSym] = newTrade
+					paperTradeOpenedAts[currentSym] = time.Now()
+
+					log.Printf("[Paper][%s] ✓ LIMIT Order placed: %s @ %.4f TP=%.4f SL=%.4f",
+						currentSym, dirStr, md.Price, sig.TakeProfit, sig.StopLoss)
+
+					srv.UpdatePositions(newTrade, paperHistory)
+					savePaperState()
+				}
+			} 
+			
+			time.Sleep(200 * time.Millisecond)
 		}
 	}()
 
@@ -646,8 +737,8 @@ func updateInsight(srv *gateway.Server, cfg Config, sig *shm.Signal, balance flo
 			action, sig.Entry, sig.TakeProfit, sig.StopLoss, sig.RiskReward)
 	}
 
-	pct24h := 0.0
-	if state.Price > 0 && state.ATR14 > 0 {
+	pct24h := state.Pct24h
+	if pct24h == 0 && state.Price > 0 && state.ATR14 > 0 {
 		pct24h = math.Round((state.ATR14/state.Price)*100*10) / 10
 	}
 

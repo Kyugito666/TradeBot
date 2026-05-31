@@ -1,28 +1,36 @@
 # Environments
 .env
-bot_runtime.conf
+**/bot_runtime.conf
 
 # Binaries and compiled files
 *.exe
 *.dll
 *.so
 *.dylib
+*.bin
 bot.exe
-go-engine/bot.exe
-rust-brain/target/
+**/bot.exe
+**/target/
+**/go-engine-bin/
+**/go-engine-bin
+**/*-bin
 
-# Database and state files
+# Database, state files, and runtime insights
 *.db
 *.sqlite
-virtual_balance.txt
-agent_rl_weights.json
+*.db-shm
+*.db-wal
+**/virtual_balance.txt
+**/agent_rl_weights.json
+**/bot_insight.json
 
 # Logs
 *.log
-bot.log
+**/bot.log
 
 # Dependency directories
 node_modules/
+**/Cargo.lock
 
 # OS generated files
 .DS_Store

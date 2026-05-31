@@ -26,8 +26,8 @@ use memmap2::MmapMut;
 
 pub const SHM_NAME:    &str  = "/tradebot_v3";
 pub const SHM_SIZE:    usize = 131_072;
-pub const MAX_CANDLES: usize = 200;
-pub const AGENT_COUNT: usize = 9;
+pub const MAX_CANDLES: usize = 1000;
+pub const AGENT_COUNT: usize = 13;
 pub const REASON_LEN:  usize = 256;
 pub const SYM_LEN:     usize = 16;
 
@@ -369,7 +369,7 @@ impl ShmBridge {
             std::ptr::copy_nonoverlapping(reason_buf.as_ptr(), raw.add(off), REASON_LEN);
             off += REASON_LEN;
 
-            // agent_dirs[6]
+            // agent_dirs[13]
             std::ptr::copy_nonoverlapping(sig.agent_dirs.as_ptr(), raw.add(off), AGENT_COUNT);
             off += AGENT_COUNT;
 
@@ -383,7 +383,7 @@ impl ShmBridge {
                 off += pad;
             }
 
-            // agent_convictions[6]
+            // agent_convictions[13]
             for (i, &c) in sig.agent_convictions.iter().enumerate() {
                 (raw.add(off + i * 8) as *mut f64).write_volatile(c);
             }

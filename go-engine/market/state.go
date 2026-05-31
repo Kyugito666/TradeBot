@@ -21,6 +21,7 @@ type StateSnapshot struct {
 	FundingRate    float64
 	SentimentScore float32
 	NewsCount      uint32
+	Pct24h         float64
 }
 
 // State returns a safe copy of the current feed state.
@@ -44,5 +45,6 @@ func (f *Feed) State() StateSnapshot {
 		FundingRate:    f.state.FundingRate,
 		SentimentScore: f.state.SentimentScore,
 		NewsCount:      f.state.NewsCount,
+		Pct24h:         f.state.Pct24h,
 	}
 }

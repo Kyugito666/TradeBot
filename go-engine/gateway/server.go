@@ -109,23 +109,41 @@ type Server struct {
 	activePos *Position
 	history   []Position
 
-	symbolCh  chan string
-	cfgMux    sync.RWMutex
-	activeCfg map[string]string
+	symbolCh      chan string
+	BacktestReqCh chan BacktestReq
+	cfgMux        sync.RWMutex
+	activeCfg     map[string]string
 
 	// Virtual Balance for Dry Run
 	virtualBalMux sync.RWMutex
 	virtualBal    float64
+
+	forceExec     atomic.Bool
+	isBacktesting atomic.Bool
+}
+
+func (s *Server) SetBacktesting(v bool) {
+	s.isBacktesting.Store(v)
+}
+
+func (s *Server) IsBacktesting() bool {
+	return s.isBacktesting.Load()
+}
+
+type BacktestReq struct {
+	Period int `json:"period"`
+	Speed  int `json:"speed"`
 }
 
 func New(baseDir string) *Server {
 	s := &Server{
-		stop:      make(chan struct{}),
-		baseDir:   baseDir,
-		insight:   InsightData{SignalStatus: "WAIT", TrendState: "RANGING"},
-		history:   make([]Position, 0),
-		symbolCh:  make(chan string, 4),
-		activeCfg: make(map[string]string),
+		stop:          make(chan struct{}),
+		baseDir:       baseDir,
+		insight:       InsightData{SignalStatus: "WAIT", TrendState: "RANGING"},
+		history:       make([]Position, 0),
+		symbolCh:      make(chan string, 4),
+		BacktestReqCh: make(chan BacktestReq, 4),
+		activeCfg:     make(map[string]string),
 	}
 	s.botRunning.Store(false)
 
@@ -359,9 +377,28 @@ func (s *Server) Start() {
 	mux.HandleFunc("/api/stop", s.handleStop)
 	mux.HandleFunc("/api/clear-logs", s.handleClearLogs)
 	mux.HandleFunc("/api/proxy/tickers", s.handleTickers)
+	mux.HandleFunc("/api/ai_history", s.handleAIHistory)
 
 	addr := fmt.Sprintf(":%d", Port)
 	log.Printf("[Gateway] Dashboard: http://localhost%s", addr)
+
+	mux.HandleFunc("/api/force-execute", s.handleForceExec)
+
+	mux.HandleFunc("/api/backtest/start", func(w http.ResponseWriter, r *http.Request) {
+		var req BacktestReq
+		if err := json.NewDecoder(r.Body).Decode(&req); err == nil {
+			s.SetBacktesting(true)
+			s.BacktestReqCh <- req
+			w.WriteHeader(http.StatusOK)
+		} else {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+		}
+	})
+
+	mux.HandleFunc("/api/backtest/stop", func(w http.ResponseWriter, r *http.Request) {
+		s.SetBacktesting(false)
+		w.WriteHeader(http.StatusOK)
+	})
 
 	srv := &http.Server{
 		Addr:         addr,
@@ -383,6 +420,20 @@ func (s *Server) Start() {
 func (s *Server) Stop() {
 	s.running.Store(false)
 	close(s.stop)
+}
+
+func (s *Server) handleForceExec(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	s.forceExec.Store(true)
+	w.Header().Set("Content-Type", "application/json")
+	w.Write([]byte(`{"status":"ok", "message":"Force execution requested"}`))
+}
+
+func (s *Server) PopForceExec() bool {
+	return s.forceExec.CompareAndSwap(true, false)
 }
 
 func (s *Server) handleInsight(w http.ResponseWriter, r *http.Request) {
@@ -810,4 +861,33 @@ func (s *Server) handleTickers(w http.ResponseWriter, r *http.Request) {
 	defer resp.Body.Close()
 	w.Header().Set("Content-Type", "application/json")
 	io.Copy(w, resp.Body)
+}
+
+// handleAIHistory handles GET/POST for persistent AI signal history
+func (s *Server) handleAIHistory(w http.ResponseWriter, r *http.Request) {
+	histFile := filepath.Join(s.baseDir, "history.json")
+	if r.Method == http.MethodGet {
+		b, err := os.ReadFile(histFile)
+		if err != nil {
+			w.Header().Set("Content-Type", "application/json")
+			w.Write([]byte("[]"))
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.Write(b)
+		return
+	}
+	
+	if r.Method == http.MethodPost {
+		b, err := io.ReadAll(r.Body)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		os.WriteFile(histFile, b, 0644)
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+	
+	http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 }
