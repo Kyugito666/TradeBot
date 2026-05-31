@@ -3,7 +3,7 @@
 import { Activity, Pause, Play, Power, ShieldAlert, ShieldCheck, Square } from "lucide-react"
 import type { BotMode, Snapshot } from "@/lib/types"
 import { StatusDot } from "./ui-kit"
-import { uptime } from "@/lib/format"
+import { uptime, num } from "@/lib/format"
 import { cn } from "@/lib/utils"
 
 export function CommandBar({
@@ -47,7 +47,7 @@ export function CommandBar({
             </span>
           </MetaItem>
           <MetaItem label="Cycle">
-            <span className="font-mono tabular text-foreground">{cycle.toLocaleString()}</span>
+            <span className="font-mono tabular text-foreground">{num(cycle, 0)}</span>
           </MetaItem>
           <MetaItem label="Latency">
             <span className={cn("font-mono tabular", latencyMs > 45 ? "text-warning" : "text-foreground")}>{latencyMs}ms</span>

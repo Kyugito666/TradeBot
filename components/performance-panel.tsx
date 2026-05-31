@@ -4,7 +4,7 @@ import { useState } from "react"
 import { Area, AreaChart, CartesianGrid, Line, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts"
 import type { Performance } from "@/lib/types"
 import { Panel } from "./ui-kit"
-import { compact, pct, usd } from "@/lib/format"
+import { compact, num, pct, usd } from "@/lib/format"
 import { cn } from "@/lib/utils"
 
 const RANGES = [
@@ -94,7 +94,7 @@ export function PerformancePanel({ performance }: { performance: Performance }) 
       <div className="mt-2 grid grid-cols-3 gap-3 border-t border-border pt-2 text-[10px]">
         <Mini label="Win Rate" value={performance.winRate.toFixed(1) + "%"} />
         <Mini label="Profit Factor" value={performance.profitFactor.toFixed(2)} />
-        <Mini label="Trades" value={performance.trades.toLocaleString()} />
+        <Mini label="Trades" value={num(performance.trades, 0)} />
         <Mini label="Avg Win" value={usd(performance.avgWin)} tone="positive" />
         <Mini label="Avg Loss" value={usd(performance.avgLoss)} tone="negative" />
         <Mini label="Best / Worst" value={`${pct(performance.bestDay)} / ${pct(performance.worstDay)}`} />
