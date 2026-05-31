@@ -13,7 +13,7 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 use std::fs;
 
-const WEIGHTS: [(&str, f64); 9] = [
+const WEIGHTS: [(&str, f64); 13] = [
     ("mathematician", 0.25),
     ("physicist",     0.20),
     ("cryptographer", 0.15),
@@ -23,6 +23,10 @@ const WEIGHTS: [(&str, f64); 9] = [
     ("game_theorist", 0.15),
     ("economist",     0.15),
     ("data_engineer", 0.0), // gatekeeper, no weight
+    ("data_scientist",0.15),
+    ("statistician",  0.15),
+    ("psychologist",  0.10),
+    ("astrophysicist",0.15),
 ];
 
 const ABSURDIST_DAMP: f64 = 0.30;
@@ -145,6 +149,7 @@ struct ActiveTrade {
 pub struct ConsensusEngine {
     active_trade: Mutex<Option<ActiveTrade>>,
     weights: Mutex<HashMap<String, f64>>,
+    last_reload: Mutex<i64>,
 }
 
 impl ConsensusEngine {
@@ -165,6 +170,22 @@ impl ConsensusEngine {
         Self {
             active_trade: Mutex::new(None),
             weights: Mutex::new(initial_weights),
+            last_reload: Mutex::new(0),
+        }
+    }
+    
+    fn reload_weights(&self, now_ms: i64) {
+        let mut last = self.last_reload.lock().unwrap();
+        if now_ms - *last > 30_000 {
+            if let Ok(data) = fs::read_to_string("agent_rl_weights.json") {
+                if let Ok(parsed) = serde_json::from_str::<HashMap<String, f64>>(&data) {
+                    let mut w_lock = self.weights.lock().unwrap();
+                    for (k, v) in parsed {
+                        w_lock.insert(k, v);
+                    }
+                }
+            }
+            *last = now_ms;
         }
     }
     
@@ -180,13 +201,13 @@ impl ConsensusEngine {
             let mut new_w = current;
             
             if is_win && is_agent_correct {
-                new_w += lr; // Reward
+                new_w += lr; // Reward: Voted with a winning trade
             } else if !is_win && is_agent_correct {
-                new_w -= lr * 1.5; // Punish (loss)
+                new_w -= lr * 1.5; // Punish: Voted with a losing trade
             } else if is_win && !is_agent_correct {
-                new_w -= lr * 0.5; // Punish slightly for doubting a win
+                new_w -= lr * 0.5; // Punish: Disagreed with a winning trade
             } else if !is_win && !is_agent_correct {
-                new_w += lr * 0.5; // Reward slightly for dodging a loss
+                new_w += lr * 0.5; // Reward: Disagreed with a losing trade (saved us!)
             }
             
             w_lock.insert(agent.clone(), new_w.clamp(0.01, 1.0));
@@ -235,6 +256,9 @@ impl ConsensusEngine {
         }
         
         let ts_ms = Utc::now().timestamp_millis();
+        
+        // Reload self-learning weights from Go Engine periodically
+        self.reload_weights(ts_ms);
 
         let style_name = read_trading_style();
         let cfg = make_style_config(&style_name);

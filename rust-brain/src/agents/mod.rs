@@ -9,6 +9,10 @@ pub mod linguist;
 pub mod liquidator;
 pub mod mathematician;
 pub mod physicist;
+pub mod data_scientist;
+pub mod statistician;
+pub mod psychologist;
+pub mod astrophysicist;
 
 use crate::shm::MarketSnapshot;
 

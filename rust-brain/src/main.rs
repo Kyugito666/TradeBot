@@ -23,6 +23,10 @@ use agents::{
     liquidator::LiquidatorAgent,
     mathematician::MathematicianAgent,
     physicist::PhysicistAgent,
+    data_scientist::DataScientist,
+    statistician::Statistician,
+    psychologist::Psychologist,
+    astrophysicist::Astrophysicist,
     Agent, AgentVote,
 };
 use consensus::ConsensusEngine;
@@ -36,13 +40,14 @@ fn main() -> anyhow::Result<()> {
     .init();
 
     info!("═══════════════════════════════════════════════════════");
-    info!("  TradeBot Brain v3.0 — 6-Agent Ensemble  (rayon)");
+    info!("  TradeBot Brain v4.0 — 13-Agent Ensemble  (rayon)");
     info!("  Agents: Mathematician · Physicist · Cryptographer");
     info!("          Linguist · Liquidator · Absurdist ✦");
+    info!("          Data Scientist · Statistician · Psychologist · Astrophysicist");
     info!("═══════════════════════════════════════════════════════");
 
     rayon::ThreadPoolBuilder::new()
-        .num_threads(6)
+        .num_threads(13)
         .thread_name(|i| format!("agent-{i}"))
         .build_global()
         .expect("rayon pool init");
@@ -57,6 +62,10 @@ fn main() -> anyhow::Result<()> {
         Box::new(LinguistAgent),
         Box::new(LiquidatorAgent),
         Box::new(AbsurdistAgent),
+        Box::new(DataScientist),
+        Box::new(Statistician),
+        Box::new(Psychologist),
+        Box::new(Astrophysicist),
     ];
 
     let consensus = ConsensusEngine::new();

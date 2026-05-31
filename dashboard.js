@@ -12,6 +12,39 @@ let _lastCandleTs = 0;
 let priceHistory = [];
 const MAX_CHART_POINTS = 150;
 
+let _multiPairMode = false;
+let _multiCharts = [];
+let _chartRO = null;
+let _multiROs = [];
+
+function toggleMultiPairMode(mode) {
+    _multiPairMode = (mode === 'multi');
+    
+    // Clean up old observers
+    if (_chartRO) { _chartRO.disconnect(); _chartRO = null; }
+    if (_multiROs.length) { _multiROs.forEach(ro => ro.disconnect()); _multiROs = []; }
+    
+    if (_multiPairMode) {
+        document.getElementById('chart-wrapper').className = 'chart-wrap chart-grid';
+        if (_lwChart) {
+            _lwChart.remove();
+            _lwChart = null;
+        }
+        _chartReady = false;
+        renderGridCharts();
+    } else {
+        document.getElementById('chart-wrapper').className = 'chart-wrap';
+        if (_multiCharts.length) {
+            _multiCharts.forEach(c => c.chart.remove());
+            _multiCharts = [];
+        }
+        _lwChart = null; // force re-init
+        _chartReady = false;
+        document.getElementById('chart-container').innerHTML = '';
+        initChart();
+    }
+}
+
 let _lastAIScanResults = [];
 let _aiSignalHistory = [];
 let _aiScanTF = '15';
@@ -45,8 +78,8 @@ const Storage = {
 // AI Signal History
 // ══════════════════════════════════════════════════════════════════════════════
 
-function _loadAISignalHistory() { _aiSignalHistory = Storage.get('aiSignalHistory', []); }
-function _saveAISignalHistory() { Storage.set('aiSignalHistory', _aiSignalHistory.slice(0, 300)); }
+async function _loadAISignalHistory() { try { const res = await fetch('/api/ai_history'); if (res.ok) { _aiSignalHistory = await res.json(); renderAISignalHistory(); } } catch(e) {} }
+function _saveAISignalHistory() { fetch('/api/ai_history', { method: 'POST', body: JSON.stringify(_aiSignalHistory.slice(0, 300)) }).catch(e=>console.error(e)); }
 
 // [FIX-AI-3] Accept forcePrice so WS tick can call this directly
 function _trackAISignalOutcomes(forcePrice) {
@@ -167,6 +200,9 @@ function renderAISignalHistory() {
                 <span style="background:${statusBg};color:${statusColor};padding:2px 8px;border-radius:3px;font-size:10px;font-weight:700;">${s.status}</span>
             </td>
             <td style="padding:8px 12px;border-bottom:1px solid var(--border);color:${(s.pnl && s.pnl.includes('+')) || isWin ? 'var(--accent)' : (s.pnl && s.pnl.includes('-')) || isLoss ? 'var(--danger)' : 'var(--text2)'};font-weight:${isOpen ? '600' : '700'};font-size:11px;">${s.pnl || (isOpen ? distInfo : '--')}</td>
+            <td style="padding:8px 12px;border-bottom:1px solid var(--border);">
+                ${isOpen ? `<button onclick="forceAIExecutionPair('${s.symbol}')" style="background:var(--accent); color:#000; border:none; padding:4px 8px; font-weight:bold; border-radius:4px; font-size:9px; cursor:pointer">⚡ EXEC</button>` : ''}
+            </td>
         </tr>`;
     }).join('');
 }
@@ -494,1064 +530,129 @@ async function initChart() {
         handleScroll: { mouseWheel: true, pressedMouseMove: true },
         handleScale: { axisPressedMouseMove: true, mouseWheel: true, pinch: true }
     });
-    _candleSeries = _lwChart.addCandlestickSeries({ upColor: '#26a69a', downColor: '#ef5350', borderUpColor: '#26a69a', borderDownColor: '#ef5350', wickUpColor: '#26a69a', wickDownColor: '#ef5350' });
+    _candleSeries = _lwChart.addCandlestickSeries({ upColor: '#0ecb81', downColor: '#f6465d', borderUpColor: '#0ecb81', borderDownColor: '#f6465d', wickUpColor: '#0ecb81', wickDownColor: '#f6465d' });
     _volSeries = _lwChart.addHistogramSeries({ color: '#3b82f620', priceFormat: { type: 'volume' }, priceScaleId: 'vol' });
+    _emaSeries = _lwChart.addLineSeries({ color: '#fcd535', lineWidth: 1, crosshairMarkerVisible: false });
+    _rsiSeries = _lwChart.addLineSeries({ color: '#c084fc', lineWidth: 1, priceScaleId: 'rsi' });
+    _lwChart.priceScale('rsi').applyOptions({ scaleMargins: { top: 0.8, bottom: 0 }, visible: false });
     _lwChart.priceScale('vol').applyOptions({ scaleMargins: { top: 0.85, bottom: 0 } });
-    const ro = new ResizeObserver(entries => {
+    _chartRO = new ResizeObserver(entries => {
         if (entries.length === 0 || entries[0].target !== wrapper) return;
         const newRect = entries[0].contentRect;
         if (_lwChart && newRect.width > 10 && newRect.height > 10 && !isChartHidden) { try { _lwChart.resize(newRect.width, newRect.height); } catch(e) {} }
     });
-    ro.observe(wrapper);
+    _chartRO.observe(wrapper);
     _chartReady = true;
 }
 
-async function fetchOHLCV(tf) {
-    const sym = _getLiveSymbol(), intv = tf || _currentTf;
-    const url = `https://api.bytick.com/v5/market/kline?category=linear&symbol=${sym}&interval=${intv}&limit=200`;
-    const statusEl = document.getElementById('chart-status');
-    try {
-        const resp = await fetch(url, { signal: AbortSignal.timeout(8000) });
-        if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-        const data = await resp.json();
-        if (data.retCode !== 0) throw new Error(data.retMsg || 'API error');
-        const rows = data.result?.list;
-        if (!rows?.length) throw new Error('empty kline list');
-        const candles = rows.slice().reverse().map(r => ({ time: Math.floor(parseInt(r[0]) / 1000), open: parseFloat(r[1]), high: parseFloat(r[2]), low: parseFloat(r[3]), close: parseFloat(r[4]), volume: parseFloat(r[5]) }));
-        _ohlcvCache[intv] = candles; _lastCandleTs = candles[candles.length - 1]?.time || 0;
-        if (statusEl) { statusEl.textContent = `✓ ${sym} ${_tfLabel(intv)}`; statusEl.className = 'chart-status ok'; }
-        return candles;
-    } catch(e) { if (statusEl) { statusEl.textContent = `✗ ${e.message}`; statusEl.className = 'chart-status err'; } return null; }
-}
-
-function _tfLabel(tf) { return {'1':'1m','3':'3m','5':'5m','15':'15m','30':'30m','60':'1h','120':'2h','240':'4h','D':'1d'}[tf] || tf; }
-
-function renderCandles(candles) {
-    if (!_candleSeries || !candles?.length) return;
-    _candleSeries.setData(candles);
-    _volSeries.setData(candles.map(c => ({ time: c.time, value: c.volume, color: c.close >= c.open ? '#26a69a30' : '#ef535030' })));
-    _resetLiveCandle && _resetLiveCandle();
-    _lastCandleTs = candles[candles.length - 1]?.time || _lastCandleTs;
-    _applyMarkers(); _lwChart.timeScale().scrollToRealTime();
-}
-
-let _liveCandle = null;
-function updateLiveCandle(price) {
-    if (!_candleSeries || !_lastCandleTs) return;
-    const tf = parseInt(_currentTf) || 5, tfSec = tf * 60, now = Math.floor(Date.now() / 1000), candleTs = Math.floor(now / tfSec) * tfSec;
-    try {
-        if (!_liveCandle || candleTs > _liveCandle.ts) {
-            _liveCandle = { ts: candleTs, open: price, high: price, low: price, close: price };
-            _candleSeries.update({ time: candleTs, open: price, high: price, low: price, close: price });
-            _volSeries.update({ time: candleTs, value: 0, color: '#3b82f620' }); _lastCandleTs = candleTs;
-        } else {
-            _liveCandle.close = price;
-            if (price > _liveCandle.high) _liveCandle.high = price;
-            if (price < _liveCandle.low)  _liveCandle.low  = price;
-            _candleSeries.update({ time: _liveCandle.ts, open: _liveCandle.open, high: _liveCandle.high, low: _liveCandle.low, close: _liveCandle.close });
+async function renderGridCharts() {
+    const container = document.getElementById('chart-container');
+    if (!container) return;
+    container.innerHTML = '';
+    _multiCharts = [];
+    
+    // Instead of lightweight charts, we render a Data Grid Dashboard
+    container.style.display = 'grid';
+    container.style.gridTemplateColumns = 'repeat(auto-fit, minmax(200px, 1fr))';
+    container.style.gap = '15px';
+    container.style.padding = '20px';
+    container.style.overflowY = 'auto';
+    container.style.alignContent = 'start';
+    
+    // Get unique active symbols from AI History or defaults
+    let pairs = ['BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'XRPUSDT', 'BNBUSDT', 'ADAUSDT', 'DOGEUSDT', 'AVAXUSDT'];
+    if (_aiSignalHistory && _aiSignalHistory.length > 0) {
+        const uniquePairs = [...new Set(_aiSignalHistory.map(s => s.symbol))];
+        if (uniquePairs.length > 0) {
+            pairs = uniquePairs;
         }
-    } catch(e) {}
-}
-function _resetLiveCandle() { _liveCandle = null; }
+    }
 
-let _pendingMarkers = [];
-function addSignalMarker(action, price) {
-    const tf = parseInt(_currentTf) || 5, tfSec = tf * 60, now = Math.floor(Date.now() / 1000), ts = Math.floor(now / tfSec) * tfSec;
-    _pendingMarkers.push({ time: ts, type: action }); if (_pendingMarkers.length > 50) _pendingMarkers.shift();
-    priceHistory.push({ price, time: Date.now(), signal: action }); if (priceHistory.length > MAX_CHART_POINTS) priceHistory.shift();
-    if (_candleSeries && _lastCandleTs) _applyMarkers(); else setTimeout(_applyMarkers, 1500);
-    _showChartLegend();
-}
-
-function _showChartLegend() {
-    const legend = document.getElementById('chart-legend');
-    if (legend && !isChartHidden && _pendingMarkers.length > 0) legend.style.display = 'flex';
-}
-
-function _applyMarkers() {
-    if (!_candleSeries || !_pendingMarkers.length) return;
-    try {
-        const markers = _pendingMarkers.map(m => ({ time: m.time, position: m.type === 'BUY' ? 'belowBar' : 'aboveBar', color: m.type === 'BUY' ? '#00e5a0' : '#ef4444', shape: m.type === 'BUY' ? 'arrowUp' : 'arrowDown', text: m.type, size: 1.5 }));
-        _candleSeries.setMarkers(markers); _showChartLegend();
-    } catch(e) { console.warn('setMarkers error:', e); }
-}
-
-let _tpLine = null, _slLine = null, _entryLine = null;
-function setTpSlLines(entry, tp, sl) {
-    if (!_candleSeries) return;
-    if (_entryLine) { try { _candleSeries.removePriceLine(_entryLine); } catch(e) {} _entryLine = null; }
-    if (_tpLine)    { try { _candleSeries.removePriceLine(_tpLine);    } catch(e) {} _tpLine    = null; }
-    if (_slLine)    { try { _candleSeries.removePriceLine(_slLine);    } catch(e) {} _slLine    = null; }
-    if (entry) _entryLine = _candleSeries.createPriceLine({ price: entry, color: '#3b82f6', lineWidth: 1, lineStyle: 0, axisLabelVisible: true, title: 'ENTRY' });
-    if (tp)    _tpLine    = _candleSeries.createPriceLine({ price: tp,    color: '#00e5a070', lineWidth: 1, lineStyle: 2, axisLabelVisible: true, title: 'TP' });
-    if (sl)    _slLine    = _candleSeries.createPriceLine({ price: sl,    color: '#ef444470', lineWidth: 1, lineStyle: 2, axisLabelVisible: true, title: 'SL' });
-    if (entry || tp || sl) _showChartLegend();
-}
-
-async function setTimeframe(btn) {
-    document.querySelectorAll('.tf-btn').forEach(b => b.classList.remove('active')); btn.classList.add('active'); _currentTf = btn.dataset.tf;
-    const cached = _ohlcvCache[_currentTf]; if (cached) renderCandles(cached);
-    const fresh = await fetchOHLCV(_currentTf); if (fresh) renderCandles(fresh);
-}
-
-function addPricePoint(price, signal, tp, sl) {
-    priceHistory.push({ price, time: Date.now(), signal, tp, sl }); if (priceHistory.length > MAX_CHART_POINTS) priceHistory.shift();
-    updateLiveCandle(price); const emptyEl = document.getElementById('chart-empty'); if (emptyEl) emptyEl.style.display = 'none';
-}
-
-let _ohlcvRefreshTimer = null;
-function _scheduleOHLCVRefresh() {
-    if (_ohlcvRefreshTimer) clearInterval(_ohlcvRefreshTimer);
-    const intervalMs = (parseInt(_currentTf) >= 60) ? 300_000 : 30_000;
-    _ohlcvRefreshTimer = setInterval(async () => { const candles = await fetchOHLCV(_currentTf); if (candles) renderCandles(candles); }, intervalMs);
-}
-
-async function startChart() { await initChart(); if (!_chartReady) return; const candles = await fetchOHLCV(_currentTf); if (candles) renderCandles(candles); _scheduleOHLCVRefresh(); }
-startChart();
-
-// ── Chart price lines from Go engine API ─────────────────────────────────────
-let _chartLines = [];
-let _goActiveTrades = [];
-let _goTradeHistory = [];
-
-async function fetchPositions() {
-    if (!_candleSeries) return;
-    try {
-        const r = await fetch('/api/positions'); if (!r.ok) return;
-        const d = await r.json();
-        if (_chartLines.length > 0) { _chartLines.forEach(l => { try { _candleSeries.removePriceLine(l); } catch(e) {} }); _chartLines = []; }
+    for (let i = 0; i < pairs.length; i++) {
+        const sym = pairs[i];
+        const card = document.createElement('div');
+        card.className = 'card';
+        card.style.display = 'flex';
+        card.style.flexDirection = 'column';
+        card.style.gap = '8px';
+        card.style.padding = '15px';
+        card.style.background = 'rgba(20, 24, 34, 0.6)';
+        card.style.border = '1px solid var(--border)';
         
-        _goActiveTrades = d.active || [];
-        _goTradeHistory = d.history || [];
-
-        if (_goActiveTrades.length > 0) {
-            const pos = _goActiveTrades[0];
-            try {
-                // Style marker lebih proper
-                const markerPrice = pos.status === 'PENDING' ? (pos.limit_price || pos.entry_price) : pos.entry_price;
-                let entryTitle = `ENTRY ${pos.side}`;
-                if (pos.status === 'OPEN') {
-                    const pnlSign = pos.pnl >= 0 ? '+' : '';
-                    entryTitle = `${pos.side} (${pnlSign}${pos.pnl.toFixed(2)}%)`;
-                } else {
-                    entryTitle = `PENDING ${pos.side}`;
-                }
-                
-                _chartLines.push(_candleSeries.createPriceLine({ price: markerPrice, color: '#3b82f6', lineWidth: 1, lineStyle: 0, axisLabelVisible: false, title: entryTitle }));
-                _chartLines.push(_candleSeries.createPriceLine({ price: pos.take_profit, color: '#10b981', lineWidth: 1, lineStyle: 2, axisLabelVisible: false, title: 'TP' }));
-                _chartLines.push(_candleSeries.createPriceLine({ price: pos.stop_loss,   color: '#ef4444', lineWidth: 1, lineStyle: 2, axisLabelVisible: false, title: 'SL' }));
-                
-                // Set the global activeTrade for other UI elements
-                activeTrade = {
-                    action: pos.side,
-                    entry: markerPrice,
-                    tp: pos.take_profit,
-                    sl: pos.stop_loss,
-                    status: pos.status
-                };
-            } catch(e) {}
-            renderTradesTableGo(_goActiveTrades, _goTradeHistory); _showChartLegend();
-        } else { 
-            activeTrade = null;
-            renderTradesTableGo([], _goTradeHistory); 
-        }
-        updateTradeStats(); // update header stats based on _goTradeHistory
-        
-        const pane = document.getElementById('pane-trades');
-        if (pane && pane.classList.contains('active')) renderFullTradesTable();
-    } catch(e) {}
-}
-
-function renderTradesTableGo(active, history) {
-    const tbody = document.getElementById('trades-tbody'); if (!tbody) return;
-    let html = '';
-    if (active && active.length > 0) {
-        const p = active[0], cls = p.side === 'BUY' ? 'trade-win' : 'trade-loss', pnlColor = (p.pnl || 0) >= 0 ? 'trade-win' : 'trade-loss', pnlSign = (p.pnl || 0) >= 0 ? '+' : '';
-        const status = p.status || 'OPEN';
-        const entryDisplay = status === 'PENDING' ? (p.limit_price || p.entry_price || 0) : (p.entry_price || 0);
-        const statusColor = status === 'PENDING' ? 'var(--warn)' : 'var(--accent)';
-        html += `<tr style="background:rgba(30,41,59,0.5)"><td>${p.time || '--'}</td><td class="${cls}">${p.side} (LIVE)</td><td>${entryDisplay.toFixed(4)}</td><td class="trade-win">${(p.take_profit||0).toFixed(4)}</td><td class="trade-loss">${(p.stop_loss||0).toFixed(4)}</td><td style="color:${statusColor}">${status}</td><td class="${pnlColor}" style="font-weight:bold">${pnlSign}${(p.pnl||0).toFixed(2)}%</td></tr>`;
+        card.innerHTML = `
+            <div style="display:flex; justify-content:space-between; align-items:center;">
+                <strong style="color:var(--accent); font-size:16px;">${sym}</strong>
+                <span class="live-price-${sym}" style="font-family:var(--mono); font-size:14px; font-weight:bold;">Loading...</span>
+            </div>
+            <div style="display:flex; justify-content:space-between; font-size:12px;">
+                <span style="color:var(--text2);">24h Volatility</span>
+                <span class="live-vol-${sym}" style="color:#fff;">--</span>
+            </div>
+            <div style="display:flex; justify-content:space-between; font-size:12px;">
+                <span style="color:var(--text2);">Signal</span>
+                <span class="live-signal-${sym}" style="color:var(--text2);">WAIT</span>
+            </div>
+            <div style="display:flex; justify-content:space-between; font-size:12px; margin-top:8px; padding-top:8px; border-top:1px solid rgba(255,255,255,0.05);">
+                <span style="color:var(--text2);">Active PNL</span>
+                <span class="live-pnl-${sym}" style="font-family:var(--mono); font-weight:bold;">0.00%</span>
+            </div>
+        `;
+        container.appendChild(card);
     }
-    if (history && history.length > 0) {
-        history.slice(0, 20).forEach(p => {
-            const cls = p.side === 'BUY' ? 'trade-win' : 'trade-loss', pnlColor = (p.pnl || 0) >= 0 ? 'trade-win' : 'trade-loss', pnlSign = (p.pnl || 0) >= 0 ? '+' : '';
-            html += `<tr><td>${p.time||'--'}</td><td class="${cls}">${p.side}</td><td>${(p.entry_price||0).toFixed(4)}</td><td>${(p.take_profit||0).toFixed(4)}</td><td>${(p.stop_loss||0).toFixed(4)}</td><td class="${cls}">${p.status||'--'}</td><td class="${pnlColor}">${pnlSign}${(p.pnl||0).toFixed(2)}%</td></tr>`;
-        });
-    }
-    // MOCK history rendering removed to prevent duplicates and confusion
-    if (html === '') html = '<tr><td colspan="7" style="text-align:center;padding:2rem;color:#64748B;">Belum ada trade / history</td></tr>';
-    tbody.innerHTML = html;
-}
-
-function renderTradesTable() {
-    // [FIX-TRADE-TABLE] Disabled legacy JS simulator table overwriting the Go backend table
-    return;
-}
-
-// ── switchTab ─────────────────────────────────────────────────────────────────
-function switchTab(name, btn) {
-    document.querySelectorAll('.tab').forEach(b => b.classList.remove('active'));
-    document.querySelectorAll('.tab-pane').forEach(p => {
-        p.classList.remove('active'); p.style.display = 'none'; p.style.visibility = 'hidden';
-        p.style.pointerEvents = 'none'; p.style.position = 'absolute'; p.style.width = '0'; p.style.height = '0';
-        p.style.overflow = 'hidden'; p.style.clip = 'rect(0,0,0,0)'; p.style.zIndex = '-999';
-    });
-    if (name !== 'chart' && _lwChart) { try { _lwChart.resize(1, 1); } catch(e) {} }
-    btn.classList.add('active');
-    const target = document.getElementById('pane-' + name); if (!target) return;
-    target.classList.add('active'); target.style.display = 'flex'; target.style.visibility = 'visible';
-    target.style.pointerEvents = 'auto'; target.style.flexDirection = 'column'; target.style.overflow = 'hidden';
-    target.style.position = 'relative'; target.style.width = '100%'; target.style.height = '100%';
-    target.style.clip = 'auto'; target.style.zIndex = '1';
-    const logFilter = document.getElementById('log-filter-btns');
-    if (logFilter) logFilter.style.display = name === 'logs' ? 'flex' : 'none';
-    if (name === 'chart') {
-        setTimeout(() => {
-            if (_lwChart && !isChartHidden) {
-                const wrapper = document.getElementById('chart-wrapper');
-                if (wrapper && wrapper.clientWidth > 10) { try { _lwChart.resize(wrapper.clientWidth, wrapper.clientHeight); } catch(e) {} }
-                _applyMarkers();
-            }
-        }, 50);
-    }
-    if (name === 'insight') ensureSignalPaneReady();
-    if (name === 'trades') renderFullTradesTable();
-}
-
-window.addEventListener('resize', () => {
-    if (_lwChart && !isChartHidden) {
-        const wrapper = document.getElementById('chart-wrapper');
-        if (wrapper && wrapper.clientWidth > 10) {
-            try { _lwChart.resize(wrapper.clientWidth, wrapper.clientHeight); } catch(e) {}
+    
+    // Background updater for the grid
+    if (window._multiGridUpdater) clearInterval(window._multiGridUpdater);
+    window._multiGridUpdater = setInterval(async () => {
+        if (!_multiPairMode) {
+            clearInterval(window._multiGridUpdater);
+            return;
         }
-    }
-});
-
-function setFilter(btn) { document.querySelectorAll('.fbtn').forEach(b => b.classList.remove('active')); btn.classList.add('active'); filterLevel = btn.dataset.lvl; renderLogs(); }
-function toggleAutoScroll() { autoScroll = !autoScroll; const btn = document.getElementById('btn-autoscroll'); if (btn) { btn.style.borderColor = autoScroll ? 'var(--accent)' : ''; btn.style.color = autoScroll ? 'var(--accent)' : ''; } if (autoScroll) renderLogs(); }
-async function clearLogs() { try { await fetch('/api/clear-logs', { method: 'POST' }); } catch(e) {} logs = []; lastCount = 0; renderLogs(); }
-
-function renderLogs() {
-    const container = document.getElementById('log-container'); if (!container) return;
-    const filtered = filterLevel === 'ALL' ? logs : logs.filter(l => l.level === filterLevel);
-    if (!filtered.length) { container.innerHTML = '<div class="empty-state"><div class="empty-icon">◈</div><div>Tidak ada log untuk filter ini</div></div>'; return; }
-    const frag = document.createDocumentFragment();
-    filtered.forEach(l => {
-        const row = document.createElement('div'); row.className = 'log-entry ' + l.level;
-        row.innerHTML = `<span class="log-ts">${l.ts}</span><span class="log-lvl">${l.level}</span><span class="log-name">${l.name}</span><span class="log-msg">${escHtml(l.msg)}</span>`;
-        frag.appendChild(row);
-    });
-    container.innerHTML = ''; container.appendChild(frag); if (autoScroll) container.scrollTop = container.scrollHeight;
-}
-
-function escHtml(s) { return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
-
-function toast(msg, ok = true) {
-    const el = document.getElementById('toast'); if (!el) return;
-    el.textContent = msg; el.className = 'toast show ' + (ok ? 'ok' : 'err');
-    setTimeout(() => { el.className = 'toast'; }, 3000);
-}
-
-async function poll() {
-    try {
-        const r = await fetch('/api/logs?since=' + lastCount), d = await r.json();
-        if (d.logs && d.logs.length) { d.logs.forEach(parseLog); logs = [...logs, ...d.logs].slice(-500); lastCount = d.total; if (autoScroll) renderLogs(); }
-        updateStatus(d.running);
-    } catch(e) {}
-}
-
-function updateStatus(running) {
-    const dot = document.getElementById('status-dot'), txt = document.getElementById('status-text');
-    const btnS = document.getElementById('btn-start'), btnP = document.getElementById('btn-stop');
-    if (dot) dot.className = 'dot ' + (running ? 'running' : 'stopped');
-    if (txt) txt.textContent = running ? 'RUNNING' : 'STOPPED';
-    if (btnS) btnS.disabled = running;
-    if (btnP) btnP.disabled = !running;
-    document.querySelectorAll('#config-form input, #config-form select').forEach(el => { el.disabled = running; });
-}
-
-async function startBot() {
-    const currentSym = document.getElementById('cfg-symbol')?.value || '';
-    if (_symbolAtBotStart && _symbolAtBotStart !== currentSym) {
-        toast(`⚠ Symbol berubah ${_symbolAtBotStart}→${currentSym}. Restart binary untuk efektif.`, false);
-        await new Promise(r => setTimeout(r, 1200));
-    }
-    try {
-        const saveR = await fetch('/api/save-env', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(collectEnv()) });
-        const saveD = await saveR.json(); if (!saveD.ok) throw new Error(saveD.message);
-    } catch(e) { toast('Config save gagal: ' + e.message, false); return; }
-    try {
-        const r = await fetch('/api/start', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(collectEnv()) });
-        const d = await r.json(); toast(d.message, d.ok); if (d.ok) _symbolAtBotStart = currentSym;
-    } catch(e) { toast('Koneksi gagal', false); }
-}
-
-async function stopBot() { try { const r = await fetch('/api/stop', { method: 'POST' }); const d = await r.json(); toast(d.message, d.ok); } catch(e) { toast('Koneksi gagal', false); } }
-
-const _KEY_SENTINEL = '__UNCHANGED__';
-
-function saveToLocal() {
-    const state = {
-        SYMBOL:        document.getElementById('cfg-symbol').value,
-        EXCHANGE:      document.getElementById('cfg-exchange').value,
-        EXCHANGE_MODE: "REAL",
-        TRADING_STYLE: document.getElementById('cfg-style').value,
-        TARGET_TYPE:   document.getElementById('cfg-target-type').value,
-        LEVERAGE:      document.getElementById('cfg-leverage').value,
-        RISK_PCT:      document.getElementById('cfg-risk').value,
-        USE_MOCK_OHLCV: document.getElementById('cfg-mock').checked,
-        DRY_RUN:       document.getElementById('cfg-dryrun').checked ? '1' : '0',
-    };
-    Storage.set('botUIState', state);
-}
-
-document.querySelectorAll('input, select').forEach(el => {
-    el.addEventListener('change', () => {
-        saveConfig();
-        if (el.id === 'cfg-mode') {
-            toast('⚠ Mode change requires full BINARY RESTART to take effect', false);
-        }
-    });
-});
-
-function collectEnv() {
-    function keyVal(id) { const v = document.getElementById(id)?.value; return (v && v !== _KEY_SENTINEL) ? v : ''; }
-    return {
-        SYMBOL:              document.getElementById('cfg-symbol').value.trim(),
-        LEVERAGE:            document.getElementById('cfg-leverage').value,
-        EXCHANGE:            document.getElementById('cfg-exchange').value,
-        EXCHANGE_MODE:       "REAL",
-        TRADING_STYLE:       document.getElementById('cfg-style').value,
-        TARGET_TYPE:         document.getElementById('cfg-target-type').value,
-        RISK_PCT:            (parseInt(document.getElementById('cfg-risk').value) / 100).toString(),
-        USE_MOCK_OHLCV:      document.getElementById('cfg-mock').checked ? '1' : '0',
-        DRY_RUN:             document.getElementById('cfg-dryrun').checked ? '1' : '0',
-        BYBIT_REAL_API_KEY:    keyVal('key-bybit-real-key'),
-        BYBIT_REAL_API_SECRET: keyVal('key-bybit-real-secret'),
-        MEXC_API_KEY:          keyVal('key-mexc-key'),
-        MEXC_API_SECRET:       keyVal('key-mexc-secret')
-    };
-}
-
-document.getElementById('btn-inject').addEventListener('click', () => {
-    fetch('/api/virtual/inject', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ amount: 1000 })
-    }).then(res => res.json()).then(data => {
-        if (data.success) {
-            stats.balance = data.balance;
-            if (!stats.initBalance) {
-                stats.initBalance = data.balance;
-            } else {
-                stats.initBalance += 1000;
-            }
-            Storage.set('botInitBalance', stats.initBalance);
-            updateBalanceStats();
-            alert("Berhasil inject $1,000 USDT ke Virtual Balance!");
-        }
-    });
-});
-
-async function saveConfig() {
-    try {
-        saveToLocal();
-        const r = await fetch('/api/save-env', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(collectEnv()) });
-        const d = await r.json(); toast(d.message, d.ok);
-    } catch(e) { toast('Koneksi gagal', false); }
-}
-
-function onExchangeChange(val) {
-    loadBybitPairs(val); updateLeverageLimits(); saveConfig();
-    toast('⚠ Exchange change requires BOT RESTART (binary, not just Stop/Start button)', false);
-}
-
-async function loadConfig() {
-    try {
-        const r = await fetch('/api/get-env'); const d = await r.json(); const e = d.env || {};
-        const local = Storage.get('botUIState', {});
-        const SYMBOL = local.SYMBOL || e.SYMBOL;
-        if (SYMBOL) {
-            const sym = SYMBOL.replace('_', '');
-            const sel = document.getElementById('cfg-symbol');
-            if ([...sel.options].some(o => o.value === sym)) sel.value = sym;
-            else sel.dataset.pendingSymbol = sym;
-            const hdrSym = document.getElementById('hdr-symbol'); if (hdrSym) hdrSym.textContent = sym;
-            _symbolAtBotStart = sym;
-        }
-        if (local.LEVERAGE || e.LEVERAGE) {
-            updateLeverageLimits();
-            const lev = local.LEVERAGE || e.LEVERAGE;
-            document.getElementById('cfg-leverage').value = lev;
-            document.getElementById('cfg-lev-slider').value = lev;
-            document.getElementById('lev-val-display').textContent = lev + 'x';
-        }
-        if (local.EXCHANGE || e.EXCHANGE)           document.getElementById('cfg-exchange').value = local.EXCHANGE || e.EXCHANGE;
-        // EXCHANGE_MODE is forced to REAL for now, DryRun is handled via virtual balance
-        if (local.TRADING_STYLE || e.TRADING_STYLE) document.getElementById('cfg-style').value = local.TRADING_STYLE || e.TRADING_STYLE;
-        if (local.TARGET_TYPE || e.TARGET_TYPE)     document.getElementById('cfg-target-type').value = local.TARGET_TYPE || e.TARGET_TYPE;
-        let riskRaw = local.RISK_PCT || e.RISK_PCT;
-        if (riskRaw) {
-            let pct = parseInt(riskRaw);
-            if (parseFloat(riskRaw) < 1.0) pct = Math.round(parseFloat(riskRaw) * 100);
-            if (pct < 1) pct = 1; if (pct > 100) pct = 100;
-            document.getElementById('cfg-risk').value = pct;
-            document.getElementById('risk-val-display').textContent = pct + '%';
-            stats.risk_pct = pct / 100.0;
-        }
-        if (local.USE_MOCK_OHLCV !== undefined) document.getElementById('cfg-mock').checked = local.USE_MOCK_OHLCV;
-        else if (e.USE_MOCK_OHLCV) document.getElementById('cfg-mock').checked = e.USE_MOCK_OHLCV === '1';
-        if (local.DRY_RUN !== undefined) document.getElementById('cfg-dryrun').checked = (local.DRY_RUN === '1' || local.DRY_RUN === true);
-        else if (e.DRY_RUN) document.getElementById('cfg-dryrun').checked = e.DRY_RUN === '1';
-
-        function loadKey(id, val) {
-            if (!val) return; const el = document.getElementById(id); if (!el) return;
-            el.value = val; el.placeholder = '••••' + val.slice(-4);
-            el.addEventListener('focus', function() { if (el.value === val) el.value = ''; }, { once: true });
-            el.addEventListener('blur', function() { if (el.value === '') el.value = val; });
-        }
-        loadKey('key-bybit-real-key',    e.BYBIT_REAL_API_KEY);
-        loadKey('key-bybit-real-secret', e.BYBIT_REAL_API_SECRET);
-        loadKey('key-mexc-key',          e.MEXC_API_KEY);
-        loadKey('key-mexc-secret',       e.MEXC_API_SECRET);
-
-        updateLeverageLimits();
-
-        setTimeout(() => {
-            try { fetch('/api/save-env', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(collectEnv()) }); }
-            catch(e) {}
-        }, 500);
-
-    } catch(e) {}
-}
-
-const _BYBIT_INSTRUMENTS_URL = 'https://api.bytick.com/v5/market/instruments-info';
-async function loadBybitPairs(exchange) {
-    const statusEl = document.getElementById('pairs-status'), sel = document.getElementById('cfg-symbol');
-    if (!statusEl || !sel) return;
-    if (exchange && exchange !== 'bybit') {
-        statusEl.textContent = 'MEXC – manual'; statusEl.style.color = 'var(--warn)';
-        sel.innerHTML = ['BTCUSDT','ETHUSDT','SOLUSDT','BNBUSDT','XRPUSDT','DOGEUSDT','PEPEUSDT','WIFUSDT','AVAXUSDT','LINKUSDT','ADAUSDT','NEARUSDT','APTUSDT','ARBUSDT','OPUSDT','INJUSDT','SUIUSDT'].map(s => `<option value="${s}">${s}</option>`).join('');
-        sel.onchange = () => { _onSymbolChange(sel.value); }; return;
-    }
-    statusEl.textContent = '⟳ fetching…'; statusEl.style.color = 'var(--text2)';
-    try {
-        const params = new URLSearchParams({ category: 'linear', status: 'Trading', limit: '1000' });
-        const res = await fetch(`${_BYBIT_INSTRUMENTS_URL}?${params}`), data = await res.json();
-        if (data.retCode !== 0) throw new Error(data.retMsg);
-        const pairs = data.result.list.filter(p => p.quoteCoin === 'USDT' && p.status === 'Trading').map(p => p.symbol).sort();
-        if (!pairs.length) throw new Error('Empty pair list');
-        const pending = sel.dataset.pendingSymbol || sel.value;
-        sel.innerHTML = pairs.map(sym => `<option value="${sym}"${sym === pending ? ' selected' : ''}>${sym}</option>`).join('');
-        if (pending && pairs.includes(pending)) { sel.value = pending; const hdrSym = document.getElementById('hdr-symbol'); if (hdrSym) hdrSym.textContent = pending; }
-        else if (!pending && pairs.includes('BTCUSDT')) sel.value = 'BTCUSDT';
-        delete sel.dataset.pendingSymbol;
-        statusEl.textContent = `✓ ${pairs.length} pairs`; statusEl.style.color = 'var(--accent)';
-        const hdrSym = document.getElementById('hdr-symbol'); if (hdrSym) hdrSym.textContent = sel.value;
-        sel.onchange = () => { _onSymbolChange(sel.value); };
-    } catch(err) { statusEl.textContent = '✗ fetch failed'; statusEl.style.color = 'var(--danger)'; }
-}
-
-function _onSymbolChange(sym) {
-    const hdrSym = document.getElementById('hdr-symbol'); if (hdrSym) hdrSym.textContent = sym;
-    const btn = document.querySelector('.tf-btn.active') || document.querySelector('.tf-btn[data-tf="5"]');
-    if (btn) setTimeframe(btn);
-    if (typeof connectLivePriceWS === 'function') connectLivePriceWS();
-    updateLeverageLimits(); saveConfig(); _ohlcvCache = {};
-    if (_candleSeries) try { _candleSeries.setData([]); } catch(e) {}
-    if (_volSeries)    try { _volSeries.setData([]);    } catch(e) {}
-    _pendingMarkers = []; setTpSlLines(null, null, null);
-    const legend = document.getElementById('chart-legend'); if (legend) legend.style.display = 'none';
-    stats.price = null; stats.prevPrice = null;
-    const hdrPrice = document.getElementById('hdr-price'), statPrice = document.getElementById('stat-price');
-    if (hdrPrice) hdrPrice.textContent = '--'; if (statPrice) statPrice.textContent = '--';
-}
-
-let _wsTicker = null;
-function _getLiveSymbol() { const sel = document.getElementById('cfg-symbol'); return (sel && sel.value) ? sel.value.replace('_', '') : 'BTCUSDT'; }
-
-function connectLivePriceWS() {
-    const sym = _getLiveSymbol().toUpperCase(); // bybit needs uppercase
-    if (_wsTicker) { 
-        _wsTicker.onclose = null; 
-        _wsTicker.close(); 
-        _wsTicker = null; 
-    }
-    _wsTicker = new WebSocket('wss://stream.bytick.com/v5/public/linear');
-    _wsTicker.onopen = () => {
-        _wsTicker.send(JSON.stringify({"op":"subscribe","args":[`tickers.${sym}`]}));
-    };
-    _wsTicker.onmessage = (msg) => {
         try {
-            const payload = JSON.parse(msg.data);
-            if (payload.topic === `tickers.${sym}` && payload.data) {
-                const data = payload.data;
-                if (data.lastPrice) {
-                    const price = parseFloat(data.lastPrice);
-                    if (price && !isNaN(price)) {
-                        stats.prevPrice = stats.price; stats.price = price;
-                        addPricePoint(price, null, null, null);
-                        updatePriceStats();
-                        _trackAISignalOutcomes(price);
+            const url = `/api/proxy/tickers?symbol=${pairs.join(',')}`;
+            const r = await fetch(url);
+            const d = await r.json();
+            if (d && d.result && d.result.list) {
+                d.result.list.forEach(tick => {
+                    const pEl = container.querySelector(`.live-price-${tick.symbol}`);
+                    if (pEl) {
+                        const oldP = parseFloat(pEl.dataset.price || 0);
+                        const newP = parseFloat(tick.lastPrice);
+                        pEl.textContent = newP.toFixed(4);
+                        pEl.dataset.price = newP;
+                        if (newP > oldP) pEl.style.color = 'var(--green)';
+                        else if (newP < oldP) pEl.style.color = 'var(--red)';
                     }
-                }
-                if (data.price24hPcnt !== undefined) {
-                    const raw = parseFloat(data.price24hPcnt) * 100.0;
-                    if (!isNaN(raw)) {
-                        stats.pct24h = raw;
-                        const deltaEl = document.getElementById('hdr-delta');
-                        if (deltaEl) { const sign = raw >= 0 ? '+' : ''; deltaEl.textContent = `${sign}${raw.toFixed(2)}% 24h`; deltaEl.className = 'price-delta ' + (raw >= 0 ? 'up' : 'down'); deltaEl.style.display = ''; }
-                    }
-                }
-            }
-        } catch(e) {}
-    };
-    _wsTicker.onclose = () => setTimeout(connectLivePriceWS, 3000);
-}
-
-async function fetchAIInsight() {
-    try {
-        const r = await fetch('/api/insight'), d = await r.json();
-        if (d.open_interest !== undefined) {
-            if (!isLikelyTimestamp(d.open_interest) && d.open_interest > 0) { stats.oi = d.open_interest; stats.oiTime = d.timestamp; updateOIStats(); }
-        }
-        if (d.lsr_val) {
-            stats.lsr = d.lsr_val;
-            let biasTxt = 'NEUTRAL';
-            if (d.lsr_val > 1.05) biasTxt = 'LONG_HEAVY'; else if (d.lsr_val < 0.95) biasTxt = 'SHORT_HEAVY';
-            stats.bias = biasTxt; updateLSRStats();
-        }
-        if (d.balance !== undefined) {
-            stats.balance = d.balance;
-            if (stats.initBalance === undefined || stats.initBalance <= 0) {
-                const savedBal = Storage.get('botInitBalance');
-                if (savedBal && parseFloat(savedBal) > 0) stats.initBalance = parseFloat(savedBal);
-                else { stats.initBalance = d.balance; Storage.set('botInitBalance', d.balance); }
-            }
-            updateBalanceStats();
-        }
-        if (d.atr !== undefined) { stats.atr = d.atr; updatePriceStats(); }
-        if (d.last_price && !stats.price) { stats.price = d.last_price; updatePriceStats(); }
-    } catch(e) {}
-}
-
-// ══════════════════════════════════════════════════════════════════════════════
-// AI SIGNAL SCANNER
-// ══════════════════════════════════════════════════════════════════════════════
-
-let _aiSignalTimer = null;
-let _aiSignalPaneReady = false;
-let _autoScanActive = false;
-
-function setAITF(btn) {
-    document.querySelectorAll('.ai-tf-btn').forEach(b => {
-        b.style.background = 'transparent';
-        b.style.color = 'var(--text2)';
-    });
-    btn.style.background = 'var(--blue-d)';
-    btn.style.color = '#fff';
-    _aiScanTF = btn.dataset.tf;
-}
-
-function toggleAutoScan() {
-    _autoScanActive = !_autoScanActive;
-    Storage.set('aiAutoScanActive', _autoScanActive);
-    const btn = document.getElementById('btn-auto-scan'); if (!btn) return;
-    if (_autoScanActive) {
-        btn.textContent = 'AUTO: ON'; btn.style.borderColor = 'var(--accent)'; btn.style.color = 'var(--accent)';
-        runAISignalScan();
-        if (_aiSignalTimer) clearInterval(_aiSignalTimer);
-        _aiSignalTimer = setInterval(runAISignalScan, 5 * 60 * 1000);
-    } else {
-        btn.textContent = 'AUTO: OFF'; btn.style.borderColor = 'var(--border2)'; btn.style.color = 'var(--text2)';
-        if (_aiSignalTimer) { clearInterval(_aiSignalTimer); _aiSignalTimer = null; }
-    }
-}
-
-function _restoreAutoScanState() {
-    if (!Storage.get('aiAutoScanActive', false)) return;
-    const btn = document.getElementById('btn-auto-scan');
-    if (!btn) { setTimeout(_restoreAutoScanState, 400); return; }
-    if (_autoScanActive) return;
-    _autoScanActive = true;
-    btn.textContent = 'AUTO: ON';
-    btn.style.borderColor = 'var(--accent)';
-    btn.style.color = 'var(--accent)';
-    if (!_aiSignalTimer) {
-        runAISignalScan();
-        _aiSignalTimer = setInterval(runAISignalScan, 5 * 60 * 1000);
-    }
-}
-
-// ── Technical indicators ──────────────────────────────────────────────────────
-
-function _calcRSI(closes, period = 14) {
-    if (closes.length < period + 2) return 50;
-    const deltas = closes.slice(1).map((v, i) => v - closes[i]);
-    let gains = 0, losses = 0;
-    for (let i = 0; i < period; i++) { if (deltas[i] > 0) gains += deltas[i]; else losses -= deltas[i]; }
-    let avgGain = gains / period, avgLoss = losses / period;
-    for (let i = period; i < deltas.length; i++) { const up = deltas[i] > 0 ? deltas[i] : 0, dn = deltas[i] < 0 ? -deltas[i] : 0; avgGain = (avgGain * (period - 1) + up) / period; avgLoss = (avgLoss * (period - 1) + dn) / period; }
-    return avgLoss < 1e-9 ? 100 : 100 - 100 / (1 + avgGain / avgLoss);
-}
-
-function _calcEMA(closes, period) {
-    if (closes.length < period) return closes[closes.length - 1] || 0;
-    const k = 2 / (period + 1);
-    let ema = closes.slice(0, period).reduce((s, v) => s + v, 0) / period;
-    for (let i = period; i < closes.length; i++) ema = closes[i] * k + ema * (1 - k);
-    return ema;
-}
-
-function _calcATR(candles, period = 14) {
-    if (candles.length < 2) return 0;
-    const trs = [];
-    for (let i = 1; i < candles.length; i++) { const hl = candles[i].h - candles[i].l, hpc = Math.abs(candles[i].h - candles[i-1].c), lpc = Math.abs(candles[i].l - candles[i-1].c); trs.push(Math.max(hl, hpc, lpc)); }
-    const n = Math.min(period, trs.length);
-    let atr = trs.slice(0, n).reduce((s, v) => s + v, 0) / n;
-    for (let i = n; i < trs.length; i++) atr = atr * (n - 1) / n + trs[i] / n;
-    return atr;
-}
-
-function _calcStdDev(arr, period) {
-    if (arr.length < period) return 0;
-    const slice = arr.slice(-period);
-    const mean = slice.reduce((a,b)=>a+b,0)/slice.length;
-    const variance = slice.reduce((a,b)=>a+Math.pow(b-mean,2),0)/slice.length;
-    return Math.sqrt(variance);
-}
-
-function _analyzeSignal(symbol, candles, style) {
-    if (candles.length < 50) return null;
-    const closes = candles.map(c => c.c), price = closes[closes.length - 1];
-    const rsi = _calcRSI(closes), ema9 = _calcEMA(closes, 9), ema21 = _calcEMA(closes, 21), ema50 = _calcEMA(closes, 50), atr = _calcATR(candles);
-    if (atr < 1e-8) return null;
-    
-    // Strict Noise Veto
-    const stdDev = _calcStdDev(closes, 20);
-    const noise = stdDev / (atr || 1);
-    
-    let noiseVeto = 1.50;
-    let minConf = 0.20;
-    let tpMult = 1.2;
-    let slMult = 1.0;
-    let minRR = 1.0;
-    
-    if (style === 'daytrade') { noiseVeto = 1.20; minConf = 0.25; tpMult = 2.0; slMult = 1.2; minRR = 1.2; }
-    else if (style === 'sniper') { noiseVeto = 1.00; minConf = 0.30; tpMult = 3.0; slMult = 1.5; minRR = 1.5; }
-    
-    if (noise > noiseVeto) return null;
-    
-    const emaBullAlign = ema9 > ema21 && ema21 > ema50;
-    const emaBearAlign = ema9 < ema21 && ema21 < ema50;
-    
-    let bullScore = 0, bearScore = 0; const reasons = [];
-    
-    if (rsi <= 30) { bullScore += 3; reasons.push(`RSI ${rsi.toFixed(0)}`); }
-    if (rsi >= 70) { bearScore += 3; reasons.push(`RSI ${rsi.toFixed(0)}`); }
-    
-    const last = candles[candles.length - 1], prev = candles[candles.length - 2];
-    if (last.c > last.o && prev.c < prev.o && last.c > prev.o && last.o < prev.c) { bullScore += 2; reasons.push('Bull engulf'); }
-    if (last.c < last.o && prev.c > prev.o && last.c < prev.o && last.o > prev.c) { bearScore += 2; reasons.push('Bear engulf'); }
-    
-    if (bullScore < 1 && bearScore < 1) return null;
-    if (Math.abs(bullScore - bearScore) < 1) return null;
-    
-    const isBull = bullScore > bearScore, direction = isBull ? 'LONG' : 'SHORT';
-    let score = isBull ? bullScore : bearScore;
-    
-    // SOFT EMA VETO
-    if (isBull && emaBearAlign) score -= 1;
-    if (!isBull && emaBullAlign) score -= 1;
-    if (score < 1) return null;
-    
-    const confidence = Math.min(0.95, 0.25 + score * 0.05);
-    if (confidence < minConf) return null;
-    
-    const entry = price, sl = isBull ? price - atr * slMult : price + atr * slMult, tp = isBull ? price + atr * tpMult : price - atr * tpMult, rr = Math.abs(tp - entry) / Math.abs(sl - entry);
-    if (rr < minRR) return null;
-    
-    const volRatio = 1.0; // Simplified for UI
-    return { symbol, direction, confidence, entry, tp, sl, rr, rsi, reasons, price, ema9, ema21, ema50, volRatio, trendConflict: false, emaBullAlign, emaBearAlign };
-}
-
-async function runAISignalScan() {
-    ensureSignalPaneReady();
-    const statusEl = document.getElementById('ai-scan-status'), gridEl = document.getElementById('ai-signal-grid'), statsEl = document.getElementById('ai-signal-stats');
-    if (!gridEl) return;
-    
-    const style = document.getElementById('cfg-style')?.value || 'scalping';
-    let tf = '5';
-    if (style === 'daytrade') tf = '15';
-    else if (style === 'sniper') tf = '60';
-    _aiScanTF = tf;
-    
-    // Update active button visually
-    document.querySelectorAll('.ai-tf-btn').forEach(b => {
-        b.style.background = b.dataset.tf === tf ? 'var(--blue-d)' : 'transparent';
-        b.style.color = b.dataset.tf === tf ? '#fff' : 'var(--text2)';
-    });
-
-    if (statusEl) statusEl.textContent = `⟳ Fetching Pairs...`;
-    gridEl.innerHTML = `<div style="color:var(--text2);font-family:var(--mono);font-size:12px;padding:24px;text-align:center;grid-column:1/-1;">⟳ Mencari top volume pairs...</div>`;
-    
-    const sel = document.getElementById('cfg-symbol');
-    let pairsToScan = sel ? Array.from(sel.options).map(o => o.value) : ['BTCUSDT','ETHUSDT'];
-
-    if (statusEl) statusEl.textContent = `⟳ Scanning ${tf}m...`;
-    gridEl.innerHTML = `<div style="color:var(--text2);font-family:var(--mono);font-size:12px;padding:24px;text-align:center;grid-column:1/-1;">⟳ Mengambil data ${pairsToScan.length} pair (TF: ${tf}m)...</div>`;
-    
-    const results = []; let scanned = 0, errors = 0;
-    const batchSize = 5;
-    for (let i = 0; i < pairsToScan.length; i += batchSize) {
-        const batch = pairsToScan.slice(i, i + batchSize);
-        const batchResults = await Promise.allSettled(batch.map(async pair => {
-            const resp = await fetch(`https://api.bytick.com/v5/market/kline?category=linear&symbol=${pair}&interval=${tf}&limit=100`, { signal: AbortSignal.timeout(6000) });
-            if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-            const d = await resp.json();
-            if (d.retCode !== 0 || !d.result?.list?.length) throw new Error('no data');
-            const candles = d.result.list.slice().reverse().map(c => ({ o: parseFloat(c[1]), h: parseFloat(c[2]), l: parseFloat(c[3]), c: parseFloat(c[4]), v: parseFloat(c[5]) }));
-            scanned++;
-            return _analyzeSignal(pair, candles, style);
-        }));
-        for (const res of batchResults) { if (res.status === 'fulfilled' && res.value) results.push(res.value); else if (res.status === 'rejected') errors++; }
-        if (results.length > 0) _renderAISignals(results, scanned, tf);
-    }
-    _renderAISignals(results, scanned, tf);
-    _renderAIScanStats(results, scanned, errors, statsEl);
-    const ts = new Date().toLocaleTimeString();
-    if (statusEl) statusEl.textContent = `✓ ${scanned}/${pairsToScan.length} @ ${ts} | ${results.length} signal | TF:${tf}m`;
-    if (results.length > 0) {
-        Storage.set('aiLastScanResults', { results, ts, scanned });
-        // [FIX-AI-1] Auto-add ALL signals to history — no click needed
-        _autoAddSignalsToHistory(results);
-    }
-}
-
-function _renderAIScanStats(results, total, errors, el) {
-    if (!el) return;
-    const longs = results.filter(r => r.direction === 'LONG').length, shorts = results.filter(r => r.direction === 'SHORT').length;
-    const avgConf = results.length ? (results.reduce((s, r) => s + r.confidence, 0) / results.length * 100).toFixed(0) : 0;
-    const conflicts = results.filter(r => r.trendConflict).length;
-    el.innerHTML = [
-        { label: 'Scanned', value: total, color: 'var(--text)' },
-        { label: 'LONG', value: longs, color: 'var(--accent)' },
-        { label: 'SHORT', value: shorts, color: 'var(--danger)' },
-        { label: 'Avg Conf', value: avgConf + '%', color: 'var(--warn)' },
-        { label: '⚠ Conflict', value: conflicts, color: conflicts > 0 ? '#f59e0b' : 'var(--text2)' },
-    ].map(s => `<div style="background:var(--bg2);border-right:1px solid var(--border);padding:8px;text-align:center;">
-        <div style="font-size:9px;font-family:var(--mono);color:var(--text2);text-transform:uppercase;">${s.label}</div>
-        <div style="font-family:var(--mono);font-size:16px;font-weight:700;color:${s.color};margin-top:2px;">${s.value}</div>
-    </div>`).join('');
-}
-
-function _renderAISignals(results, total, tf) {
-    const gridEl = document.getElementById('ai-signal-grid'); if (!gridEl) return;
-    if (!results.length) { gridEl.innerHTML = `<div style="color:var(--text2);font-family:var(--mono);font-size:12px;padding:24px;text-align:center;grid-column:1/-1;border:1px dashed var(--border);border-radius:6px;">Tidak ada sinyal kuat dari ${total} pair (TF: ${tf}m)<br><span style="font-size:10px;opacity:0.6;">Coba TF lain atau tunggu momentum terbentuk.</span></div>`; _lastAIScanResults = []; return; }
-    const sorted = [...results].sort((a, b) => b.confidence - a.confidence); _lastAIScanResults = sorted;
-    gridEl.innerHTML = sorted.map(s => {
-        const isLong = s.direction === 'LONG', color = isLong ? 'var(--accent)' : 'var(--danger)', bgColor = isLong ? '#00e5a012' : '#ef444412', border = isLong ? '#00e5a030' : '#ef444430';
-        const confPct = Math.round(s.confidence * 100), dec = s.price < 0.01 ? 6 : s.price < 1 ? 5 : s.price < 10 ? 4 : s.price < 1000 ? 3 : 2;
-        const confBar = `<div style="height:3px;background:var(--border);border-radius:2px;margin:6px 0 8px;"><div style="height:3px;width:${confPct}%;background:${color};border-radius:2px;transition:width .3s;"></div></div>`;
-        const conflictBadge = s.trendConflict ? `<span style="background:rgba(245,158,11,0.2);color:#f59e0b;border:1px solid rgba(245,158,11,0.4);border-radius:3px;padding:2px 6px;font-family:var(--mono);font-size:8px;font-weight:700;margin-left:4px;">⚠ CONFLICT</span>` : '';
-        const emaLabel = s.emaBullAlign ? '▲ bull' : s.emaBearAlign ? '▼ bear' : '— mix', emaColor = s.emaBullAlign ? 'var(--accent)' : s.emaBearAlign ? 'var(--danger)' : 'var(--text2)';
-        // Check if already tracked
-        const isTracked = _aiSignalHistory.some(h => h.symbol === s.symbol && h.status === 'OPEN');
-        const trackedBadge = isTracked ? `<span style="background:rgba(59,130,246,0.2);color:var(--blue);border:1px solid rgba(59,130,246,0.4);border-radius:3px;padding:2px 5px;font-family:var(--mono);font-size:8px;font-weight:700;">TRACKING</span>` : '';
-        return `<div style="background:var(--bg2);border:1px solid ${border};border-radius:6px;padding:12px;cursor:pointer;transition:border-color .2s;${s.trendConflict ? 'opacity:0.78;' : ''}" onclick="selectAISignalPair('${s.symbol}')" onmouseenter="this.style.borderColor='${color}'" onmouseleave="this.style.borderColor='${border}'">
-          <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;">
-            <span style="font-family:var(--mono);font-weight:700;color:var(--text);font-size:12px;">${s.symbol.replace('USDT','/USDT')} ${trackedBadge}</span>
-            <div style="display:flex;align-items:center;gap:3px;">${conflictBadge}<span style="background:${bgColor};color:${color};border:1px solid ${border};border-radius:3px;padding:2px 8px;font-family:var(--mono);font-size:10px;font-weight:700;">${s.direction}</span></div>
-          </div>
-          ${confBar}
-          <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:5px;margin-bottom:7px;">
-            <div style="text-align:center;background:var(--panel);border:1px solid var(--border);border-radius:3px;padding:5px;"><div style="font-size:8px;color:var(--text2);text-transform:uppercase;margin-bottom:1px;">Entry</div><div style="font-family:var(--mono);color:var(--blue);font-size:10px;font-weight:600;">${s.entry.toFixed(dec)}</div></div>
-            <div style="text-align:center;background:var(--panel);border:1px solid var(--border);border-radius:3px;padding:5px;"><div style="font-size:8px;color:var(--text2);text-transform:uppercase;margin-bottom:1px;">TP</div><div style="font-family:var(--mono);color:var(--accent);font-size:10px;font-weight:600;">${s.tp.toFixed(dec)}</div></div>
-            <div style="text-align:center;background:var(--panel);border:1px solid var(--border);border-radius:3px;padding:5px;"><div style="font-size:8px;color:var(--text2);text-transform:uppercase;margin-bottom:1px;">SL</div><div style="font-family:var(--mono);color:var(--danger);font-size:10px;font-weight:600;">${s.sl.toFixed(dec)}</div></div>
-          </div>
-          <div style="display:flex;justify-content:space-between;font-family:var(--mono);font-size:9px;color:var(--text2);margin-bottom:4px;">
-            <span>RSI ${s.rsi.toFixed(0)}</span><span>RR ${s.rr.toFixed(2)}×</span><span>Conf ${confPct}%</span><span style="color:${emaColor}">EMA ${emaLabel}</span>
-          </div>
-          <div style="font-size:9px;color:var(--text2);font-style:italic;line-height:1.4;">${s.reasons.slice(0,3).join(' · ')}</div>
-        </div>`;
-    }).join('');
-}
-
-// [FIX-AI-5] selectAISignalPair — skip re-add to history if already OPEN
-function selectAISignalPair(symbol) {
-    const sel = document.getElementById('cfg-symbol');
-    if (sel && [...sel.options].some(o => o.value === symbol)) { sel.value = symbol; _onSymbolChange(symbol); }
-    const sig = _lastAIScanResults.find(s => s.symbol === symbol);
-    const chartBtn = document.querySelector('.tab[onclick*="chart"]'); if (chartBtn) switchTab('chart', chartBtn);
-    if (sig) {
-        const action = sig.direction === 'LONG' ? 'BUY' : 'SELL', dec = sig.price < 10 ? 4 : 2, conflictWarn = sig.trendConflict ? ' ⚠CONFLICT' : '';
-        toast(`📍 ${symbol} ${sig.direction}${conflictWarn} | Entry:${sig.entry.toFixed(dec)} TP:${sig.tp.toFixed(dec)} SL:${sig.sl.toFixed(dec)}`, !sig.trendConflict);
-        // [FIX-AI-5] Only add to history if not already OPEN (auto-scan already added it)
-        const alreadyTracked = _aiSignalHistory.some(h => h.symbol === sig.symbol && h.status === 'OPEN');
-        if (!alreadyTracked) {
-            _aiSignalHistory.unshift({ time: new Date().toLocaleTimeString(), symbol: sig.symbol, direction: sig.direction, entry: sig.entry, tp: sig.tp, sl: sig.sl, rr: sig.rr, conf: sig.confidence, status: 'PENDING', pnl: null, closeTime: null });
-            if (_aiSignalHistory.length > 300) _aiSignalHistory.pop();
-            _saveAISignalHistory();
-        }
-        setTimeout(() => { addSignalMarker(action, sig.price); setTpSlLines(sig.entry, sig.tp, sig.sl); _showChartLegend(); }, 1200);
-    } else { toast(`Chart: ${symbol}`, true); }
-}
-
-// ── ensureSignalPaneReady ─────────────────────────────────────────────────────
-function ensureSignalPaneReady() {
-    if (_aiSignalPaneReady) return;
-    _aiSignalPaneReady = true;
-    const pane = document.getElementById('pane-insight'); if (!pane) return;
-    pane.style.padding = '0'; pane.style.background = 'var(--bg)';
-
-    pane.innerHTML = `
-    <div style="height:100%;overflow-y:auto;box-sizing:border-box;display:flex;flex-direction:column;">
-
-      <div style="display:flex;align-items:center;justify-content:space-between;padding:12px 16px;flex-shrink:0;border-bottom:1px solid var(--border);background:var(--bg2);">
-        <div>
-          <div style="font-family:var(--mono);color:var(--accent);font-size:13px;font-weight:600;letter-spacing:2px;">🎯 AI SIGNAL SCANNER</div>
-          <div style="font-family:var(--mono);font-size:9px;color:var(--text2);margin-top:2px;">Top 50 pairs · Auto-track WIN/LOSS via live price · Klik kartu → chart</div>
-        </div>
-        <div style="display:flex;gap:8px;align-items:center;flex-shrink:0;">
-          <div style="display:flex;gap:2px;background:var(--bg);border:1px solid var(--border);border-radius:4px;padding:2px;">
-            <button class="ai-tf-btn" data-tf="5"  onclick="setAITF(this)" style="padding:3px 8px;font-family:var(--mono);font-size:10px;border:none;border-radius:3px;cursor:pointer;background:transparent;color:var(--text2);">5m</button>
-            <button class="ai-tf-btn active" data-tf="15" onclick="setAITF(this)" style="padding:3px 8px;font-family:var(--mono);font-size:10px;border:none;border-radius:3px;cursor:pointer;background:var(--blue-d);color:#fff;">15m</button>
-            <button class="ai-tf-btn" data-tf="60" onclick="setAITF(this)" style="padding:3px 8px;font-family:var(--mono);font-size:10px;border:none;border-radius:3px;cursor:pointer;background:transparent;color:var(--text2);">1h</button>
-          </div>
-          <span id="ai-scan-status" style="font-family:var(--mono);font-size:10px;color:var(--text2);">⟳ idle</span>
-          <button onclick="runAISignalScan()" style="padding:6px 14px;background:var(--accent);color:#000;border:none;border-radius:4px;font-family:var(--mono);font-size:11px;font-weight:700;cursor:pointer;letter-spacing:1px;white-space:nowrap;">⚡ SCAN</button>
-          <button onclick="toggleAutoScan()" id="btn-auto-scan" style="padding:6px 10px;background:var(--panel);border:1px solid var(--border2);color:var(--text2);border-radius:4px;font-family:var(--mono);font-size:10px;cursor:pointer;white-space:nowrap;">AUTO: OFF</button>
-        </div>
-      </div>
-
-      <div id="ai-signal-stats" style="display:grid;grid-template-columns:repeat(5,1fr);border-bottom:1px solid var(--border);flex-shrink:0;"></div>
-
-      <div id="ai-signal-grid" style="padding:12px 16px;display:grid;gap:8px;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));flex-shrink:0;">
-        <div style="color:var(--text2);font-family:var(--mono);font-size:12px;padding:24px;text-align:center;grid-column:1/-1;border:1px dashed var(--border);border-radius:6px;">
-          Klik <strong style="color:var(--accent)">⚡ SCAN</strong> untuk analisa Top 50 pair<br>
-          <span style="font-size:10px;opacity:0.6;margin-top:4px;display:block;">Semua signal otomatis masuk history · WIN/LOSS dihitung saat price hit TP/SL via live price</span>
-        </div>
-      </div>
-
-      <div style="flex-shrink:0;border-top:1px solid var(--border);background:var(--bg2);">
-        <div style="display:flex;align-items:center;justify-content:space-between;padding:10px 16px;border-bottom:1px solid var(--border);">
-          <span style="font-family:var(--mono);font-size:10px;font-weight:600;letter-spacing:2px;color:var(--text2);text-transform:uppercase;">📊 SIGNAL HISTORY (Auto-Track)</span>
-          <div style="display:flex;gap:12px;align-items:center;">
-            <div id="ai-hist-summary" style="display:flex;gap:14px;font-family:var(--mono);font-size:11px;"></div>
-            <button onclick="clearAISignalHistory()" style="padding:4px 10px;background:var(--panel);border:1px solid var(--border2);color:var(--danger);border-radius:4px;font-family:var(--mono);font-size:10px;cursor:pointer;">🗑 Reset</button>
-          </div>
-        </div>
-        <div style="max-height:220px;overflow-y:auto;">
-          <table style="width:100%;border-collapse:collapse;font-family:var(--mono);font-size:11px;">
-            <thead>
-              <tr style="background:var(--panel);position:sticky;top:0;z-index:1;">
-                <th style="text-align:left;padding:7px 12px;color:var(--text2);font-weight:600;font-size:9px;letter-spacing:1.5px;border-bottom:1px solid var(--border);">Time</th>
-                <th style="text-align:left;padding:7px 12px;color:var(--text2);font-weight:600;font-size:9px;letter-spacing:1.5px;border-bottom:1px solid var(--border);">Pair</th>
-                <th style="text-align:left;padding:7px 12px;color:var(--text2);font-weight:600;font-size:9px;letter-spacing:1.5px;border-bottom:1px solid var(--border);">Dir</th>
-                <th style="text-align:left;padding:7px 12px;color:var(--text2);font-weight:600;font-size:9px;letter-spacing:1.5px;border-bottom:1px solid var(--border);">Entry</th>
-                <th style="text-align:left;padding:7px 12px;color:var(--text2);font-weight:600;font-size:9px;letter-spacing:1.5px;border-bottom:1px solid var(--border);">Live</th>
-                <th style="text-align:left;padding:7px 12px;color:var(--text2);font-weight:600;font-size:9px;letter-spacing:1.5px;border-bottom:1px solid var(--border);">TP</th>
-                <th style="text-align:left;padding:7px 12px;color:var(--text2);font-weight:600;font-size:9px;letter-spacing:1.5px;border-bottom:1px solid var(--border);">SL</th>
-                <th style="text-align:left;padding:7px 12px;color:var(--text2);font-weight:600;font-size:9px;letter-spacing:1.5px;border-bottom:1px solid var(--border);">Status</th>
-                <th style="text-align:left;padding:7px 12px;color:var(--text2);font-weight:600;font-size:9px;letter-spacing:1.5px;border-bottom:1px solid var(--border);">P&L / Dist</th>
-              </tr>
-            </thead>
-            <tbody id="ai-signal-history-body"></tbody>
-          </table>
-        </div>
-      </div>
-
-    </div>`;
-
-    renderAISignalHistory();
-    _restoreAutoScanState();
-}
-
-// ── Trades Tab ────────────────────────────────────────────────────────────────
-function initTradesTab() {
-    const tabBar = document.querySelector('.tab-bar'), spacer = document.querySelector('.tab-spacer');
-    if (tabBar && spacer && !document.querySelector('[data-trade-tab]')) {
-        const tradeBtn = document.createElement('button'); tradeBtn.className = 'tab'; tradeBtn.setAttribute('data-trade-tab', '1'); tradeBtn.textContent = '📊 TRADES'; tradeBtn.onclick = function() { switchTab('trades', this); };
-        tabBar.insertBefore(tradeBtn, spacer);
-    }
-    if (!document.getElementById('pane-trades')) {
-        const mainPanel = document.querySelector('.main-panel'); if (!mainPanel) return;
-        const pane = document.createElement('div'); pane.className = 'tab-pane'; pane.id = 'pane-trades';
-        pane.style.cssText = 'display:none;visibility:hidden;pointer-events:none;position:absolute;width:0;height:0;overflow:hidden;clip:rect(0,0,0,0);z-index:-999;flex-direction:column;';
-        pane.innerHTML = `
-          <div style="display:grid;grid-template-columns:repeat(5,1fr);border-bottom:1px solid var(--border);background:var(--bg2);flex-shrink:0;">
-            <div style="padding:12px 16px;border-right:1px solid var(--border);text-align:center;"><div style="font-family:var(--mono);font-size:9px;font-weight:600;letter-spacing:1.5px;text-transform:uppercase;color:var(--text2);margin-bottom:4px;">Total</div><div id="ts-total" style="font-family:var(--mono);font-size:18px;font-weight:700;color:var(--text);">0</div></div>
-            <div style="padding:12px 16px;border-right:1px solid var(--border);text-align:center;"><div style="font-family:var(--mono);font-size:9px;font-weight:600;letter-spacing:1.5px;text-transform:uppercase;color:var(--text2);margin-bottom:4px;">Win Rate</div><div id="ts-wr" style="font-family:var(--mono);font-size:18px;font-weight:700;color:var(--text);">--</div></div>
-            <div style="padding:12px 16px;border-right:1px solid var(--border);text-align:center;"><div style="font-family:var(--mono);font-size:9px;font-weight:600;letter-spacing:1.5px;text-transform:uppercase;color:var(--text2);margin-bottom:4px;">Sim P&L</div><div id="ts-pnl" style="font-family:var(--mono);font-size:18px;font-weight:700;color:var(--text);">+0.00%</div></div>
-            <div style="padding:12px 16px;border-right:1px solid var(--border);text-align:center;"><div style="font-family:var(--mono);font-size:9px;font-weight:600;letter-spacing:1.5px;text-transform:uppercase;color:var(--text2);margin-bottom:4px;">Wins</div><div id="ts-wins" style="font-family:var(--mono);font-size:18px;font-weight:700;color:var(--accent);">0</div></div>
-            <div style="padding:12px 16px;text-align:center;"><div style="font-family:var(--mono);font-size:9px;font-weight:600;letter-spacing:1.5px;text-transform:uppercase;color:var(--text2);margin-bottom:4px;">Losses</div><div id="ts-losses" style="font-family:var(--mono);font-size:18px;font-weight:700;color:var(--danger);">0</div></div>
-          </div>
-          <div style="display:flex;align-items:center;justify-content:space-between;padding:12px 20px;border-bottom:1px solid var(--border);background:var(--bg2);flex-shrink:0;">
-            <span style="font-family:var(--mono);font-size:10px;font-weight:600;letter-spacing:2px;color:var(--text2);text-transform:uppercase;">📊 TRADE HISTORY</span>
-            <button onclick="resetHistory()" style="padding:5px 12px;background:var(--panel);border:1px solid var(--border2);color:var(--danger);border-radius:4px;font-family:var(--mono);font-size:10px;cursor:pointer;">🗑 Reset</button>
-          </div>
-          <div style="flex:1;overflow-y:auto;">
-            <table style="width:100%;border-collapse:collapse;font-family:var(--mono);font-size:12px;">
-              <thead><tr style="background:var(--panel);position:sticky;top:0;z-index:1;">
-                <th style="text-align:left;padding:10px 20px;color:var(--text2);font-weight:600;font-size:10px;letter-spacing:1.5px;border-bottom:1px solid var(--border);text-transform:uppercase;">Time</th>
-                <th style="text-align:left;padding:10px 20px;color:var(--text2);font-weight:600;font-size:10px;letter-spacing:1.5px;border-bottom:1px solid var(--border);text-transform:uppercase;">Side</th>
-                <th style="text-align:left;padding:10px 20px;color:var(--text2);font-weight:600;font-size:10px;letter-spacing:1.5px;border-bottom:1px solid var(--border);text-transform:uppercase;">Entry</th>
-                <th style="text-align:left;padding:10px 20px;color:var(--text2);font-weight:600;font-size:10px;letter-spacing:1.5px;border-bottom:1px solid var(--border);text-transform:uppercase;">TP</th>
-                <th style="text-align:left;padding:10px 20px;color:var(--text2);font-weight:600;font-size:10px;letter-spacing:1.5px;border-bottom:1px solid var(--border);text-transform:uppercase;">SL</th>
-                <th style="text-align:left;padding:10px 20px;color:var(--text2);font-weight:600;font-size:10px;letter-spacing:1.5px;border-bottom:1px solid var(--border);text-transform:uppercase;">Status</th>
-                <th style="text-align:left;padding:10px 20px;color:var(--text2);font-weight:600;font-size:10px;letter-spacing:1.5px;border-bottom:1px solid var(--border);text-transform:uppercase;">P&L</th>
-              </tr></thead>
-              <tbody id="trades-full-tbody"><tr><td colspan="7" style="text-align:center;padding:3rem;color:var(--text2);font-family:var(--mono);font-size:13px;">No closed trades yet</td></tr></tbody>
-            </table>
-          </div>`;
-        mainPanel.appendChild(pane);
-    }
-}
-
-function renderFullTradesTable() {
-    const tbody = document.getElementById('trades-full-tbody'); if (!tbody) return;
-    const wins = _goTradeHistory.filter(t => t.status === 'CLOSED_TP' || (t.pnl||0) > 0).length;
-    const losses = _goTradeHistory.filter(t => t.status === 'CLOSED_SL' || (t.pnl||0) < 0).length;
-    const total = _goTradeHistory.length;
-    
-    let computedPnl = 0;
-    _goTradeHistory.forEach(t => computedPnl += (t.pnl || 0));
-    const pnlSign = computedPnl >= 0 ? '+' : '';
-    
-    const el = (id) => document.getElementById(id);
-    if (el('ts-total'))  el('ts-total').textContent  = total + (_goActiveTrades.length ? ' +1' : '');
-    if (el('ts-wr'))     el('ts-wr').textContent      = total ? (wins/total*100).toFixed(1) + '%' : '--';
-    if (el('ts-pnl'))  { el('ts-pnl').textContent = pnlSign + computedPnl.toFixed(2) + '%'; el('ts-pnl').style.color = computedPnl > 0 ? 'var(--accent)' : computedPnl < 0 ? 'var(--danger)' : 'var(--text)'; }
-    if (el('ts-wins'))   el('ts-wins').textContent   = wins;
-    if (el('ts-losses')) el('ts-losses').textContent = losses;
-    
-    let rows = '';
-    if (_goActiveTrades.length > 0) {
-        const activeTrade = _goActiveTrades[0];
-        const dec = activeTrade.entry_price < 1 ? 6 : activeTrade.entry_price < 10 ? 4 : 2;
-        const curPnl = activeTrade.pnl || 0;
-        const curPnlColor = curPnl >= 0 ? 'trade-win' : 'trade-loss';
-        const curPnlSign = curPnl >= 0 ? '+' : '';
-        const status = activeTrade.status || 'OPEN';
-        const entryDisplay = status === 'PENDING' ? (activeTrade.limit_price || activeTrade.entry_price || 0) : (activeTrade.entry_price || 0);
-        const statusColor = status === 'PENDING' ? 'var(--warn)' : 'var(--accent)';
-        rows += `<tr style="background:rgba(245,158,11,0.04)"><td style="padding:12px 20px;border-bottom:1px solid var(--border);color:var(--text)">${activeTrade.time||'--'}</td><td style="padding:12px 20px;border-bottom:1px solid var(--border)" class="${activeTrade.side==='BUY'?'trade-win':'trade-loss'}">${activeTrade.side}</td><td style="padding:12px 20px;border-bottom:1px solid var(--border);color:var(--text)">${entryDisplay.toFixed(dec)}</td><td style="padding:12px 20px;border-bottom:1px solid var(--border)" class="trade-win">${(activeTrade.take_profit||0).toFixed(dec)}</td><td style="padding:12px 20px;border-bottom:1px solid var(--border)" class="trade-loss">${(activeTrade.stop_loss||0).toFixed(dec)}</td><td style="padding:12px 20px;border-bottom:1px solid var(--border)"><span style="display:inline-block;padding:3px 8px;border-radius:3px;font-size:10px;font-weight:700;letter-spacing:1px;background:rgba(245,158,11,0.15);color:${statusColor};border:1px solid rgba(245,158,11,0.3);">${status}</span></td><td style="padding:12px 20px;border-bottom:1px solid var(--border)" class="${curPnlColor}">${curPnlSign}${curPnl.toFixed(2)}%</td></tr>`;
-    }
-    _goTradeHistory.forEach(t => {
-        const isWin = (t.pnl || 0) >= 0;
-        const cls = isWin ? 'trade-win' : 'trade-loss';
-        const dec = t.entry_price < 1 ? 6 : t.entry_price < 10 ? 4 : 2;
-        const pnl = (t.pnl >= 0 ? '+' : '') + (t.pnl||0).toFixed(2) + '%';
-        const badgeBg = isWin ? 'rgba(0,229,160,0.12)' : 'rgba(239,68,68,0.1)';
-        const badgeClr = isWin ? 'var(--accent)' : 'var(--danger)';
-        const badgeBdr = isWin ? 'rgba(0,229,160,0.3)' : 'rgba(239,68,68,0.3)';
-        rows += `<tr onmouseenter="this.style.background='rgba(255,255,255,0.02)'" onmouseleave="this.style.background=''"><td style="padding:12px 20px;border-bottom:1px solid var(--border);color:var(--text2)">${t.time||'--'}</td><td style="padding:12px 20px;border-bottom:1px solid var(--border)" class="${t.side==='BUY'?'trade-win':'trade-loss'}">${t.side}</td><td style="padding:12px 20px;border-bottom:1px solid var(--border);color:var(--text)">${(t.entry_price||0).toFixed(dec)}</td><td style="padding:12px 20px;border-bottom:1px solid var(--border)" class="trade-win">${(t.take_profit||0).toFixed(dec)}</td><td style="padding:12px 20px;border-bottom:1px solid var(--border)" class="trade-loss">${(t.stop_loss||0).toFixed(dec)}</td><td style="padding:12px 20px;border-bottom:1px solid var(--border)"><span style="display:inline-block;padding:3px 8px;border-radius:3px;font-size:10px;font-weight:700;letter-spacing:1px;background:${badgeBg};color:${badgeClr};border:1px solid ${badgeBdr};">${t.status}</span></td><td style="padding:12px 20px;border-bottom:1px solid var(--border)" class="${cls}">${pnl}</td></tr>`;
-    });
-    
-    // MOCK history rendering removed
-    
-    if (!rows) rows = `<tr><td colspan="7" style="text-align:center;padding:3rem;color:var(--text2);font-family:var(--mono);font-size:13px;">No closed trades yet</td></tr>`;
-    tbody.innerHTML = rows;
-}
-
-// ── BOOT SEQUENCE ─────────────────────────────────────────────────────────────
-loadConfig();
-loadSimState();
-
-const styleSelect = document.getElementById('cfg-style');
-if (styleSelect) {
-    styleSelect.addEventListener('change', () => {
-        loadSimState();
-        renderFullTradesTable();
-    });
-}
-loadBybitPairs('bybit');
-_loadAISignalHistory();
-ensureSignalPaneReady();
-initTradesTab();
-
-(function _initPaneContainment() {
-    document.querySelectorAll('.tab-pane:not(.active)').forEach(p => { p.style.cssText = 'display:none;visibility:hidden;pointer-events:none;position:absolute;width:0;height:0;overflow:hidden;clip:rect(0,0,0,0);z-index:-999;'; });
-    const activePane = document.querySelector('.tab-pane.active');
-    if (activePane) { activePane.style.cssText = 'display:flex;visibility:visible;pointer-events:auto;flex-direction:column;overflow:hidden;position:relative;width:100%;height:100%;clip:auto;z-index:1;'; }
-})();
-
-poll();
-setInterval(poll, 1500);
-setInterval(fetchAIInsight, 3000);
-setTimeout(connectLivePriceWS, 1000);
-setInterval(fetchPositions, 1000);
-
-// [FIX-AI-LIVE] Background polling for AI Signal Live Prices
-async function _updateAISignalLivePrices() {
-    const openSymbols = [...new Set(_aiSignalHistory.filter(s => s.status === 'OPEN' || s.status === 'PENDING').map(s => s.symbol))];
-    if (!openSymbols.length) return;
-    
-    // Batch into chunks of 10 if too many
-    try {
-        const url = `/api/proxy/tickers?symbol=${openSymbols.join(',')}`;
-        const r = await fetch(url);
-        const d = await r.json();
-        if (d && d.result && d.result.list) {
-            let changed = false;
-            d.result.list.forEach(tick => {
-                const price = parseFloat(tick.lastPrice);
-                _aiSignalHistory.forEach(sig => {
-                    if ((sig.status === 'OPEN' || sig.status === 'PENDING') && sig.symbol === tick.symbol) {
-                        sig.livePrice = price;
-                        // Gunakan leverage dinamis proporsional
-                        const exchange = document.getElementById('cfg-exchange').value || 'mexc';
-                        const activeSym = document.getElementById('cfg-symbol').value || 'BTCUSDT';
-                        const userLev = stats.leverage || 10;
-                        const levRatio = userLev / getMaxLeverage(exchange, activeSym);
-                        const lev = Math.max(1, Math.round(getMaxLeverage(exchange, sig.symbol) * levRatio));
-                        
-                        // Limit Order Trigger Logic for AI Insight
-                        if (sig.status === 'PENDING') {
-                            if ((sig.direction === 'LONG' || sig.direction === 'BUY') && price <= sig.entry) {
-                                sig.status = 'OPEN';
-                            } else if ((sig.direction === 'SHORT' || sig.direction === 'SELL') && price >= sig.entry) {
-                                sig.status = 'OPEN';
-                            }
-                        }
-
-                        // Cek TP / SL sekalian supaya bisa running background tanpa di-trigger manual!
-                        if (sig.status === 'OPEN') {
-                            if (sig.direction === 'LONG' || sig.direction === 'BUY') {
-                                if (price >= sig.tp) { sig.status = 'WIN'; sig.pnl = '+' + (((sig.tp - sig.entry) / sig.entry) * 100 * lev).toFixed(2) + '%'; sig.closeTime = new Date().toLocaleTimeString(); changed = true; }
-                                else if (price <= sig.sl) { sig.status = 'LOSS'; sig.pnl = (((sig.sl - sig.entry) / sig.entry) * 100 * lev).toFixed(2) + '%'; sig.closeTime = new Date().toLocaleTimeString(); changed = true; }
-                            } else {
-                                if (price <= sig.tp) { sig.status = 'WIN'; sig.pnl = '+' + (((sig.entry - sig.tp) / sig.entry) * 100 * lev).toFixed(2) + '%'; sig.closeTime = new Date().toLocaleTimeString(); changed = true; }
-                                else if (price >= sig.sl) { sig.status = 'LOSS'; sig.pnl = (((sig.entry - sig.sl) / sig.entry) * 100 * lev).toFixed(2) + '%'; sig.closeTime = new Date().toLocaleTimeString(); changed = true; }
-                            }
-                        }
-
-                        if (sig.status === 'OPEN') {
-                            // Calculate Live PnL Percentage
-                            let unrealizedPct = 0;
-                            if (sig.direction === 'LONG' || sig.direction === 'BUY') {
-                                unrealizedPct = ((price - sig.entry) / sig.entry) * 100.0 * lev;
-                                const maxWin = ((sig.tp - sig.entry) / sig.entry) * 100.0 * lev;
-                                const maxLoss = ((sig.sl - sig.entry) / sig.entry) * 100.0 * lev;
-                                if (unrealizedPct > maxWin) unrealizedPct = maxWin;
-                                if (unrealizedPct < maxLoss) unrealizedPct = maxLoss;
-                            } else {
-                                unrealizedPct = ((sig.entry - price) / sig.entry) * 100.0 * lev;
-                                const maxWin = ((sig.entry - sig.tp) / sig.entry) * 100.0 * lev;
-                                const maxLoss = ((sig.entry - sig.sl) / sig.entry) * 100.0 * lev;
-                                if (unrealizedPct > maxWin) unrealizedPct = maxWin;
-                                if (unrealizedPct < maxLoss) unrealizedPct = maxLoss;
-                            }
-                            const sign = unrealizedPct >= 0 ? '+' : '';
-                            sig.pnl = `${sign}${unrealizedPct.toFixed(2)}%`;
-                            changed = true;
-                        }
+                    
+                    const vEl = container.querySelector(`.live-vol-${tick.symbol}`);
+                    if (vEl) {
+                        const pct = parseFloat(tick.price24hPcnt) * 100;
+                        vEl.textContent = (pct >= 0 ? '+' : '') + pct.toFixed(2) + '%';
+                        vEl.style.color = pct >= 0 ? 'var(--green)' : 'var(--red)';
                     }
                 });
-            });
-            if (changed) { _saveAISignalHistory(); renderAISignalHistory(); }
-        }
-    } catch(e) {}
+            }
+        } catch(e) {}
+        
+        // Update Signal and PNL from _aiSignalHistory
+        pairs.forEach(sym => {
+            const activeSig = _aiSignalHistory.slice().reverse().find(s => s.symbol === sym && (s.status === 'OPEN' || s.status === 'PENDING'));
+            const sEl = container.querySelector(`.live-signal-${sym}`);
+            const pEl = container.querySelector(`.live-pnl-${sym}`);
+            if (activeSig) {
+                if (sEl) {
+                    sEl.textContent = activeSig.direction;
+                    sEl.style.color = (activeSig.direction==='BUY'||activeSig.direction==='LONG') ? 'var(--green)' : 'var(--red)';
+                }
+                if (pEl) {
+                    pEl.textContent = activeSig.pnl || '0.00%';
+                    pEl.style.color = (activeSig.pnl && activeSig.pnl.startsWith('+')) ? 'var(--green)' : 'var(--red)';
+                }
+            } else {
+                if (sEl) { sEl.textContent = 'WAIT'; sEl.style.color = 'var(--text2)'; }
+                if (pEl) { pEl.textContent = '0.00%'; pEl.style.color = 'var(--text2)'; }
+            }
+        });
+    }, 2000);
 }
-setInterval(_updateAISignalLivePrices, 2000);
+
 
