@@ -7,6 +7,7 @@ import { NavRail, type TabId } from "./nav-rail"
 import { CommandBar } from "./command-bar"
 import { KpiStrip } from "./kpi-strip"
 import { SignalWatch } from "./signal-watch"
+import { SignalPanel } from "./signal-panel"
 import { ConsensusPanel } from "./consensus-panel"
 import { PositionsTable } from "./positions-table"
 import { RiskPanel } from "./risk-panel"
@@ -183,10 +184,12 @@ export function Dashboard() {
           )}
 
           {tab === "signals" && (
-            <div className="flex flex-col gap-3">
-              <KpiStrip snapshot={snapshot} />
-              <SignalWatch market={snapshot.market} marketOnline={snapshot.marketOnline} />
-            </div>
+            <SignalPanel
+              market={snapshot.market}
+              marketOnline={snapshot.marketOnline}
+              tradingSettings={tradingSettings}
+              agentAnalysis={agentAnalysis}
+            />
           )}
 
           {tab === "consensus" && (

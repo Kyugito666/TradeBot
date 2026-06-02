@@ -4,13 +4,30 @@
 
 import type { DryRunConfig, TradingSettings } from "@/hooks/use-live-data"
 import type { BacktestResult } from "./backtest"
+import type { PaperTrade } from "./signal-engine"
 
 const PREFIX = "tradebot:v1:"
 const KEYS = {
   settings: `${PREFIX}trading-settings`,
   dryRun: `${PREFIX}dry-run`,
   backtests: `${PREFIX}backtests`,
+  signalState: `${PREFIX}signal-forwardtest`,
 } as const
+
+// Persisted state for the Signal tab forward-test (paper-only, never real).
+export interface SignalForwardState {
+  autoEntry: boolean
+  autoTpSl: boolean
+  open: PaperTrade[]
+  history: PaperTrade[]
+}
+
+const DEFAULT_SIGNAL_STATE: SignalForwardState = {
+  autoEntry: false,
+  autoTpSl: true,
+  open: [],
+  history: [],
+}
 
 function isBrowser() {
   return typeof window !== "undefined" && typeof window.localStorage !== "undefined"
@@ -45,4 +62,10 @@ export const localStore = {
   loadBacktests: () => read<BacktestResult[]>(KEYS.backtests) ?? [],
   saveBacktests: (results: BacktestResult[]) => write(KEYS.backtests, results),
   clearBacktests: () => write(KEYS.backtests, []),
+
+  loadSignalState: (): SignalForwardState => ({
+    ...DEFAULT_SIGNAL_STATE,
+    ...(read<SignalForwardState>(KEYS.signalState) ?? {}),
+  }),
+  saveSignalState: (s: SignalForwardState) => write(KEYS.signalState, s),
 }
