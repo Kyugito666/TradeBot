@@ -1,9 +1,11 @@
 "use client"
 
-import { useCallback, useMemo, useState } from "react"
+import { useCallback, useEffect, useMemo, useState } from "react"
 import useSWR from "swr"
 import type { Consensus, MarketResponse, MarketRow, Snapshot } from "@/lib/types"
 import { pollEngine, startEngine, stopEngine, type EngineSnapshot } from "@/lib/engine"
+import { localStore } from "@/lib/local-store"
+import { runLocalBacktest, type BacktestResult } from "@/lib/backtest"
 import {
   buildConsensus,
   buildPerformance,
@@ -104,7 +106,8 @@ export interface DryRunConfig {
 
 // ---- Mode & exchange configuration -------------------------------------
 
-export type CexId = "binance" | "bybit" | "okx" | "mexc"
+// MEXC-only build. Kept as a union for forward-compat if more CEXes return.
+export type CexId = "mexc"
 export type TradingStyle = "scalp" | "intraday" | "swing"
 export type MarginMode = "isolated" | "cross"
 
@@ -137,56 +140,22 @@ export interface TradingSettings {
 }
 
 const DEFAULT_TRADING_SETTINGS: TradingSettings = {
-  activeCex: "binance",
+  activeCex: "mexc",
   tradingStyle: "intraday",
   cexes: [
     {
-      id: "binance",
-      label: "Binance",
-      enabled: true,
-      apiKeyEnv: "BINANCE_API_KEY",
-      apiSecretEnv: "BINANCE_API_SECRET",
-      marginMode: "isolated",
-      marginUsagePct: 20,
-      defaultLeverage: 5,
-      pairLeverage: [
-        { pair: "BTCUSDT", leverage: 10 },
-        { pair: "ETHUSDT", leverage: 8 },
-      ],
-    },
-    {
-      id: "bybit",
-      label: "Bybit",
-      enabled: false,
-      apiKeyEnv: "BYBIT_API_KEY",
-      apiSecretEnv: "BYBIT_API_SECRET",
-      marginMode: "cross",
-      marginUsagePct: 15,
-      defaultLeverage: 3,
-      pairLeverage: [{ pair: "SOLUSDT", leverage: 6 }],
-    },
-    {
-      id: "okx",
-      label: "OKX",
-      enabled: false,
-      apiKeyEnv: "OKX_API_KEY",
-      apiSecretEnv: "OKX_API_SECRET",
-      passphraseEnv: "OKX_API_PASSPHRASE",
-      marginMode: "isolated",
-      marginUsagePct: 10,
-      defaultLeverage: 3,
-      pairLeverage: [],
-    },
-    {
       id: "mexc",
       label: "MEXC",
-      enabled: false,
+      enabled: true,
       apiKeyEnv: "MEXC_API_KEY",
       apiSecretEnv: "MEXC_API_SECRET",
       marginMode: "cross",
       marginUsagePct: 10,
       defaultLeverage: 5,
-      pairLeverage: [{ pair: "BTCUSDT", leverage: 10 }],
+      pairLeverage: [
+        { pair: "BTCUSDT", leverage: 10 },
+        { pair: "ETHUSDT", leverage: 8 },
+      ],
     },
   ],
 }
@@ -226,6 +195,32 @@ export function useLiveData() {
 
   // Mode & exchange configuration (mode/settings tab)
   const [tradingSettings, setTradingSettings] = useState<TradingSettings>(DEFAULT_TRADING_SETTINGS)
+
+  // Per-user (per-browser) local persistence + manual backtest results.
+  const [hydrated, setHydrated] = useState(false)
+  const [backtests, setBacktests] = useState<BacktestResult[]>([])
+  const [isBacktesting, setIsBacktesting] = useState(false)
+
+  // Load persisted state AFTER mount so server/client first render match
+  // (avoids hydration mismatches). Defaults render first, then we swap in
+  // whatever this browser previously saved.
+  useEffect(() => {
+    const savedSettings = localStore.loadTradingSettings()
+    if (savedSettings) setTradingSettings(savedSettings)
+    const savedDryRun = localStore.loadDryRun()
+    if (savedDryRun) setDryRunConfig(savedDryRun)
+    setBacktests(localStore.loadBacktests())
+    setHydrated(true)
+  }, [])
+
+  // Persist settings + mode whenever they change (only after initial hydration).
+  useEffect(() => {
+    if (hydrated) localStore.saveTradingSettings(tradingSettings)
+  }, [hydrated, tradingSettings])
+
+  useEffect(() => {
+    if (hydrated) localStore.saveDryRun(dryRunConfig)
+  }, [hydrated, dryRunConfig])
   
   // Real public market data + server-computed analytics (works on localhost + Vercel).
   const market = useSWR("market", marketFetcher, {
@@ -362,6 +357,30 @@ export function useLiveData() {
     }))
   }, [])
 
+  // Manual, per-user backtest. Triggered explicitly by the user (never auto-run);
+  // computed locally from the current config and saved to this browser only.
+  const runBacktest = useCallback(async () => {
+    setIsBacktesting(true)
+    try {
+      // Small async yield so the UI can show the running state.
+      await new Promise(r => setTimeout(r, 400))
+      const result = runLocalBacktest(tradingSettings, dryRunConfig, snapshot.market)
+      setBacktests(prev => {
+        const next = [result, ...prev].slice(0, 20) // keep last 20 per user
+        localStore.saveBacktests(next)
+        return next
+      })
+      return result
+    } finally {
+      setIsBacktesting(false)
+    }
+  }, [tradingSettings, dryRunConfig, snapshot.market])
+
+  const clearBacktests = useCallback(() => {
+    setBacktests([])
+    localStore.clearBacktests()
+  }, [])
+
   return {
     snapshot,
     start,
@@ -385,6 +404,13 @@ export function useLiveData() {
     tradingSettings,
     updateTradingSettings,
     updateCexConfig,
+
+    // Local-first persistence + manual backtest
+    hydrated,
+    backtests,
+    isBacktesting,
+    runBacktest,
+    clearBacktests,
   }
 }
 

@@ -35,7 +35,11 @@ export function Dashboard() {
     updateDryRunConfig,
     tradingSettings,
     updateTradingSettings,
-    updateCexConfig
+    updateCexConfig,
+    backtests,
+    isBacktesting,
+    runBacktest,
+    clearBacktests
   } = useLiveData()
   const [tab, setTab] = useState<TabId>("overview")
   const online = snapshot.engineOnline
@@ -242,6 +246,10 @@ export function Dashboard() {
               tradingSettings={tradingSettings}
               updateTradingSettings={updateTradingSettings}
               updateCexConfig={updateCexConfig}
+              backtests={backtests}
+              isBacktesting={isBacktesting}
+              runBacktest={runBacktest}
+              clearBacktests={clearBacktests}
             />
           )}
         </main>
