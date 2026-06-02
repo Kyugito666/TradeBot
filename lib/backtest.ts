@@ -49,6 +49,40 @@ export interface PairStat {
   netRoiPct: number
 }
 
+// ── Candle-replay payload (TradingView-style) ───────────────────────────────
+// One OHLC bar of the headline pair, used to draw the live candlestick chart.
+export interface ReplayBar {
+  o: number
+  h: number
+  l: number
+  c: number
+}
+
+// A trade overlaid on the replay chart, anchored to the bars it opened/closed on.
+export interface ReplayMarker {
+  side: "LONG" | "SHORT"
+  entry: number
+  exit: number
+  entryBar: number
+  exitBar: number
+  outcome: "TP" | "SL"
+  pnlPct: number
+}
+
+// Everything the UI needs to "play" a single symbol bar-by-bar with a real
+// time axis. `endTime`/`intervalMs` let the client label each bar's period.
+export interface ReplayChart {
+  symbol: string
+  leverage: number
+  bars: ReplayBar[]
+  markers: ReplayMarker[]
+  warmup: number
+  intervalMs: number
+  endTime: number
+  initialBalance: number
+  riskPerTrade: number
+}
+
 export interface BacktestResult {
   id: string
   ranAt: number
@@ -73,6 +107,8 @@ export interface BacktestResult {
   pairStats: PairStat[]
   /** Number of pairs that had enough candles to replay. */
   scannedPairs: number
+  /** Headline pair's candles + trade markers for the live replay chart. */
+  replay: ReplayChart | null
 }
 
 // One pair's full candle history for replay.
@@ -99,6 +135,7 @@ function trendFromWindow(closes: number[]): TrendState {
 interface ClosedTrade extends BacktestTrade {
   pnlR: number
   entryBar: number
+  exitBar: number
 }
 
 // Replay a single pair, returning its closed trades (non-overlapping).
@@ -155,6 +192,7 @@ function replayPair(pair: PairCandles, style: TradingStyle, risk: BacktestRiskMo
           pnlR,
           outcome,
           entryBar: i,
+          exitBar,
         })
         i = exitBar + 1 // no overlapping trades on the same pair
         continue
@@ -245,6 +283,54 @@ export function replayBacktest(pairs: PairCandles[], cfg: ReplayConfig): Backtes
   }
   pairStats.sort((a, b) => b.expectancyR - a.expectancyR)
 
+  // ── Pick the "headline" pair to drive the live candlestick replay. ──────────
+  // The most-traded pair gives the richest chart to watch; fall back to the
+  // longest candle history so the chart is never empty.
+  let headline: PairCandles | null = null
+  let headlineTrades: ClosedTrade[] = []
+  let bestTrades = -1
+  for (const pair of pairs) {
+    const t = perPair.get(pair.symbol) ?? []
+    const score = t.length
+    if (score > bestTrades) {
+      bestTrades = score
+      headline = pair
+      headlineTrades = t
+    }
+  }
+  if (!headline && pairs.length > 0) {
+    headline = pairs.reduce((a, b) => (b.closes.length > a.closes.length ? b : a))
+    headlineTrades = perPair.get(headline.symbol) ?? []
+  }
+
+  const HOUR_MS = 3_600_000
+  const replay: ReplayChart | null = headline
+    ? {
+        symbol: headline.symbol,
+        leverage: headline.leverage,
+        bars: headline.closes.map((c, idx) => ({
+          o: headline!.opens[idx],
+          h: headline!.highs[idx],
+          l: headline!.lows[idx],
+          c,
+        })),
+        markers: headlineTrades.map((t) => ({
+          side: t.side,
+          entry: t.entry,
+          exit: t.exit,
+          entryBar: t.entryBar,
+          exitBar: t.exitBar,
+          outcome: t.outcome,
+          pnlPct: t.pnlPct,
+        })),
+        warmup: WARMUP,
+        intervalMs: HOUR_MS,
+        endTime: Date.now(),
+        initialBalance: cfg.initialBalance,
+        riskPerTrade: cfg.riskPerTrade,
+      }
+    : null
+
   const sampleTrades: BacktestTrade[] = all.slice(0, 8).map((t) => ({
     symbol: t.symbol,
     side: t.side,
@@ -277,5 +363,6 @@ export function replayBacktest(pairs: PairCandles[], cfg: ReplayConfig): Backtes
     sampleTrades,
     pairStats,
     scannedPairs,
+    replay,
   }
 }
