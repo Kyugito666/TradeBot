@@ -393,6 +393,17 @@ export function useLiveData() {
     keepPreviousData: true,
   })
   
+  // Keep the analysed pair valid for the ACTIVE exchange. The pair list is fully
+  // DYNAMIC — derived from the exchange's real market feed — so when the user
+  // switches CEX (or the current symbol isn't listed there) we snap the analysis
+  // to that exchange's most-liquid real pair instead of a hardcoded default.
+  useEffect(() => {
+    const rows = market.data?.market
+    if (!rows || rows.length === 0) return
+    const listed = rows.some((m) => m.symbol.toUpperCase() === analysisSymbol.toUpperCase())
+    if (!listed) setAnalysisSymbol(rows[0].symbol)
+  }, [market.data, analysisSymbol])
+
   // Agent analysis with progress tracking — runs on the chosen pair of the ACTIVE CEX.
   const agentAnalysis = useSWR<AgentAnalysisResponse | null>(
     [`agent-analysis`, analysisSymbol, activeCexId],
@@ -679,6 +690,9 @@ export function useLiveData() {
     isBacktesting,
     runBacktest,
     clearBacktests,
+    // Per-pair backtest stats — shared with the Signals & Consensus tabs so all
+    // three views analyse the exact same pairs/data of the active exchange.
+    pairStats,
   }
 }
 

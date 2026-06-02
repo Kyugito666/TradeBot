@@ -1,6 +1,6 @@
 "use client"
 
-import { useState } from "react"
+import { useMemo, useState } from "react"
 import { WifiOff, Play, ToggleLeft, ToggleRight } from "lucide-react"
 import { useLiveData } from "@/hooks/use-live-data"
 import { NavRail, type TabId } from "./nav-rail"
@@ -46,10 +46,22 @@ export function Dashboard() {
     backtests,
     isBacktesting,
     runBacktest,
-    clearBacktests
+    clearBacktests,
+    pairStats
   } = useLiveData()
   const [tab, setTab] = useState<TabId>("overview")
   const online = snapshot.engineOnline
+
+  // Fully DYNAMIC analysis universe: the real, live pair list of the ACTIVE
+  // exchange (never hardcoded). Pairs that already have backtest stats are ranked
+  // first (by expectancy) so Backtest, Signals & Consensus all surface the same
+  // best pairs; the rest keep the exchange's liquidity order.
+  const analyzeSymbols = useMemo(() => {
+    const syms = snapshot.market.map((m) => m.symbol)
+    return [...syms]
+      .sort((a, b) => (pairStats[b]?.expectancyR ?? Number.NEGATIVE_INFINITY) - (pairStats[a]?.expectancyR ?? Number.NEGATIVE_INFINITY))
+      .slice(0, 12)
+  }, [snapshot.market, pairStats])
 
   return (
     <div className="flex h-screen overflow-hidden bg-background">
@@ -114,10 +126,14 @@ export function Dashboard() {
                     >
                       <div className="p-3 space-y-3">
                         <p className="text-[11px] text-muted-foreground">
-                          Run the multi-agent analysis pipeline on a specific symbol to get consensus signal with full progress tracking.
+                          Run the multi-agent analysis pipeline on any live pair of the active exchange to get a
+                          consensus signal with full progress tracking.
                         </p>
                         <div className="flex flex-wrap gap-2">
-                          {["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT"].map((sym) => (
+                          {analyzeSymbols.length === 0 && (
+                            <span className="text-[11px] text-muted-foreground">Loading live pairs…</span>
+                          )}
+                          {analyzeSymbols.map((sym) => (
                             <button
                               key={sym}
                               onClick={() => runAnalysis(sym)}
@@ -192,6 +208,7 @@ export function Dashboard() {
               marketOnline={snapshot.marketOnline}
               tradingSettings={tradingSettings}
               agentAnalysis={agentAnalysis}
+              pairStats={pairStats}
             />
           )}
 
@@ -207,25 +224,58 @@ export function Dashboard() {
                     </Tag>
                   }
                 >
-                  <div className="flex flex-wrap items-center gap-2 p-3">
-                    <span className="text-[11px] text-muted-foreground">Analyze:</span>
-                    {["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT"].map((sym) => (
-                      <button
-                        key={sym}
-                        onClick={() => runAnalysis(sym)}
-                        disabled={isAnalyzing}
-                        className={cn(
-                          "flex items-center gap-1.5 rounded border px-3 py-1.5 text-xs font-semibold transition-colors",
-                          analysisSymbol === sym && !isAnalyzing
-                            ? "border-primary bg-primary/15 text-primary"
-                            : "border-border text-muted-foreground hover:border-primary/50 hover:text-primary",
-                          isAnalyzing && "opacity-50 cursor-not-allowed",
-                        )}
-                      >
-                        <Play className="h-3 w-3" />
-                        {sym.replace("USDT", "")}
-                      </button>
-                    ))}
+                  <div className="flex flex-col gap-2 p-3">
+                    <div className="flex flex-wrap items-center gap-2">
+                      <span className="text-[11px] text-muted-foreground">Analyze:</span>
+                      {analyzeSymbols.length === 0 && (
+                        <span className="text-[11px] text-muted-foreground">Loading live pairs from the active exchange…</span>
+                      )}
+                      {analyzeSymbols.map((sym) => {
+                        const stat = pairStats[sym]
+                        return (
+                          <button
+                            key={sym}
+                            onClick={() => runAnalysis(sym)}
+                            disabled={isAnalyzing}
+                            title={stat ? `Backtest: ${stat.winRate}% WR · ${stat.expectancyR >= 0 ? "+" : ""}${stat.expectancyR}R exp` : undefined}
+                            className={cn(
+                              "flex items-center gap-1.5 rounded border px-3 py-1.5 text-xs font-semibold transition-colors",
+                              analysisSymbol === sym && !isAnalyzing
+                                ? "border-primary bg-primary/15 text-primary"
+                                : "border-border text-muted-foreground hover:border-primary/50 hover:text-primary",
+                              isAnalyzing && "opacity-50 cursor-not-allowed",
+                            )}
+                          >
+                            <Play className="h-3 w-3" />
+                            {sym.replace("USDT", "")}
+                            {stat && (
+                              <span className={cn("ml-0.5 font-mono text-[9px]", stat.expectancyR >= 0 ? "text-positive" : "text-negative")}>
+                                {stat.winRate}%
+                              </span>
+                            )}
+                          </button>
+                        )
+                      })}
+                    </div>
+                    {/* Full dynamic universe — pick ANY real pair listed on the active exchange */}
+                    {snapshot.market.length > 0 && (
+                      <div className="flex items-center gap-2">
+                        <span className="text-[11px] text-muted-foreground">All pairs:</span>
+                        <select
+                          value={analysisSymbol}
+                          disabled={isAnalyzing}
+                          onChange={(e) => runAnalysis(e.target.value)}
+                          className="rounded border border-border bg-background px-2 py-1 font-mono text-xs text-foreground disabled:opacity-50"
+                        >
+                          {snapshot.market.map((m) => (
+                            <option key={m.symbol} value={m.symbol}>
+                              {m.symbol.replace("USDT", "/USDT")}
+                            </option>
+                          ))}
+                        </select>
+                        <span className="text-[10px] text-muted-foreground">{snapshot.market.length} live pairs</span>
+                      </div>
+                    )}
                   </div>
                 </Panel>
                 <AnalysisProgress progress={agentAnalysis?.progress ?? null} />

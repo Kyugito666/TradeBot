@@ -16,6 +16,7 @@ import { cn } from "@/lib/utils"
 import { num, pct } from "@/lib/format"
 import type { MarketRow } from "@/lib/types"
 import type { AgentAnalysisResponse, TradingSettings } from "@/hooks/use-live-data"
+import type { PairStat } from "@/lib/backtest"
 import { useSignalTrades } from "@/hooks/use-signal-trades"
 import { styleConfidenceGate, type PaperTrade } from "@/lib/signal-engine"
 
@@ -35,11 +36,14 @@ export function SignalPanel({
   marketOnline,
   tradingSettings,
   agentAnalysis,
+  pairStats = {},
 }: {
   market: MarketRow[]
   marketOnline: boolean
   tradingSettings: TradingSettings
   agentAnalysis?: AgentAnalysisResponse | null
+  /** Per-pair backtest stats shared from the Backtest tab (same pairs/strategy). */
+  pairStats?: Record<string, PairStat>
 }) {
   const activeCex = tradingSettings.cexes.find((c) => c.id === tradingSettings.activeCex)
   const risk = tradingSettings.riskModel
@@ -83,8 +87,10 @@ export function SignalPanel({
       >
         <div className="flex flex-col gap-3 p-3">
           <p className="text-[11px] leading-relaxed text-muted-foreground">
-            Paper-only forward test. Signals are scanned live across every active pair and follow your{" "}
-            <span className="text-foreground">Mode &amp; Settings</span> configuration. No real account or order
+            Paper-only forward test. Signals are scanned live across every real pair of the active exchange and follow
+            your <span className="text-foreground">Mode &amp; Settings</span> configuration. The{" "}
+            <span className="text-foreground">BT Edge</span> column reuses the same per-pair backtest data shown in the
+            Backtest &amp; Consensus tabs, so all three views analyse one shared dataset. No real account or order
             execution is involved.
           </p>
 
@@ -170,6 +176,7 @@ export function SignalPanel({
               <th className="px-2 py-2 text-right font-medium">SL</th>
               <th className="px-2 py-2 text-right font-medium">Lev</th>
               <th className="px-2 py-2 text-right font-medium">Exp. ROI</th>
+              <th className="px-2 py-2 text-center font-medium">BT Edge</th>
               <th className="px-2 py-2 text-center font-medium">Conf</th>
               <th className="px-3 py-2 text-right font-medium">Action</th>
             </tr>
@@ -195,6 +202,21 @@ export function SignalPanel({
                   <td className="px-2 py-2 text-right font-mono tabular text-negative">{priceFmt(levels.sl)}</td>
                   <td className="px-2 py-2 text-right font-mono tabular text-muted-foreground">{levels.leverage}×</td>
                   <td className="px-2 py-2 text-right font-mono tabular text-primary">+{levels.expectedRoiPct}%</td>
+                  <td className="px-2 py-2 text-center font-mono tabular">
+                    {(() => {
+                      const stat = pairStats[row.symbol]
+                      if (!stat) return <span className="text-muted-foreground">—</span>
+                      return (
+                        <span
+                          className={cn(stat.expectancyR >= 0 ? "text-positive" : "text-negative")}
+                          title={`Backtest: ${stat.trades} trades · ${stat.winRate}% win · ${stat.expectancyR >= 0 ? "+" : ""}${stat.expectancyR}R exp`}
+                        >
+                          {stat.winRate}% · {stat.expectancyR >= 0 ? "+" : ""}
+                          {stat.expectancyR}R
+                        </span>
+                      )
+                    })()}
+                  </td>
                   <td className="px-2 py-2 text-center font-mono tabular text-muted-foreground">
                     {(row.confidence * 100).toFixed(0)}%
                   </td>
@@ -218,7 +240,7 @@ export function SignalPanel({
             })}
             {candidates.length === 0 && (
               <tr>
-                <td colSpan={9} className="px-3 py-8 text-center text-xs text-muted-foreground">
+                <td colSpan={10} className="px-3 py-8 text-center text-xs text-muted-foreground">
                   {marketOnline
                     ? "No pairs currently pass the signal filter. Waiting for qualifying setups…"
                     : "Loading live market data…"}
