@@ -15,6 +15,7 @@ import { EventLog } from "./event-log"
 import { AnalysisProgress } from "./analysis-progress"
 import { AgentVotesPanel } from "./agent-votes-panel"
 import { SettingsPanel } from "./settings-panel"
+import { BacktestPanel } from "./backtest-panel"
 import { ENGINE_URL } from "@/lib/engine"
 import { Panel, Tag } from "./ui-kit"
 import { cn } from "@/lib/utils"
@@ -36,6 +37,8 @@ export function Dashboard() {
     tradingSettings,
     updateTradingSettings,
     updateCexConfig,
+    updateRiskModel,
+    applyRiskPreset,
     backtests,
     isBacktesting,
     runBacktest,
@@ -246,6 +249,14 @@ export function Dashboard() {
               tradingSettings={tradingSettings}
               updateTradingSettings={updateTradingSettings}
               updateCexConfig={updateCexConfig}
+              updateRiskModel={updateRiskModel}
+              applyRiskPreset={applyRiskPreset}
+            />
+          )}
+
+          {/* Backtest tab */}
+          {tab === "backtest" && (
+            <BacktestPanel
               backtests={backtests}
               isBacktesting={isBacktesting}
               runBacktest={runBacktest}
