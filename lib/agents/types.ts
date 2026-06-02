@@ -19,20 +19,54 @@ export interface IAgent {
 export type AgentCategory = 
   | "trend"        // Trend-following agents (MA, momentum)
   | "mean_revert"  // Mean reversion agents (RSI, Bollinger)
-  | "sentiment"    // Sentiment/whale analysis
+  | "sentiment"    // Sentiment/news analysis
   | "volume"       // Volume/OI analysis
   | "risk"         // Risk management/veto agents
   | "macro"        // Macro regime detection
+  | "quant"        // Probabilistic / statistical models
+  | "orderflow"    // Order book / liquidation / CVD flow
+  | "onchain"      // Whale / on-chain / cross-market flow
+  | "gatekeeper"   // Data-quality veto (no directional weight)
 
+// A single OHLCV candle (mirrors rust-brain MarketSnapshot.candles).
+export interface Candle {
+  open: number
+  high: number
+  low: number
+  close: number
+  vol: number
+}
+
+// Full market snapshot passed to every agent. Mirrors the Rust `MarketSnapshot`
+// so the 13 ported quant agents read identical fields. Fields that the public
+// market feed cannot provide default to 0 — data-dependent agents then return
+// WAIT gracefully instead of throwing.
 export interface AgentInput {
   symbol: string
+  price: number
+  candles: Candle[]
+  // Convenience projections of `candles` (kept in sync by the builder).
   closes: number[]
   highs: number[]
   lows: number[]
   volumes: number[]
-  openInterest: number
-  lsr: number
+  // Derivatives / market microstructure.
+  openInterest: number   // OI in base units (Rust: snap.oi)
+  lsr: number            // long/short account ratio
+  fundingRate: number
+  bid: number            // top-of-book / bid depth proxy
+  ask: number            // top-of-book / ask depth proxy
+  atr14: number
+  // Sentiment + on-chain (0 when feed unavailable).
+  sentimentScore: number // -1..1
+  newsCount: number
+  whaleInflowUsd: number
+  longLiq1h: number
+  shortLiq1h: number
+  usdtDeltaPct: number
+  kimchiPct: number
   timestamp: number
+  tsMs: number
 }
 
 export interface AgentOutput {
