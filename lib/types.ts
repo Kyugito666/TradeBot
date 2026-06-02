@@ -157,3 +157,77 @@ export interface EngineLogLine {
   name: string
   msg: string
 }
+
+// ── Agent self-evaluation framework (mirrors rust-brain/src/evolution/mod.rs) ──
+
+export interface AgentTunables {
+  weight: number
+  conviction_scale: number
+  activation_gate: number
+  params?: Record<string, number>
+}
+
+export interface AgentScorecard {
+  trades: number
+  correct: number
+  incorrect: number
+  accuracy: number
+  recent_accuracy: number
+  pnl_contrib: number
+  wrong_streak: number
+  recent?: boolean[]
+}
+
+export interface EvaluationReport {
+  agent: string
+  ts_ms: number
+  trigger: string // "trade_loss" | "trade_win" | "team_drawdown"
+  trade_direction: string
+  agent_vote: string
+  was_correct: boolean
+  verdict: string
+  adjustments: string[]
+  weight_before: number
+  weight_after: number
+  conviction_scale_before: number
+  conviction_scale_after: number
+  activation_gate_before: number
+  activation_gate_after: number
+  accuracy: number
+  recent_accuracy: number
+}
+
+export interface AgentRecord {
+  tunables: AgentTunables
+  scorecard: AgentScorecard
+  last_report?: EvaluationReport | null
+}
+
+export interface TeamScorecard {
+  trades: number
+  wins: number
+  losses: number
+  net_pnl_r: number
+  peak_r: number
+  drawdown_r: number
+  win_streak: number
+  loss_streak: number
+  conservatism_bias: number
+  recent_results?: boolean[]
+}
+
+export interface EvolutionState {
+  version: number
+  updated_ms: number
+  agents: Record<string, AgentRecord>
+  team: TeamScorecard
+  reports: EvaluationReport[]
+}
+
+// Shape returned by GET /api/agents.
+export interface AgentsResponse {
+  ok: boolean
+  ts: number
+  state: EvolutionState | null
+  error?: string
+}

@@ -4,6 +4,7 @@ import {
   BarChart3,
   Bot,
   Boxes,
+  Brain,
   GaugeCircle,
   LayoutDashboard,
   Radar,
@@ -12,10 +13,11 @@ import {
 } from "lucide-react"
 import { cn } from "@/lib/utils"
 
-export type TabId = "overview" | "signals" | "consensus" | "positions" | "risk" | "performance" | "logs"
+export type TabId = "overview" | "signals" | "consensus" | "positions" | "risk" | "performance" | "logs" | "agents"
 
 export const NAV_ITEMS: { id: TabId; label: string; icon: typeof LayoutDashboard }[] = [
   { id: "overview", label: "Overview", icon: LayoutDashboard },
+  { id: "agents", label: "Agents", icon: Brain },
   { id: "signals", label: "Signals", icon: Radar },
   { id: "consensus", label: "Consensus", icon: Bot },
   { id: "positions", label: "Positions", icon: Boxes },

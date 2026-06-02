@@ -7,11 +7,10 @@
 // [FIX-CONF]        baca bot_runtime.conf bukan .env (sudah ada, dipertahankan)
 
 use crate::agents::{AgentVote, Direction};
+use crate::evolution::EvolutionEngine;
 use crate::shm::{MarketSnapshot, SignalOutput, AGENT_COUNT};
 use chrono::Utc;
-use std::collections::HashMap;
 use std::sync::Mutex;
-use std::fs;
 
 const WEIGHTS: [(&str, f64); 13] = [
     ("mathematician", 0.25),
@@ -148,74 +147,22 @@ struct ActiveTrade {
 
 pub struct ConsensusEngine {
     active_trade: Mutex<Option<ActiveTrade>>,
-    weights: Mutex<HashMap<String, f64>>,
-    last_reload: Mutex<i64>,
+    // Framework self-evaluation terpusat. Memegang scorecard + tunable adaptif
+    // (weight / conviction_scale / activation_gate) untuk SEMUA agent, plus
+    // konservatisme level-team. Lihat src/evolution/mod.rs.
+    evolution: EvolutionEngine,
 }
 
 impl ConsensusEngine {
     pub fn new() -> Self {
-        let mut initial_weights = HashMap::new();
-        for (name, w) in WEIGHTS.iter() {
-            initial_weights.insert(name.to_string(), *w);
-        }
-        
-        // Coba load dari file RL
-        if let Ok(data) = fs::read_to_string("agent_rl_weights.json") {
-            if let Ok(parsed) = serde_json::from_str::<HashMap<String, f64>>(&data) {
-                log::info!("[Consensus] Loaded self-learning RL weights from file.");
-                initial_weights = parsed;
-            }
-        }
-        
+        // WEIGHTS = daftar agent + bobot awal. EvolutionEngine otomatis bikin
+        // scorecard/tunable untuk tiap nama di sini (atau load dari file kalau ada).
+        // Tambah agent baru? Cukup tambahkan entri di WEIGHTS — tidak ada
+        // perubahan arsitektur lain yang diperlukan.
+        let evolution = EvolutionEngine::new(&WEIGHTS);
         Self {
             active_trade: Mutex::new(None),
-            weights: Mutex::new(initial_weights),
-            last_reload: Mutex::new(0),
-        }
-    }
-    
-    fn reload_weights(&self, now_ms: i64) {
-        let mut last = self.last_reload.lock().unwrap();
-        if now_ms - *last > 30_000 {
-            if let Ok(data) = fs::read_to_string("agent_rl_weights.json") {
-                if let Ok(parsed) = serde_json::from_str::<HashMap<String, f64>>(&data) {
-                    let mut w_lock = self.weights.lock().unwrap();
-                    for (k, v) in parsed {
-                        w_lock.insert(k, v);
-                    }
-                }
-            }
-            *last = now_ms;
-        }
-    }
-    
-    fn update_rl_weights(&self, trade: &ActiveTrade, is_win: bool) {
-        let mut w_lock = self.weights.lock().unwrap();
-        for (agent, vote_dir, conv) in &trade.agent_votes {
-            if *vote_dir == Direction::Wait { continue; }
-            let is_agent_correct = *vote_dir == trade.direction;
-            let current = w_lock.get(agent).copied().unwrap_or(0.1);
-            
-            // Learning rate = 0.05 * conviction
-            let lr = 0.05 * conv;
-            let mut new_w = current;
-            
-            if is_win && is_agent_correct {
-                new_w += lr; // Reward: Voted with a winning trade
-            } else if !is_win && is_agent_correct {
-                new_w -= lr * 1.5; // Punish: Voted with a losing trade
-            } else if is_win && !is_agent_correct {
-                new_w -= lr * 0.5; // Punish: Disagreed with a winning trade
-            } else if !is_win && !is_agent_correct {
-                new_w += lr * 0.5; // Reward: Disagreed with a losing trade (saved us!)
-            }
-            
-            w_lock.insert(agent.clone(), new_w.clamp(0.01, 1.0));
-        }
-        
-        // Simpan ke file
-        if let Ok(json) = serde_json::to_string_pretty(&*w_lock) {
-            let _ = fs::write("agent_rl_weights.json", json);
+            evolution,
         }
     }
 
@@ -245,10 +192,28 @@ impl ConsensusEngine {
                 }
                 
                 if trade_finished {
-                    log::info!("[RL-Brain] Trade concluded. Win={}, updating agent weights!", is_win);
+                    log::info!("[Evolusi] Trade kelar. Win={}. Memicu evaluasi mandiri tiap agent + team!", is_win);
                     let t = trade.clone();
-                    drop(trade_lock); // release lock sebelum update
-                    self.update_rl_weights(&t, is_win);
+                    drop(trade_lock); // release lock sebelum evaluasi
+
+                    // Risk-reward realisasi sebagai proxy magnitude reward/punish.
+                    let sl_dist = (t.entry_price - t.sl).abs().max(1e-8);
+                    let tp_dist = (t.tp - t.entry_price).abs();
+                    let rr = tp_dist / sl_dist;
+                    let now_ms = Utc::now().timestamp_millis();
+
+                    let reports = self.evolution.on_trade_closed(
+                        &t.agent_votes, t.direction, is_win, rr, now_ms,
+                    );
+                    for r in &reports {
+                        let adj = if r.adjustments.is_empty() {
+                            "no-change".to_string()
+                        } else {
+                            r.adjustments.join(", ")
+                        };
+                        log::info!("[Evolusi:{}] {} | {}", r.agent, r.verdict, adj);
+                    }
+
                     let mut lock2 = self.active_trade.lock().unwrap();
                     *lock2 = None;
                 }
@@ -256,14 +221,19 @@ impl ConsensusEngine {
         }
         
         let ts_ms = Utc::now().timestamp_millis();
-        
-        // Reload self-learning weights from Go Engine periodically
-        self.reload_weights(ts_ms);
 
         let style_name = read_trading_style();
         let cfg = make_style_config(&style_name);
-        log::debug!("[Consensus] style={} min_conf={} noise_veto={} min_rr={}",
-            cfg.style_name, cfg.min_confidence, cfg.noise_veto, cfg.min_rr);
+
+        // Tunable adaptif (weight/conviction_scale/activation_gate) hasil self-eval.
+        let tun = self.evolution.tunables_snapshot();
+
+        // Konservatisme team: saat agregasi lagi loss-streak/drawdown, min_confidence
+        // dinaikkan otomatis supaya bot lebih selektif.
+        let min_conf = (cfg.min_confidence + self.evolution.conservatism_bias()).min(0.95);
+
+        log::debug!("[Consensus] style={} min_conf={:.3} (base {:.3} + bias {:.3}) noise_veto={} min_rr={}",
+            cfg.style_name, min_conf, cfg.min_confidence, self.evolution.conservatism_bias(), cfg.noise_veto, cfg.min_rr);
 
         let (ema9, ema21, ema50, ema_bear, ema_bull) = ema_alignment(snap);
 
@@ -280,10 +250,21 @@ impl ConsensusEngine {
         let mut sell_count = 0_usize;
 
         for vote in votes {
+            if vote.direction == Direction::Wait { continue; }
+
             let w = effective_weights.iter()
                 .find(|(n, _)| *n == vote.agent)
                 .map(|(_, w)| *w)
                 .unwrap_or(0.05);
+
+            // Tunable adaptif per-agent dari framework self-evaluation.
+            let scale = tun.get(vote.agent).map(|t| t.conviction_scale).unwrap_or(1.0);
+            let gate  = tun.get(vote.agent).map(|t| t.activation_gate).unwrap_or(0.0);
+            let eff_conv = (vote.conviction * scale).min(1.0);
+
+            // Activation gate: agent yang lagi "diragukan" (gate naik karena sering
+            // salah) suaranya hanya dihitung kalau keyakinannya cukup tinggi.
+            if eff_conv < gate { continue; }
 
             let sign = match vote.direction {
                 Direction::Buy  => { buy_count  += 1;  1.0 },
@@ -291,8 +272,8 @@ impl ConsensusEngine {
                 Direction::Wait => 0.0,
             };
 
-            score += w * vote.conviction * sign;
-            if vote.direction != Direction::Wait { active_w += w; }
+            score += w * eff_conv * sign;
+            active_w += w;
         }
 
         if active_w > 0.05 {
@@ -310,7 +291,7 @@ impl ConsensusEngine {
 
         let mut confidence = score.abs().min(1.0);
 
-        let tentative_action = if confidence >= cfg.min_confidence {
+        let tentative_action = if confidence >= min_conf {
             if score > 0.0 && buy_count  >= cfg.min_agree { Direction::Buy  }
             else if score < 0.0 && sell_count >= cfg.min_agree { Direction::Sell }
             else { Direction::Wait }
@@ -336,12 +317,12 @@ impl ConsensusEngine {
                     tentative_action
                 } else {
                     confidence *= multiplier;
-                    if confidence >= cfg.min_confidence {
+                    if confidence >= min_conf {
                         tentative_action
                     } else {
                         return self.make_wait(
                             votes,
-                            format!("Kurang yakin bos, ngeri ngelawan trend EMA (Yakin: {:.3} < Minimal: {:.3})", confidence, cfg.min_confidence),
+                            format!("Kurang yakin bos, ngeri ngelawan trend EMA (Yakin: {:.3} < Minimal: {:.3})", confidence, min_conf),
                             ts_ms,
                         );
                     }
@@ -447,10 +428,11 @@ impl ConsensusEngine {
     fn calc_effective_weights(
         &self, votes: &[AgentVote], snap: &MarketSnapshot, ema_bear: bool, ema_bull: bool,
     ) -> Vec<(&'static str, f64)> {
-        let w_lock = self.weights.lock().unwrap();
-        // Fallback untuk agen yang belum ada di map
+        // Bobot dasar tiap agent diambil dari framework self-evaluation
+        // (sudah beradaptasi terhadap track-record). Fallback 0.1 untuk agent baru.
+        let tun = self.evolution.tunables_snapshot();
         let mut ew: Vec<(&'static str, f64)> = votes.iter()
-            .map(|v| (v.agent, w_lock.get(v.agent).copied().unwrap_or(0.1)))
+            .map(|v| (v.agent, tun.get(v.agent).map(|t| t.weight).unwrap_or(0.1)))
             .collect();
             
         for (name, weight) in ew.iter_mut() {
