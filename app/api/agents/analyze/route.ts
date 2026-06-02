@@ -171,6 +171,7 @@ export async function GET(request: Request) {
         version: evolution.version,
         agentCount: Object.keys(evolution.agents).length,
         team: evolution.team,
+        agents: evolution.agents,
         recentReports: evolution.reports.slice(-10),
       },
       agents: agentRegistry.getEnabledAgents().map((a) => ({

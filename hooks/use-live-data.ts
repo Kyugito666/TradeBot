@@ -1,6 +1,6 @@
 "use client"
 
-import { useCallback, useEffect, useMemo, useState } from "react"
+import { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import useSWR from "swr"
 import type { Consensus, MarketResponse, MarketRow, Snapshot } from "@/lib/types"
 import { pollEngine, startEngine, stopEngine, type EngineSnapshot } from "@/lib/engine"
@@ -23,6 +23,7 @@ export interface AgentOutput {
   confidence: number
   reasoning: string
   metrics: Record<string, number>
+  activity?: string
 }
 
 export interface AgentInfo {
@@ -46,8 +47,10 @@ export interface PipelineProgress {
 }
 
 export interface TeamConsensus {
+  decision: "VOTED" | "VETO"
   signal: "LONG" | "SHORT" | "WAIT" | "VETO"
   confidence: number
+  votes: { long: number; short: number; hold: number; veto: number }
   agreeingAgents: string[]
   dissentingAgents: string[]
   vetoAgents: string[]
@@ -272,6 +275,37 @@ async function agentAnalysisFetcher(symbol: string): Promise<AgentAnalysisRespon
   }
 }
 
+// A live forecast the agents are watching. When price crosses TP or SL we grade it
+// and feed the result back so each agent self-adjusts (TP/SL-driven learning).
+export interface PendingForecast {
+  symbol: string
+  direction: "LONG" | "SHORT"
+  entry: number
+  tp: number
+  sl: number
+  agentVotes: AgentOutput[]
+  createdTs: number
+}
+
+// Submit a graded trade outcome to the self-evaluation engine.
+async function postTradeResult(body: {
+  symbol: string
+  direction: "LONG" | "SHORT"
+  pnlR: number
+  isWin: boolean
+  agentVotes: AgentOutput[]
+}): Promise<void> {
+  try {
+    await fetch("/api/agents/analyze", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body),
+    })
+  } catch {
+    /* best-effort; learning will retry on the next resolved forecast */
+  }
+}
+
 export function useLiveData() {
   // Dry-run mode state
   const [dryRunConfig, setDryRunConfig] = useState<DryRunConfig>({
@@ -283,6 +317,12 @@ export function useLiveData() {
   // Track analysis state
   const [analysisSymbol, setAnalysisSymbol] = useState("BTCUSDT")
   const [isAnalyzing, setIsAnalyzing] = useState(false)
+
+  // Autonomous TP/SL learning: track the live forecast the agents are grading.
+  const [pendingForecast, setPendingForecast] = useState<PendingForecast | null>(null)
+  const [lastGrade, setLastGrade] = useState<{ symbol: string; isWin: boolean; pnlR: number; ts: number } | null>(null)
+  const lastForecastTsRef = useRef(0)
+  const resolvingRef = useRef(false)
 
   // Mode & exchange configuration (mode/settings tab)
   const [tradingSettings, setTradingSettings] = useState<TradingSettings>(DEFAULT_TRADING_SETTINGS)
@@ -414,6 +454,66 @@ export function useLiveData() {
     }
   }, [engine.data, market.data, dryRunConfig])
 
+  // ── Open a forecast whenever the team produces a fresh VOTED long/short verdict.
+  // We never overwrite an unresolved forecast — agents must see the outcome first.
+  useEffect(() => {
+    const a = agentAnalysis.data
+    if (!a?.ok || !a.consensus) return
+    if (a.ts === lastForecastTsRef.current) return
+    const c = a.consensus
+    const directional = c.signal === "LONG" || c.signal === "SHORT"
+    if (c.decision === "VOTED" && directional && c.entry > 0 && c.tp > 0 && c.sl > 0) {
+      lastForecastTsRef.current = a.ts
+      setPendingForecast((prev) =>
+        prev
+          ? prev
+          : {
+              symbol: a.symbol,
+              direction: c.signal as "LONG" | "SHORT",
+              entry: c.entry,
+              tp: c.tp,
+              sl: c.sl,
+              agentVotes: a.agentOutputs,
+              createdTs: a.ts,
+            },
+      )
+    }
+  }, [agentAnalysis.data])
+
+  // ── Grade the open forecast against the live price (TP vs SL). On resolution we
+  // POST the result so every agent self-adjusts its weight/conviction autonomously.
+  useEffect(() => {
+    if (!pendingForecast || resolvingRef.current) return
+    const row = (market.data?.market ?? []).find((m) => m.symbol === pendingForecast.symbol)
+    const price = row?.lastPrice
+    if (!price || price <= 0) return
+
+    const { direction, entry, tp, sl, agentVotes, symbol } = pendingForecast
+    const risk = Math.abs(entry - sl)
+    const reward = Math.abs(tp - entry)
+    const rr = risk > 1e-9 ? reward / risk : 1
+
+    let resolved: { isWin: boolean; pnlR: number } | null = null
+    if (direction === "LONG") {
+      if (price >= tp) resolved = { isWin: true, pnlR: rr }
+      else if (price <= sl) resolved = { isWin: false, pnlR: -1 }
+    } else {
+      if (price <= tp) resolved = { isWin: true, pnlR: rr }
+      else if (price >= sl) resolved = { isWin: false, pnlR: -1 }
+    }
+    if (!resolved) return
+
+    resolvingRef.current = true
+    const outcome = resolved
+    postTradeResult({ symbol, direction, pnlR: outcome.pnlR, isWin: outcome.isWin, agentVotes }).finally(() => {
+      setLastGrade({ symbol, isWin: outcome.isWin, pnlR: outcome.pnlR, ts: Date.now() })
+      setPendingForecast(null)
+      resolvingRef.current = false
+      // Pull the updated evolution stats back into the UI.
+      agentAnalysis.mutate()
+    })
+  }, [market.data, pendingForecast, agentAnalysis])
+
   const start = useCallback(async () => {
     try {
       await startEngine()
@@ -520,6 +620,10 @@ export function useLiveData() {
     isAnalyzing: isAnalyzing || agentAnalysis.isLoading,
     analysisSymbol,
     runAnalysis,
+
+    // Autonomous TP/SL learning loop
+    pendingForecast,
+    lastGrade,
     
     // Dry-run mode
     dryRunConfig,

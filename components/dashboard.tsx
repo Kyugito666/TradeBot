@@ -9,6 +9,7 @@ import { KpiStrip } from "./kpi-strip"
 import { SignalWatch } from "./signal-watch"
 import { SignalPanel } from "./signal-panel"
 import { ConsensusPanel } from "./consensus-panel"
+import { AgentConsensusPanel } from "./agent-consensus-panel"
 import { PositionsTable } from "./positions-table"
 import { RiskPanel } from "./risk-panel"
 import { PerformancePanel } from "./performance-panel"
@@ -32,6 +33,8 @@ export function Dashboard() {
     isAnalyzing,
     analysisSymbol,
     runAnalysis,
+    pendingForecast,
+    lastGrade,
     dryRunConfig,
     toggleDryRun,
     updateDryRunConfig,
@@ -195,24 +198,56 @@ export function Dashboard() {
           {tab === "consensus" && (
             <div className="grid grid-cols-1 gap-3 xl:grid-cols-[1fr_360px]">
               <div className="flex flex-col gap-3">
-                <SignalWatch market={snapshot.market} marketOnline={snapshot.marketOnline} />
-                {/* Agent analysis section */}
-                <div className="grid grid-cols-1 gap-3 lg:grid-cols-2">
-                  <AnalysisProgress progress={agentAnalysis?.progress ?? null} />
-                  {agentAnalysis?.agentOutputs && (
-                    <AgentVotesPanel
-                      outputs={agentAnalysis.agentOutputs}
-                      agents={agentAnalysis.agents || []}
-                      evolution={{
-                        team: agentAnalysis.evolution?.team,
-                        agents: agentAnalysis.evolution?.agents as any,
-                        recentReports: agentAnalysis.evolution?.recentReports
-                      }}
-                    />
-                  )}
-                </div>
+                {/* Symbol selector — every agent runs live on the chosen market */}
+                <Panel
+                  title="Agent Team"
+                  right={
+                    <Tag tone={isAnalyzing ? "warning" : "positive"}>
+                      {isAnalyzing ? "ANALYZING" : "LIVE"}
+                    </Tag>
+                  }
+                >
+                  <div className="flex flex-wrap items-center gap-2 p-3">
+                    <span className="text-[11px] text-muted-foreground">Analyze:</span>
+                    {["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT"].map((sym) => (
+                      <button
+                        key={sym}
+                        onClick={() => runAnalysis(sym)}
+                        disabled={isAnalyzing}
+                        className={cn(
+                          "flex items-center gap-1.5 rounded border px-3 py-1.5 text-xs font-semibold transition-colors",
+                          analysisSymbol === sym && !isAnalyzing
+                            ? "border-primary bg-primary/15 text-primary"
+                            : "border-border text-muted-foreground hover:border-primary/50 hover:text-primary",
+                          isAnalyzing && "opacity-50 cursor-not-allowed",
+                        )}
+                      >
+                        <Play className="h-3 w-3" />
+                        {sym.replace("USDT", "")}
+                      </button>
+                    ))}
+                  </div>
+                </Panel>
+                <AnalysisProgress progress={agentAnalysis?.progress ?? null} />
+                {/* Live agent activity — every agent runs and shows its current read */}
+                {agentAnalysis?.agentOutputs && (
+                  <AgentVotesPanel
+                    outputs={agentAnalysis.agentOutputs}
+                    agents={agentAnalysis.agents || []}
+                    evolution={{
+                      team: agentAnalysis.evolution?.team,
+                      agents: agentAnalysis.evolution?.agents as any,
+                      recentReports: agentAnalysis.evolution?.recentReports
+                    }}
+                  />
+                )}
               </div>
-              <ConsensusPanel consensus={snapshot.consensus} engineOnline={online} />
+              <AgentConsensusPanel
+                consensus={agentAnalysis?.consensus}
+                symbol={agentAnalysis?.symbol ?? analysisSymbol}
+                pendingForecast={pendingForecast}
+                lastGrade={lastGrade}
+              />
             </div>
           )}
 

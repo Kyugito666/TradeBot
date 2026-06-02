@@ -209,8 +209,8 @@ export function AgentVotesPanel({
                     <div className="text-xs font-semibold truncate">
                       {agent?.name || output.agentId}
                     </div>
-                    <div className="text-[9px] text-muted-foreground uppercase tracking-wider">
-                      {agent?.category || "unknown"}
+                    <div className="text-[9px] text-muted-foreground truncate">
+                      {output.activity || agent?.category || "unknown"}
                     </div>
                   </div>
                 </div>
@@ -244,7 +244,14 @@ export function AgentVotesPanel({
               {/* Expanded details */}
               {isExpanded && (
                 <div className="px-3 pb-3 space-y-3">
-                  {/* Reasoning */}
+                  {/* Current activity */}
+                  {output.activity && (
+                    <div className="flex items-center gap-1.5">
+                      <Tag tone="outline">{agent?.category || "agent"}</Tag>
+                      <span className="text-[10px] text-muted-foreground truncate">{output.activity}</span>
+                    </div>
+                  )}
+                  {/* Reasoning / current read */}
                   <div className="rounded bg-muted/50 p-2">
                     <p className="text-[11px] text-muted-foreground leading-relaxed">
                       {output.reasoning}
