@@ -16,6 +16,7 @@
 
 import { atr, computeSignal } from "./signals"
 import type { TrendState } from "./types"
+import type { Timeframe } from "./exchanges"
 
 // Local mirrors of the settings types (kept self-contained so server routes can
 // import this without pulling in the client-only settings hook).
@@ -74,6 +75,8 @@ export interface ReplayMarker {
 export interface ReplayChart {
   symbol: string
   leverage: number
+  /** Candle timeframe the bars were sampled at (15m / 1h / 4h / 1d). */
+  timeframe: Timeframe
   bars: ReplayBar[]
   markers: ReplayMarker[]
   warmup: number
@@ -89,6 +92,10 @@ export interface BacktestResult {
   cex: string
   cexLabel: string
   style: TradingStyle
+  /** Candle timeframe used for this run. */
+  timeframe: Timeframe
+  /** Lookback window (in days) the candles span. */
+  periodDays: number
   marginMode: string
   marginUsagePct: number
   dryRun: boolean
@@ -213,6 +220,14 @@ export interface ReplayConfig {
   riskPerTrade: number // decimal (maxPnlPct/100)
   marginMode: string
   marginUsagePct: number
+  /** Candle timeframe these candles were sampled at. */
+  timeframe: Timeframe
+  /** Lookback window in days (for display/metadata). */
+  periodDays: number
+  /** Milliseconds per bar (derived from the timeframe). */
+  intervalMs: number
+  /** The pair the user is focused on — drives the live replay chart. */
+  focusSymbol?: string
 }
 
 export function replayBacktest(pairs: PairCandles[], cfg: ReplayConfig): BacktestResult {
@@ -284,18 +299,32 @@ export function replayBacktest(pairs: PairCandles[], cfg: ReplayConfig): Backtes
   pairStats.sort((a, b) => b.expectancyR - a.expectancyR)
 
   // ── Pick the "headline" pair to drive the live candlestick replay. ──────────
-  // The most-traded pair gives the richest chart to watch; fall back to the
-  // longest candle history so the chart is never empty.
+  // ALWAYS honour the pair the user has selected in the app (focusSymbol) so the
+  // chart shows the REAL pair/candles they're looking at — never a dummy or an
+  // unrelated pair. Only if that pair has no candle history do we fall back to
+  // the most-traded pair, then the longest history, so the chart is never empty.
   let headline: PairCandles | null = null
   let headlineTrades: ClosedTrade[] = []
-  let bestTrades = -1
-  for (const pair of pairs) {
-    const t = perPair.get(pair.symbol) ?? []
-    const score = t.length
-    if (score > bestTrades) {
-      bestTrades = score
-      headline = pair
-      headlineTrades = t
+
+  if (cfg.focusSymbol) {
+    const want = cfg.focusSymbol.toUpperCase()
+    const focused = pairs.find((p) => p.symbol.toUpperCase() === want)
+    if (focused) {
+      headline = focused
+      headlineTrades = perPair.get(focused.symbol) ?? []
+    }
+  }
+
+  if (!headline) {
+    let bestTrades = -1
+    for (const pair of pairs) {
+      const t = perPair.get(pair.symbol) ?? []
+      const score = t.length
+      if (score > bestTrades) {
+        bestTrades = score
+        headline = pair
+        headlineTrades = t
+      }
     }
   }
   if (!headline && pairs.length > 0) {
@@ -303,11 +332,11 @@ export function replayBacktest(pairs: PairCandles[], cfg: ReplayConfig): Backtes
     headlineTrades = perPair.get(headline.symbol) ?? []
   }
 
-  const HOUR_MS = 3_600_000
   const replay: ReplayChart | null = headline
     ? {
         symbol: headline.symbol,
         leverage: headline.leverage,
+        timeframe: cfg.timeframe,
         bars: headline.closes.map((c, idx) => ({
           o: headline!.opens[idx],
           h: headline!.highs[idx],
@@ -324,7 +353,7 @@ export function replayBacktest(pairs: PairCandles[], cfg: ReplayConfig): Backtes
           pnlPct: t.pnlPct,
         })),
         warmup: WARMUP,
-        intervalMs: HOUR_MS,
+        intervalMs: cfg.intervalMs,
         endTime: Date.now(),
         initialBalance: cfg.initialBalance,
         riskPerTrade: cfg.riskPerTrade,
@@ -347,6 +376,8 @@ export function replayBacktest(pairs: PairCandles[], cfg: ReplayConfig): Backtes
     cex: cfg.cex,
     cexLabel: cfg.cexLabel,
     style: cfg.style,
+    timeframe: cfg.timeframe,
+    periodDays: cfg.periodDays,
     marginMode: cfg.marginMode,
     marginUsagePct: cfg.marginUsagePct,
     dryRun: cfg.dryRun,

@@ -291,6 +291,8 @@ export function Dashboard() {
               runBacktest={runBacktest}
               clearBacktests={clearBacktests}
               tradingSettings={tradingSettings}
+              selectedSymbol={analysisSymbol}
+              pairs={snapshot.market.map((m) => m.symbol)}
             />
           )}
         </main>
