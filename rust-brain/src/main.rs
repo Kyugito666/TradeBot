@@ -11,6 +11,7 @@ use rayon::prelude::*;
 
 mod agents;
 mod consensus;
+mod evolution;
 mod shm;
 
 use agents::{
