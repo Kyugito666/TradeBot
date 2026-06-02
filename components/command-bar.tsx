@@ -1,25 +1,23 @@
 "use client"
 
-import { Activity, Pause, Play, Power, ShieldAlert, ShieldCheck, Square } from "lucide-react"
-import type { BotMode, Snapshot } from "@/lib/types"
+import { Activity, Play, RefreshCw, Square } from "lucide-react"
+import type { Snapshot } from "@/lib/types"
 import { StatusDot } from "./ui-kit"
-import { uptime } from "@/lib/format"
 import { cn } from "@/lib/utils"
 
 export function CommandBar({
   snapshot,
-  onMode,
-  onToggleKill,
+  onStart,
+  onStop,
+  onRefresh,
 }: {
   snapshot: Snapshot
-  onMode: (m: BotMode) => void
-  onToggleKill: () => void
+  onStart: () => void
+  onStop: () => void
+  onRefresh: () => void
 }) {
-  const { mode, cycle, latencyMs, uptimeSec, risk } = snapshot
+  const { mode, engineOnline, marketOnline, activeSymbol } = snapshot
   const running = mode === "RUNNING"
-
-  const modeTone = running ? "positive" : mode === "PAUSED" ? "warning" : "negative"
-  const modeLabel = running ? "RUNNING" : mode === "PAUSED" ? "PAUSED" : "STOPPED"
 
   return (
     <header className="flex flex-wrap items-center justify-between gap-3 border-b border-border bg-panel px-4 py-2.5">
@@ -29,7 +27,7 @@ export function CommandBar({
         </div>
         <div className="leading-tight">
           <div className="flex items-center gap-2">
-            <span className="font-mono text-sm font-bold tracking-tight text-foreground">AXIOM</span>
+            <span className="font-mono text-sm font-bold tracking-tight text-foreground">TRADEBOT</span>
             <span className="text-[10px] uppercase tracking-[0.2em] text-muted-foreground">Quant Terminal</span>
           </div>
           <span className="text-[10px] text-muted-foreground">Multi-Agent Consensus Engine</span>
@@ -38,31 +36,44 @@ export function CommandBar({
 
       <div className="flex items-center gap-4">
         <div className="hidden items-center gap-4 md:flex">
-          <MetaItem label="Mode">
+          <MetaItem label="Engine">
             <span className="flex items-center gap-1.5">
-              <StatusDot tone={modeTone} pulse={running} />
-              <span className={cn("font-mono font-semibold", running ? "text-positive" : mode === "PAUSED" ? "text-warning" : "text-negative")}>
-                {modeLabel}
+              <StatusDot tone={engineOnline ? "positive" : "negative"} pulse={engineOnline} />
+              <span className={cn("font-mono font-semibold", engineOnline ? "text-positive" : "text-negative")}>
+                {engineOnline ? "ONLINE" : "OFFLINE"}
               </span>
             </span>
           </MetaItem>
-          <MetaItem label="Cycle">
-            <span className="font-mono tabular text-foreground">{cycle.toLocaleString()}</span>
+          <MetaItem label="Bot">
+            <span
+              className={cn(
+                "font-mono font-semibold",
+                running ? "text-positive" : "text-muted-foreground",
+              )}
+            >
+              {running ? "RUNNING" : "STOPPED"}
+            </span>
           </MetaItem>
-          <MetaItem label="Latency">
-            <span className={cn("font-mono tabular", latencyMs > 45 ? "text-warning" : "text-foreground")}>{latencyMs}ms</span>
+          <MetaItem label="Active Pair">
+            <span className="font-mono tabular text-foreground">{activeSymbol || "—"}</span>
           </MetaItem>
-          <MetaItem label="Uptime">
-            <span className="font-mono tabular text-foreground">{uptime(uptimeSec)}</span>
+          <MetaItem label="Market Feed">
+            <span className="flex items-center gap-1.5">
+              <StatusDot tone={marketOnline ? "primary" : "warning"} pulse={marketOnline} />
+              <span className={cn("font-mono", marketOnline ? "text-foreground" : "text-warning")}>
+                {marketOnline ? "LIVE" : "…"}
+              </span>
+            </span>
           </MetaItem>
         </div>
 
         <div className="flex items-center gap-1.5">
           <button
-            onClick={() => onMode("RUNNING")}
-            disabled={running}
+            onClick={onStart}
+            disabled={!engineOnline || running}
+            title={engineOnline ? "Start the trading engine" : "Engine offline"}
             className={cn(
-              "flex items-center gap-1.5 rounded border px-2.5 py-1.5 text-xs font-semibold transition-colors",
+              "flex items-center gap-1.5 rounded border px-2.5 py-1.5 text-xs font-semibold transition-colors disabled:cursor-not-allowed disabled:opacity-40",
               running
                 ? "border-positive/40 bg-positive/15 text-positive"
                 : "border-border bg-transparent text-muted-foreground hover:border-positive/40 hover:text-positive",
@@ -71,41 +82,24 @@ export function CommandBar({
             <Play className="h-3.5 w-3.5" /> Start
           </button>
           <button
-            onClick={() => onMode("PAUSED")}
-            disabled={mode === "PAUSED"}
+            onClick={onStop}
+            disabled={!engineOnline || !running}
+            title={engineOnline ? "Stop the trading engine" : "Engine offline"}
             className={cn(
-              "flex items-center gap-1.5 rounded border px-2.5 py-1.5 text-xs font-semibold transition-colors",
-              mode === "PAUSED"
-                ? "border-warning/40 bg-warning/15 text-warning"
-                : "border-border bg-transparent text-muted-foreground hover:border-warning/40 hover:text-warning",
-            )}
-          >
-            <Pause className="h-3.5 w-3.5" /> Pause
-          </button>
-          <button
-            onClick={() => onMode("STOPPED")}
-            disabled={mode === "STOPPED"}
-            className={cn(
-              "flex items-center gap-1.5 rounded border px-2.5 py-1.5 text-xs font-semibold transition-colors",
-              mode === "STOPPED"
-                ? "border-negative/40 bg-negative/15 text-negative"
+              "flex items-center gap-1.5 rounded border px-2.5 py-1.5 text-xs font-semibold transition-colors disabled:cursor-not-allowed disabled:opacity-40",
+              !running
+                ? "border-negative/40 bg-negative/10 text-negative"
                 : "border-border bg-transparent text-muted-foreground hover:border-negative/40 hover:text-negative",
             )}
           >
             <Square className="h-3.5 w-3.5" /> Stop
           </button>
           <button
-            onClick={onToggleKill}
-            title="Kill switch closes all positions and halts execution"
-            className={cn(
-              "ml-1 flex items-center gap-1.5 rounded border px-2.5 py-1.5 text-xs font-semibold transition-colors",
-              risk.killSwitchArmed
-                ? "border-primary/40 bg-primary/10 text-primary hover:bg-primary/20"
-                : "border-negative/50 bg-negative/15 text-negative",
-            )}
+            onClick={onRefresh}
+            title="Refresh data"
+            className="ml-1 flex items-center gap-1.5 rounded border border-border px-2.5 py-1.5 text-xs font-semibold text-muted-foreground transition-colors hover:border-primary/40 hover:text-primary"
           >
-            {risk.killSwitchArmed ? <ShieldCheck className="h-3.5 w-3.5" /> : <ShieldAlert className="h-3.5 w-3.5" />}
-            {risk.killSwitchArmed ? "Armed" : "Disarmed"}
+            <RefreshCw className="h-3.5 w-3.5" />
           </button>
         </div>
       </div>

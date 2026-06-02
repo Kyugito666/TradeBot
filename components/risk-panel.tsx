@@ -1,19 +1,34 @@
 "use client"
 
 import type { RiskMetrics } from "@/lib/types"
-import { Panel, Tag } from "./ui-kit"
-import { num, pct, usd } from "@/lib/format"
+import { Panel } from "./ui-kit"
+import { usd } from "@/lib/format"
 import { cn } from "@/lib/utils"
 
-export function RiskPanel({ risk }: { risk: RiskMetrics }) {
-  const marginPct = risk.marginRatio * 100
+export function RiskPanel({ risk, engineOnline }: { risk: RiskMetrics; engineOnline: boolean }) {
+  const marginPct = Math.min(100, risk.marginRatio * 100)
   const marginTone = marginPct > 70 ? "negative" : marginPct > 45 ? "warning" : "positive"
-  const lossUsed = Math.min(1, Math.abs(Math.min(0, risk.dailyPnl)) / Math.abs(risk.dailyLossLimit))
-  const longExp = Math.max(0, risk.netExposure)
   const netTone = risk.netExposure >= 0 ? "positive" : "negative"
+  const grossBase = risk.grossExposure || 1
+  const longPct = Math.min(100, (Math.max(0, risk.netExposure) / grossBase) * 100)
 
   return (
-    <Panel title="Risk & Exposure" bodyClassName="flex flex-col gap-3 p-3">
+    <Panel
+      title="Risk & Exposure"
+      right={
+        <span className="text-[10px] text-muted-foreground">
+          {engineOnline ? `${risk.openPositions} open` : "offline"}
+        </span>
+      }
+      bodyClassName="flex flex-col gap-3 p-3"
+    >
+      {/* account */}
+      <div className="grid grid-cols-3 gap-px overflow-hidden rounded-lg border border-border bg-border">
+        <Cell label="Equity" value={usd(risk.equity, 2)} />
+        <Cell label="Balance" value={usd(risk.balance, 2)} />
+        <Cell label="Day P&L" value={usd(risk.dailyPnl, 2)} tone={risk.dailyPnl >= 0 ? "positive" : "negative"} />
+      </div>
+
       {/* margin utilization */}
       <div>
         <div className="mb-1 flex items-center justify-between text-[10px] uppercase tracking-wider text-muted-foreground">
@@ -23,64 +38,50 @@ export function RiskPanel({ risk }: { risk: RiskMetrics }) {
           </span>
         </div>
         <div className="h-2 w-full overflow-hidden rounded-full bg-muted">
-          <div className={cn("h-full rounded-full transition-all duration-500", marginTone === "negative" ? "bg-negative" : marginTone === "warning" ? "bg-warning" : "bg-positive")} style={{ width: `${marginPct}%` }} />
+          <div
+            className={cn(
+              "h-full rounded-full transition-all duration-500",
+              marginTone === "negative" ? "bg-negative" : marginTone === "warning" ? "bg-warning" : "bg-positive",
+            )}
+            style={{ width: `${marginPct}%` }}
+          />
         </div>
         <div className="mt-1 flex justify-between text-[10px] tabular text-muted-foreground">
-          <span>Used {usd(risk.marginUsed)}</span>
-          <span>Free {usd(risk.marginFree)}</span>
+          <span>Used {usd(risk.marginUsed, 2)}</span>
+          <span>Free {usd(risk.marginFree, 2)}</span>
         </div>
       </div>
 
-      {/* daily loss limit */}
-      <div>
-        <div className="mb-1 flex items-center justify-between text-[10px] uppercase tracking-wider text-muted-foreground">
-          <span>Daily Loss Limit</span>
-          <span className="font-mono text-foreground">{usd(risk.dailyLossLimit)}</span>
-        </div>
-        <div className="h-2 w-full overflow-hidden rounded-full bg-muted">
-          <div className="h-full rounded-full bg-negative transition-all duration-500" style={{ width: `${lossUsed * 100}%` }} />
-        </div>
-        <div className="mt-1 flex justify-between text-[10px] tabular text-muted-foreground">
-          <span>Today P&L</span>
-          <span className={risk.dailyPnl >= 0 ? "text-positive" : "text-negative"}>{usd(risk.dailyPnl)}</span>
-        </div>
-      </div>
-
-      {/* exposure bar */}
+      {/* exposure */}
       <div>
         <div className="mb-1 flex items-center justify-between text-[10px] uppercase tracking-wider text-muted-foreground">
           <span>Net Exposure</span>
           <span className={cn("font-mono", netTone === "positive" ? "text-positive" : "text-negative")}>
-            {risk.netExposure >= 0 ? "+" : ""}{usd(risk.netExposure)}
+            {risk.netExposure >= 0 ? "+" : ""}
+            {usd(risk.netExposure, 2)}
           </span>
         </div>
         <div className="flex h-2 w-full overflow-hidden rounded-full bg-muted">
-          <div className="h-full bg-positive" style={{ width: `${(longExp / risk.grossExposure) * 100}%` }} />
+          <div className="h-full bg-positive" style={{ width: `${longPct}%` }} />
         </div>
         <div className="mt-1 flex justify-between text-[10px] tabular text-muted-foreground">
-          <span>Gross {usd(risk.grossExposure)}</span>
+          <span>Gross {usd(risk.grossExposure, 2)}</span>
           <span>{risk.openPositions} positions</span>
         </div>
       </div>
 
-      {/* metric grid */}
-      <div className="grid grid-cols-2 gap-px overflow-hidden rounded-lg border border-border bg-border">
-        <Cell label="Sharpe" value={num(risk.sharpe, 2)} />
-        <Cell label="Sortino" value={num(risk.sortino, 2)} />
-        <Cell label="Cur. Drawdown" value={pct(risk.currentDrawdown)} tone="warning" />
-        <Cell label="Max Drawdown" value={pct(risk.maxDrawdown)} tone="negative" />
-        <Cell label="VaR 95% 1d" value={usd(risk.valueAtRisk)} tone="warning" />
-        <Cell
-          label="Kill Switch"
-          value={<Tag tone={risk.killSwitchArmed ? "primary" : "negative"}>{risk.killSwitchArmed ? "ARMED" : "OFF"}</Tag>}
-        />
-      </div>
+      {!engineOnline && (
+        <p className="rounded border border-border bg-muted/30 px-2.5 py-2 text-[10px] leading-relaxed text-muted-foreground">
+          Risk metrics are derived from live engine balance and open positions. Start your TradeBot engine to populate
+          them.
+        </p>
+      )}
     </Panel>
   )
 }
 
-function Cell({ label, value, tone }: { label: string; value: React.ReactNode; tone?: "warning" | "negative" }) {
-  const toneText = tone === "negative" ? "text-negative" : tone === "warning" ? "text-warning" : "text-foreground"
+function Cell({ label, value, tone }: { label: string; value: React.ReactNode; tone?: "positive" | "negative" }) {
+  const toneText = tone === "negative" ? "text-negative" : tone === "positive" ? "text-positive" : "text-foreground"
   return (
     <div className="flex flex-col gap-0.5 bg-panel px-2.5 py-2">
       <span className="text-[9px] uppercase tracking-wider text-muted-foreground">{label}</span>
