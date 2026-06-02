@@ -27,11 +27,11 @@ export function Dashboard() {
 
         {!online && (
           <div className="flex flex-wrap items-center gap-2 border-b border-warning/30 bg-warning/10 px-4 py-2 text-[11px] text-warning">
-            <WifiOff className="h-3.5 w-3.5" />
+            <WifiOff className="h-3.5 w-3.5 shrink-0" />
             <span className="font-semibold">Trading engine offline.</span>
             <span className="text-warning/80">
-              Live market data is shown below. Start your local engine (gateway on{" "}
-              <span className="font-mono">{ENGINE_URL}</span>) to stream bot signals, positions, P&amp;L and logs. Set{" "}
+              Signals &amp; consensus below are computed live from real market data. Connect your engine (gateway on{" "}
+              <span className="font-mono">{ENGINE_URL}</span>) to enable live positions, P&amp;L and execution logs. Set{" "}
               <span className="font-mono">NEXT_PUBLIC_ENGINE_URL</span> to point at a remote engine.
             </span>
           </div>

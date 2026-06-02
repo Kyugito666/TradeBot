@@ -2,7 +2,7 @@
 
 import { useCallback, useMemo } from "react"
 import useSWR from "swr"
-import type { MarketRow, Snapshot } from "@/lib/types"
+import type { Consensus, MarketResponse, MarketRow, Snapshot } from "@/lib/types"
 import { pollEngine, startEngine, stopEngine, type EngineSnapshot } from "@/lib/engine"
 import {
   buildConsensus,
@@ -17,21 +17,20 @@ import {
 const EMPTY_PERF = buildPerformance([], 0)
 const EMPTY_RISK = buildRisk(null, [], EMPTY_PERF)
 
-async function marketFetcher(): Promise<{ market: MarketRow[]; ok: boolean }> {
+async function marketFetcher(): Promise<MarketResponse> {
   const res = await fetch("/api/market", { cache: "no-store" })
-  if (!res.ok) return { market: [], ok: false }
-  const json = await res.json()
-  return { market: json.market ?? [], ok: !!json.ok }
+  if (!res.ok) return { ok: false, ts: Date.now(), market: [], consensus: null }
+  return (await res.json()) as MarketResponse
 }
 
 export function useLiveData() {
-  // Real public market data via our server route (works on localhost + Vercel).
+  // Real public market data + server-computed analytics (works on localhost + Vercel).
   const market = useSWR("market", marketFetcher, {
     refreshInterval: 15000,
     keepPreviousData: true,
   })
 
-  // Real engine state via the local/remote Go gateway.
+  // Real engine state via the local/remote Go gateway (live trading account).
   const engine = useSWR<EngineSnapshot>("engine", pollEngine, {
     refreshInterval: 3000,
     keepPreviousData: true,
@@ -41,18 +40,25 @@ export function useLiveData() {
     const eng = engine.data
     const rows = market.data?.market ?? []
     const marketOnline = !!market.data?.ok && rows.length > 0
+    const analyticsConsensus: Consensus | null = market.data?.consensus ?? null
 
     const online = !!eng?.online
     const insight = eng?.insight ?? null
-    const activeSymbol = insight?.symbol ?? ""
+    const engineConsensus = buildConsensus(insight)
 
-    // Overlay the engine's real consensus signal onto the active symbol row only.
+    // When the engine is live it owns the verdict; otherwise the terminal runs
+    // on the genuine analytics computed from real market data.
+    const consensus: Consensus | null = engineConsensus ?? analyticsConsensus
+    const activeSymbol = consensus?.symbol ?? ""
+
+    // Overlay the engine's live verdict onto its active symbol row (real account
+    // signal). All other rows keep their own computed TA signal.
     const marketRows: MarketRow[] = rows.map((m) => {
-      if (online && insight && m.symbol === activeSymbol) {
+      if (online && insight && m.symbol === insight.symbol) {
         return {
           ...m,
           signalStatus: mapSignal(insight.signal_status),
-          confidence: parseConfidence(insight.advice),
+          confidence: parseConfidence(insight.advice) || m.confidence,
         }
       }
       return m
@@ -61,7 +67,6 @@ export function useLiveData() {
     const positions = buildPositions(eng?.active ?? [], marketRows)
     const performance = buildPerformance(eng?.history ?? [], insight?.balance ?? 0)
     const risk = buildRisk(insight, positions, performance)
-    const consensus = buildConsensus(insight)
     const log = mapLogs(eng?.logs ?? [])
 
     return {

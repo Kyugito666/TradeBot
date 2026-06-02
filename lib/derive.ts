@@ -61,6 +61,7 @@ export function buildConsensus(insight: EngineInsight | null): Consensus | null 
     tpTarget: insight.tp_target || 0,
     slTarget: insight.sl_target || 0,
     updatedAt: insight.timestamp || "",
+    source: "engine",
   }
 }
 

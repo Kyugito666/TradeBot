@@ -37,6 +37,7 @@ export function SignalWatch({
             <th className="px-2 py-2 text-right font-medium">Last</th>
             <th className="px-2 py-2 text-right font-medium">24h</th>
             <th className="px-2 py-2 text-center font-medium">Trend</th>
+            <th className="px-2 py-2 text-right font-medium">RSI</th>
             <th className="px-2 py-2 text-right font-medium">L/S</th>
             <th className="px-2 py-2 text-center font-medium">Whale</th>
             <th className="px-2 py-2 text-right font-medium">OI</th>
@@ -56,6 +57,7 @@ export function SignalWatch({
                 <td className="px-2 py-2 text-center">
                   <Tag tone={trendTone(m.trendState)}>{m.trendState.slice(0, 4)}</Tag>
                 </td>
+                <td className={cn("px-2 py-2 text-right font-mono tabular", m.rsi >= 70 ? "text-negative" : m.rsi <= 30 ? "text-positive" : "text-muted-foreground")}>{m.rsi.toFixed(0)}</td>
                 <td className={cn("px-2 py-2 text-right font-mono tabular", m.lsrVal > 1 ? "text-positive" : "text-negative")}>{num(m.lsrVal, 2)}</td>
                 <td className="px-2 py-2 text-center">
                   <span className={cn("font-mono text-[10px] font-semibold", m.whaleBias === "LONG_HEAVY" ? "text-positive" : m.whaleBias === "SHORT_HEAVY" ? "text-negative" : "text-muted-foreground")}>
@@ -84,7 +86,7 @@ export function SignalWatch({
           })}
           {market.length === 0 && (
             <tr>
-              <td colSpan={10} className="px-3 py-8 text-center text-xs text-muted-foreground">
+              <td colSpan={11} className="px-3 py-8 text-center text-xs text-muted-foreground">
                 {marketOnline ? "No market rows." : "Loading live market data…"}
               </td>
             </tr>

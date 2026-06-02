@@ -1,6 +1,6 @@
 "use client"
 
-import { Ban, Minus, TrendingDown, TrendingUp, WifiOff } from "lucide-react"
+import { Ban, Loader2, Minus, TrendingDown, TrendingUp } from "lucide-react"
 import type { Consensus } from "@/lib/types"
 import { Panel, Tag, Meter } from "./ui-kit"
 import { num } from "@/lib/format"
@@ -15,26 +15,30 @@ export function ConsensusPanel({
   engineOnline: boolean
   className?: string
 }) {
-  if (!engineOnline || !consensus) {
+  if (!consensus) {
     return (
       <Panel title="Consensus Engine" className={className} bodyClassName="flex flex-col items-center justify-center gap-2 p-6 text-center">
-        <WifiOff className="h-6 w-6 text-muted-foreground" />
-        <p className="text-xs text-muted-foreground">
-          {engineOnline ? "Waiting for first consensus from the engine…" : "Engine offline — no live consensus available."}
-        </p>
+        <Loader2 className="h-6 w-6 animate-spin text-muted-foreground" />
+        <p className="text-xs text-muted-foreground">Computing consensus from live market data…</p>
       </Panel>
     )
   }
 
-  const { action, confidence, reason, trendState, whaleBias, entryTarget, tpTarget, slTarget, symbol, updatedAt } =
+  const { action, confidence, reason, trendState, whaleBias, entryTarget, tpTarget, slTarget, symbol, updatedAt, source } =
     consensus
   const actionTone = action === "LONG" ? "positive" : action === "SHORT" ? "negative" : "warning"
   const ActionIcon = action === "LONG" ? TrendingUp : action === "SHORT" ? TrendingDown : action === "WAIT" ? Minus : Ban
+  const sourceLabel = source === "engine" ? "ENGINE" : "ANALYTICS"
 
   return (
     <Panel
       title="Consensus Engine"
-      right={<Tag tone="primary">{symbol}</Tag>}
+      right={
+        <div className="flex items-center gap-1.5">
+          <Tag tone={source === "engine" ? "positive" : "primary"}>{sourceLabel}</Tag>
+          <Tag tone="primary">{symbol}</Tag>
+        </div>
+      }
       className={className}
       bodyClassName="flex flex-col gap-3 p-3 scroll-thin overflow-auto"
     >
