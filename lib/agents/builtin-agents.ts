@@ -1,8 +1,17 @@
 // ────────────────────────────────────────────────────────────────────────────────
-// Built-in Analysis Agents — faithful TypeScript port of the 13 Rust quant agents
-// (rust-brain/src/agents/*). Each agent is self-contained; the roster + weights +
-// enable flags live in `config.ts`. Adding a new agent = add a config entry + a
-// builder in AGENT_BUILDERS. No other architecture change required.
+// Built-in Analysis Agents — QUANT team (Jim Simons / Renaissance inspired).
+//
+// DESIGN PRINCIPLES (this rewrite):
+//   • NO RSI and no "indicator soup". Every agent uses simple-but-strong statistical
+//     / order-flow logic computed from data we ACTUALLY have (OHLCV, OI, funding,
+//     long/short ratio, order-book depth).
+//   • Every agent is ACTIVE: there are no agents that just sit and WAIT because a
+//     sentiment/whale/liquidation feed is missing. Each one always produces a real
+//     directional read from price/volume/derivatives data.
+//   • Each agent reports an `activity` string so the UI can show, in real time, what
+//     it is currently analysing.
+//
+// Adding a new agent = add a config entry + a builder in AGENT_BUILDERS.
 // ────────────────────────────────────────────────────────────────────────────────
 
 import { createAgent, agentRegistry } from "./registry"
@@ -10,7 +19,7 @@ import { AGENT_TEAM_CONFIG } from "./config"
 import type { AgentInput, AgentOutput, AgentVote, IAgent } from "./types"
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// SHARED MATH (ports of rust-brain/src/agents/mod.rs helpers)
+// SHARED QUANT MATH (pure price/volume statistics — no oscillator indicators)
 // ═══════════════════════════════════════════════════════════════════════════════
 
 function sma(values: number[], period: number): number {
@@ -20,31 +29,66 @@ function sma(values: number[], period: number): number {
   return slice.reduce((a, b) => a + b, 0) / n
 }
 
-function rsi(closes: number[], period = 14): number {
-  if (closes.length < period + 1) return 50
-  const deltas: number[] = []
-  for (let i = 1; i < closes.length; i++) deltas.push(closes[i] - closes[i - 1])
-  const seed = deltas.slice(0, period)
-  let avgUp = seed.filter((d) => d >= 0).reduce((a, b) => a + b, 0) / period
-  let avgDown = seed.filter((d) => d < 0).reduce((a, b) => a - b, 0) / period
-  for (const d of deltas.slice(period)) {
-    const up = d > 0 ? d : 0
-    const down = d < 0 ? -d : 0
-    avgUp = (avgUp * (period - 1) + up) / period
-    avgDown = (avgDown * (period - 1) + down) / period
-  }
-  if (avgDown < 1e-10) return 100
-  return 100 - 100 / (1 + avgUp / avgDown)
+function mean(values: number[]): number {
+  if (values.length === 0) return 0
+  return values.reduce((a, b) => a + b, 0) / values.length
+}
+
+function std(values: number[]): number {
+  if (values.length < 2) return 0
+  const m = mean(values)
+  return Math.sqrt(values.reduce((a, b) => a + (b - m) ** 2, 0) / values.length)
 }
 
 function zscore(series: number[], window: number): number {
   if (series.length < window) return 0
   const w = series.slice(series.length - window)
-  const mean = w.reduce((a, b) => a + b, 0) / window
-  const variance = w.reduce((a, b) => a + (b - mean) ** 2, 0) / window
-  const std = Math.sqrt(variance)
-  if (std < 1e-10) return 0
-  return (series[series.length - 1] - mean) / std
+  const m = mean(w)
+  const s = std(w)
+  if (s < 1e-10) return 0
+  return (series[series.length - 1] - m) / s
+}
+
+// Log returns of a close series.
+function logReturns(closes: number[]): number[] {
+  const r: number[] = []
+  for (let i = 1; i < closes.length; i++) {
+    if (closes[i - 1] > 0 && closes[i] > 0) r.push(Math.log(closes[i] / closes[i - 1]))
+  }
+  return r
+}
+
+// Kaufman Efficiency Ratio over the last `period` closes: directional travel ÷ total
+// path. ~1 = clean trend, ~0 = choppy noise. The core regime filter (no RSI).
+function efficiencyRatio(closes: number[], period: number): number {
+  const n = Math.min(period, closes.length - 1)
+  if (n <= 0) return 0
+  const change = Math.abs(closes[closes.length - 1] - closes[closes.length - 1 - n])
+  let vol = 0
+  for (let i = closes.length - n; i < closes.length; i++) vol += Math.abs(closes[i] - closes[i - 1])
+  if (vol < 1e-9) return 0
+  return change / vol
+}
+
+// Ordinary least-squares slope + R² over an index-vs-value series.
+function linreg(values: number[]): { slope: number; r2: number } {
+  const n = values.length
+  if (n < 3) return { slope: 0, r2: 0 }
+  const xs = Array.from({ length: n }, (_, i) => i)
+  const mx = (n - 1) / 2
+  const my = mean(values)
+  let sxy = 0
+  let sxx = 0
+  let syy = 0
+  for (let i = 0; i < n; i++) {
+    sxy += (xs[i] - mx) * (values[i] - my)
+    sxx += (xs[i] - mx) ** 2
+    syy += (values[i] - my) ** 2
+  }
+  if (sxx < 1e-12) return { slope: 0, r2: 0 }
+  const slope = sxy / sxx
+  const r2 = syy < 1e-12 ? 0 : (sxy * sxy) / (sxx * syy)
+  return { slope, r2 }
 }
 
 function bayesianUpdate(priorUp: number, likUp: number, likDown: number): number {
@@ -70,15 +114,6 @@ function wilderAtr(highs: number[], lows: number[], closes: number[], period = 1
   return atr
 }
 
-function calcEma(closes: number[], period: number): number {
-  if (closes.length === 0) return 0
-  if (closes.length < period) return closes.reduce((a, b) => a + b, 0) / closes.length
-  const k = 2 / (period + 1)
-  let ema = closes.slice(0, period).reduce((a, b) => a + b, 0) / period
-  for (const c of closes.slice(period)) ema = c * k + ema * (1 - k)
-  return ema
-}
-
 function percentile(sorted: number[], p: number): number {
   if (sorted.length === 0) return 0
   const idx = Math.round((p / 100) * (sorted.length - 1))
@@ -89,107 +124,104 @@ function clamp(v: number, lo: number, hi: number): number {
   return Math.max(lo, Math.min(hi, v))
 }
 
-function wait(agentId: string, reasoning: string, metrics: Record<string, number> = {}): AgentOutput {
-  return { agentId, vote: "WAIT", confidence: 0, reasoning, metrics }
+function tanh(x: number): number {
+  return Math.tanh(x)
+}
+
+// Directional vote from a signed score in [-1,1] with a small dead-zone.
+function voteFromScore(score: number, deadzone = 0.12): { vote: AgentVote; confidence: number } {
+  if (score > deadzone) return { vote: "LONG", confidence: clamp(Math.abs(score), 0, 1) }
+  if (score < -deadzone) return { vote: "SHORT", confidence: clamp(Math.abs(score), 0, 1) }
+  return { vote: "WAIT", confidence: clamp(Math.abs(score) / deadzone * 0.2, 0, 0.2) }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// 1. MATHEMATICIAN — Bayesian probability chain (RSI + Z-score), emits noise/anomaly
+// 1. MATHEMATICIAN — Bayesian regime-aware probability (momentum + mean reversion)
 // ═══════════════════════════════════════════════════════════════════════════════
 async function mathematician(input: AgentInput): Promise<AgentOutput> {
   const id = "mathematician"
+  const activity = "Bayesian regime probability (efficiency ratio + z-score + drift)"
   const c = input.closes
   const period = 14
-  if (c.length < period * 2) return wait(id, "insufficient candles")
+  if (c.length < period + 2) return weakWait(id, "insufficient candles", activity)
 
-  // Kaufman Efficiency Ratio regime filter
-  let er = 0
-  const n = Math.min(period, c.length - 1)
-  if (n > 0) {
-    const change = Math.abs(c[c.length - 1] - c[c.length - 1 - n])
-    let vol = 0
-    for (let i = c.length - n; i < c.length; i++) vol += Math.abs(c[i] - c[i - 1])
-    if (vol > 1e-9) er = change / vol
-  }
-  const strongUp = er > 0.35 && c[c.length - 1] > c[c.length - 1 - n]
-  const strongDown = er > 0.35 && c[c.length - 1] < c[c.length - 1 - n]
-
-  const rsiVal = rsi(c, period)
-  let probUp = 0.5
-  if (strongUp) {
-    if (rsiVal > 65) probUp = bayesianUpdate(probUp, 0.75, 0.25)
-    else if (rsiVal < 50) probUp = bayesianUpdate(probUp, 0.65, 0.35)
-  } else if (strongDown) {
-    if (rsiVal < 35) probUp = bayesianUpdate(probUp, 0.25, 0.75)
-    else if (rsiVal > 50) probUp = bayesianUpdate(probUp, 0.35, 0.65)
-  } else {
-    if (rsiVal < 30) probUp = bayesianUpdate(probUp, 0.72, 0.28)
-    else if (rsiVal < 45) probUp = bayesianUpdate(probUp, 0.57, 0.43)
-    else if (rsiVal > 70) probUp = bayesianUpdate(probUp, 0.28, 0.72)
-    else if (rsiVal > 55) probUp = bayesianUpdate(probUp, 0.43, 0.57)
-  }
+  const er = efficiencyRatio(c, period)
+  const last = c[c.length - 1]
+  const prev = c[c.length - 1 - Math.min(period, c.length - 1)]
+  const trendUp = last > prev
+  const trending = er > 0.35
 
   const z = zscore(c, period)
-  if (strongUp) {
-    if (z > 1.5) probUp = bayesianUpdate(probUp, 0.65, 0.35)
-  } else if (strongDown) {
-    if (z < -1.5) probUp = bayesianUpdate(probUp, 0.35, 0.65)
-  } else {
-    if (z < -2) probUp = bayesianUpdate(probUp, 0.68, 0.32)
-    else if (z < -1) probUp = bayesianUpdate(probUp, 0.58, 0.42)
-    else if (z > 2) probUp = bayesianUpdate(probUp, 0.32, 0.68)
-    else if (z > 1) probUp = bayesianUpdate(probUp, 0.42, 0.58)
-  }
-  const probDown = 1 - probUp
+  let probUp = 0.5
 
+  if (trending) {
+    // Trend-following: ride the dominant direction, strength scaled by efficiency.
+    if (trendUp) probUp = bayesianUpdate(probUp, 0.5 + er * 0.4, 0.5 - er * 0.4)
+    else probUp = bayesianUpdate(probUp, 0.5 - er * 0.4, 0.5 + er * 0.4)
+  } else {
+    // Mean reversion when choppy: fade extreme z-scores back to the mean.
+    if (z < -2) probUp = bayesianUpdate(probUp, 0.72, 0.28)
+    else if (z < -1) probUp = bayesianUpdate(probUp, 0.6, 0.4)
+    else if (z > 2) probUp = bayesianUpdate(probUp, 0.28, 0.72)
+    else if (z > 1) probUp = bayesianUpdate(probUp, 0.4, 0.6)
+  }
+
+  // Short-horizon drift confirmation.
+  const rets = logReturns(c.slice(-period))
+  const drift = mean(rets)
+  if (drift > 0) probUp = bayesianUpdate(probUp, 0.56, 0.44)
+  else if (drift < 0) probUp = bayesianUpdate(probUp, 0.44, 0.56)
+
+  const probDown = 1 - probUp
   const atr = wilderAtr(input.highs, input.lows, c, period)
-  const lastCandle = input.candles[input.candles.length - 1]
-  const bodyLast = lastCandle ? Math.abs(c[c.length - 1] - lastCandle.open) : 0
-  const rangeLast = lastCandle ? lastCandle.high - lastCandle.low : 1
+
+  // Noise + anomaly diagnostics (used by the risk veto layer; replaces RSI noise).
+  const lc = input.candles[input.candles.length - 1]
+  const bodyLast = lc ? Math.abs(lc.close - lc.open) : 0
+  const rangeLast = lc ? lc.high - lc.low : 1
   const noiseRatio = rangeLast > 1e-9 ? (rangeLast - bodyLast) / rangeLast : 0
   const anomaly = Math.abs(z) > 4
 
   let vote: AgentVote = "WAIT"
-  let confidence = 0.5
-  if (probUp > 0.62) { vote = "LONG"; confidence = probUp }
-  else if (probDown > 0.62) { vote = "SHORT"; confidence = probDown }
+  let confidence = 0
+  if (probUp > 0.56) { vote = "LONG"; confidence = (probUp - 0.5) * 2 }
+  else if (probDown > 0.56) { vote = "SHORT"; confidence = (probDown - 0.5) * 2 }
+  confidence = clamp(confidence, 0, 1)
 
-  const flags: string[] = []
-  if (anomaly) flags.push("anomaly")
   return {
     agentId: id,
     vote,
     confidence,
-    reasoning: `RSI=${rsiVal.toFixed(1)} Z=${z.toFixed(2)} P(up)=${probUp.toFixed(3)} noise=${noiseRatio.toFixed(2)} anomaly=${anomaly} ATR=${atr.toFixed(4)}`,
-    metrics: { rsi: rsiVal, z, probUp, noise: noiseRatio, anomaly: anomaly ? 1 : 0, atr },
-    flags,
+    activity,
+    reasoning: `ER=${er.toFixed(2)} ${trending ? "TREND" : "RANGE"} Z=${z.toFixed(2)} drift=${drift.toFixed(4)} P(up)=${probUp.toFixed(2)}`,
+    metrics: { er, z, probUp, noise: noiseRatio, anomaly: anomaly ? 1 : 0, atr },
+    flags: anomaly ? ["anomaly"] : [],
   }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// 2. PHYSICIST — GBM Monte Carlo, VETOs on volatility crisis
+// 2. PHYSICIST — GBM Monte Carlo upside bias, VETOs on volatility crisis
 // ═══════════════════════════════════════════════════════════════════════════════
 async function physicist(input: AgentInput): Promise<AgentOutput> {
   const id = "physicist"
+  const activity = "Monte Carlo GBM forecast (1000 paths) + volatility-regime guard"
   const c = input.closes
-  if (c.length < 30) return wait(id, "insufficient candles for GBM")
+  if (c.length < 30) return weakWait(id, "insufficient candles for GBM", activity)
   const price = input.price
 
-  const returns: number[] = []
-  for (let i = 1; i < c.length; i++) returns.push(Math.log(c[i] / c[i - 1]))
+  const returns = logReturns(c)
   const nr = returns.length
-  const mu = returns.reduce((a, b) => a + b, 0) / nr
-  const variance = returns.reduce((a, b) => a + (b - mu) ** 2, 0) / nr
-  const sig = Math.sqrt(variance)
+  const mu = mean(returns)
+  const sig = std(returns)
 
   const recent = returns.slice(Math.max(0, nr - 20))
-  const mRec = recent.reduce((a, b) => a + b, 0) / recent.length
-  const recentVol = Math.sqrt(recent.reduce((a, b) => a + (b - mRec) ** 2, 0) / recent.length)
-  if (recentVol > sig * 3) {
+  const recentVol = std(recent)
+  if (sig > 1e-9 && recentVol > sig * 3) {
     return {
       agentId: id,
       vote: "VETO",
       confidence: 0.9,
+      activity,
       reasoning: `VOLATILITY CRISIS: recent_vol=${recentVol.toFixed(4)} > 3x hist_vol=${(sig * 3).toFixed(4)}`,
       metrics: { recentVol, histVol: sig },
       flags: ["VOLATILITY_CRISIS"],
@@ -197,18 +229,16 @@ async function physicist(input: AgentInput): Promise<AgentOutput> {
   }
 
   const drift = mu - 0.5 * sig * sig
-  const diff = sig
   const sims = 1000
   const horizon = 24
   const finals: number[] = new Array(sims)
   for (let s = 0; s < sims; s++) {
     let p = price
     for (let h = 0; h < horizon; h++) {
-      // Box-Muller standard normal
       const u1 = Math.random() || 1e-12
       const u2 = Math.random()
       const zr = Math.sqrt(-2 * Math.log(u1)) * Math.cos(2 * Math.PI * u2)
-      p *= Math.exp(drift + diff * zr)
+      p *= Math.exp(drift + sig * zr)
     }
     finals[s] = p
   }
@@ -216,20 +246,19 @@ async function physicist(input: AgentInput): Promise<AgentOutput> {
   const p5 = percentile(finals, 5)
   const p50 = percentile(finals, 50)
   const p95 = percentile(finals, 95)
-  const spread = p95 - p5
-  const upsideBias = spread > 1e-8 ? (p95 - price) / spread : 0.5
+  // Share of simulated paths that finish above current price.
+  const upShare = finals.filter((p) => p > price).length / sims
 
-  let vote: AgentVote = "WAIT"
-  let confidence = 0.5
-  if (upsideBias > 0.62) { vote = "LONG"; confidence = Math.min(0.95, 0.4 + (upsideBias - 0.5)) }
-  else if (upsideBias < 0.38) { vote = "SHORT"; confidence = Math.min(0.95, 0.4 + (0.5 - upsideBias)) }
+  const score = (upShare - 0.5) * 2
+  const { vote, confidence } = voteFromScore(score, 0.12)
 
   return {
     agentId: id,
     vote,
-    confidence,
-    reasoning: `GBM P5=${p5.toFixed(2)} P50=${p50.toFixed(2)} P95=${p95.toFixed(2)} upside_bias=${upsideBias.toFixed(3)} mu=${mu.toFixed(5)}`,
-    metrics: { p5, p50, p95, upsideBias, mu, sigma: sig },
+    confidence: clamp(confidence, 0, 0.95),
+    activity,
+    reasoning: `GBM P5=${p5.toFixed(2)} P50=${p50.toFixed(2)} P95=${p95.toFixed(2)} up_share=${(upShare * 100).toFixed(0)}% mu=${mu.toFixed(5)}`,
+    metrics: { p5, p50, p95, upShare, mu, sigma: sig },
   }
 }
 
@@ -238,11 +267,11 @@ async function physicist(input: AgentInput): Promise<AgentOutput> {
 // ═══════════════════════════════════════════════════════════════════════════════
 async function cryptographer(input: AgentInput): Promise<AgentOutput> {
   const id = "cryptographer"
+  const activity = "Decoding volume profile (POC), cumulative delta & candle patterns"
   const candles = input.candles
   const n = candles.length
-  if (n < 50) return wait(id, "insufficient candles")
+  if (n < 30) return weakWait(id, "insufficient candles", activity)
 
-  // POC
   const minP = Math.min(...candles.map((c) => c.low))
   const maxP = Math.max(...candles.map((c) => c.high))
   const bins = 50
@@ -259,23 +288,20 @@ async function cryptographer(input: AgentInput): Promise<AgentOutput> {
     poc = minP + (maxIdx + 0.5) * binW
   }
 
-  // CVD
   const window = 20
   const recent = candles.slice(Math.max(0, n - window))
   const cvd = recent.reduce((acc, c) => acc + (c.close > c.open ? c.vol : c.close < c.open ? -c.vol : 0), 0)
 
-  // Whale footprint
   const vols = input.volumes
   const lastVol = vols[vols.length - 1] ?? 0
   const histVol = vols.slice(0, Math.max(0, vols.length - 1))
-  const meanVol = histVol.length ? histVol.reduce((a, b) => a + b, 0) / histVol.length : 0
-  const stdVol = histVol.length ? Math.sqrt(histVol.reduce((a, b) => a + (b - meanVol) ** 2, 0) / histVol.length) : 0
-  const volZ = stdVol > 1e-10 ? (lastVol - meanVol) / stdVol : 0
+  const mV = mean(histVol)
+  const sV = std(histVol)
+  const volZ = sV > 1e-10 ? (lastVol - mV) / sV : 0
   const whalePresent = volZ > 2.5
   const lastC = candles[n - 1]
   const whaleDir = whalePresent ? (lastC.close > lastC.open ? 1 : -1) : 0
 
-  // Patterns
   const prev = candles[n - 2]
   const rangeL = lastC.high - lastC.low
   const bodyL = Math.abs(lastC.close - lastC.open)
@@ -288,8 +314,8 @@ async function cryptographer(input: AgentInput): Promise<AgentOutput> {
   if (bullEngulf) { score += 0.35; if (cvd > 0) score += 0.15 }
   if (bearEngulf) { score -= 0.35; if (cvd < 0) score -= 0.15 }
   if (isDoji) score *= 0.5
-  const cvdNorm = meanVol > 1e-10 ? cvd / (meanVol * window) : 0
-  score += clamp(cvdNorm, -0.3, 0.3)
+  const cvdNorm = mV > 1e-10 ? cvd / (mV * window) : 0
+  score += clamp(cvdNorm, -0.35, 0.35)
   if (whalePresent) {
     score *= 1 + Math.min(0.5, volZ / 5)
     if (whaleDir < 0) score = Math.min(score, -Math.abs(score))
@@ -299,43 +325,58 @@ async function cryptographer(input: AgentInput): Promise<AgentOutput> {
   if (pocDist < 0.005) score *= 1.1
   score = clamp(score, -1, 1)
 
-  const pattern = bullEngulf ? "BullishEngulfing" : bearEngulf ? "BearishEngulfing" : isDoji ? "Doji" : "None"
-  let vote: AgentVote = "WAIT"
-  let confidence = 0.5
-  if (score > 0.25) { vote = "LONG"; confidence = Math.abs(score) }
-  else if (score < -0.25) { vote = "SHORT"; confidence = Math.abs(score) }
+  const pattern = bullEngulf ? "BullEngulf" : bearEngulf ? "BearEngulf" : isDoji ? "Doji" : "None"
+  const { vote, confidence } = voteFromScore(score, 0.15)
 
   return {
     agentId: id,
     vote,
     confidence,
-    reasoning: `Pattern=${pattern} CVD=${cvd.toFixed(0)} WhalZ=${volZ.toFixed(1)} POC=${poc.toFixed(2)} score=${score.toFixed(3)}`,
+    activity,
+    reasoning: `Pattern=${pattern} CVD=${cvd.toFixed(0)} whaleZ=${volZ.toFixed(1)} POC=${poc.toFixed(2)} score=${score.toFixed(2)}`,
     metrics: { poc, cvd, volZ, whaleDir, score },
   }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// 4. LINGUIST — social sentiment (reads cached sentiment + news count)
+// 4. LINGUIST — Tape reader: volume-weighted buy/sell pressure (order-flow sentiment)
 // ═══════════════════════════════════════════════════════════════════════════════
 async function linguist(input: AgentInput): Promise<AgentOutput> {
   const id = "linguist"
-  const score = input.sentimentScore
-  const count = input.newsCount
-  if (count === 0) return wait(id, "no news data in cache yet")
-  const baseConf = Math.min(1, count / 10)
-  let vote: AgentVote = "WAIT"
-  let confidence = baseConf * 0.3
-  let label = "NEUTRAL"
-  if (score > 0.4) { label = "VERY_BULLISH"; vote = "LONG"; confidence = baseConf }
-  else if (score > 0.1) { label = "BULLISH"; vote = "LONG"; confidence = baseConf * 0.75 }
-  else if (score < -0.4) { label = "VERY_BEARISH"; vote = "SHORT"; confidence = baseConf }
-  else if (score < -0.1) { label = "BEARISH"; vote = "SHORT"; confidence = baseConf * 0.75 }
+  const activity = "Reading the tape — volume-weighted buy/sell pressure over recent candles"
+  const candles = input.candles
+  const n = candles.length
+  if (n < 10) return weakWait(id, "insufficient candles", activity)
+
+  const window = Math.min(24, n)
+  const recent = candles.slice(n - window)
+  let pressure = 0
+  let volSum = 0
+  for (const c of recent) {
+    const range = c.high - c.low
+    const body = c.close - c.open
+    const bodyRatio = range > 1e-9 ? body / range : 0 // -1..1 conviction
+    pressure += bodyRatio * c.vol
+    volSum += c.vol
+  }
+  const tape = volSum > 1e-9 ? pressure / volSum : 0 // -1..1
+
+  // Confirm with where price sits in the recent range (acceptance).
+  const hi = Math.max(...recent.map((c) => c.high))
+  const lo = Math.min(...recent.map((c) => c.low))
+  const loc = hi - lo > 1e-9 ? ((input.price - lo) / (hi - lo)) * 2 - 1 : 0
+
+  const score = clamp(tape * 0.7 + loc * 0.3, -1, 1)
+  const { vote, confidence } = voteFromScore(score, 0.12)
+
+  const label = score > 0.3 ? "BULLISH_TAPE" : score < -0.3 ? "BEARISH_TAPE" : "MIXED_TAPE"
   return {
     agentId: id,
     vote,
     confidence,
-    reasoning: `sentiment=${score.toFixed(3)} label=${label} articles=${count}`,
-    metrics: { sentiment: score, newsCount: count },
+    activity,
+    reasoning: `${label}: tape_pressure=${tape.toFixed(2)} range_loc=${loc.toFixed(2)} score=${score.toFixed(2)}`,
+    metrics: { tape, rangeLoc: loc, score },
   }
 }
 
@@ -347,17 +388,36 @@ const LEV_WEIGHTS = [0.04, 0.12, 0.3, 0.28, 0.12, 0.09, 0.05]
 const MMR = 0.004
 async function liquidator(input: AgentInput): Promise<AgentOutput> {
   const id = "liquidator"
+  const activity = "Mapping liquidation clusters (leverage ladder vs OI & long/short ratio)"
   const candles = input.candles
   const n = candles.length
-  if (n < 20 || input.openInterest < 1) return wait(id, "insufficient data for liq estimation")
   const atr = wilderAtr(input.highs, input.lows, input.closes, 14)
   const current = input.price
+
+  // Fallback: if OI/volume is unavailable, derive a directional read from where
+  // price sits relative to its recent swing (liquidity tends to pool at extremes).
+  const volTotal = input.volumes.reduce((a, b) => a + b, 0)
+  if (n < 20 || input.openInterest < 1 || volTotal < 1) {
+    const hi = Math.max(...input.highs.slice(-50))
+    const lo = Math.min(...input.lows.slice(-50))
+    const loc = hi - lo > 1e-9 ? (current - lo) / (hi - lo) : 0.5
+    // Price near range lows → short liquidity below likely swept → mild LONG, and vice-versa.
+    const score = (0.5 - loc) * 1.2
+    const { vote, confidence } = voteFromScore(clamp(score, -1, 1), 0.15)
+    return {
+      agentId: id,
+      vote,
+      confidence,
+      activity,
+      reasoning: `OI feed thin — using swing liquidity proxy (range_loc=${loc.toFixed(2)})`,
+      metrics: { atr, rangeLoc: loc },
+    }
+  }
+
   const oiUsd = input.openInterest * current
   const lsr = Math.max(1e-6, input.lsr)
   const longFrac = lsr / (1 + lsr)
   const shortFrac = 1 - longFrac
-  const volTotal = input.volumes.reduce((a, b) => a + b, 0)
-  if (volTotal < 1) return wait(id, "zero volume")
 
   const longLiq: [number, number][] = []
   const shortLiq: [number, number][] = []
@@ -372,83 +432,62 @@ async function liquidator(input: AgentInput): Promise<AgentOutput> {
     })
   })
 
-  const above = shortLiq
-    .filter(([p]) => p > current && p - current < atr * 2)
-    .sort((a, b) => a[0] - current - (b[0] - current))[0]
-  const below = longLiq
-    .filter(([p]) => p < current && current - p < atr * 2)
-    .sort((a, b) => current - a[0] - (current - b[0]))[0]
+  const above = shortLiq.filter(([p]) => p > current && p - current < atr * 2).sort((a, b) => a[0] - b[0])[0]
+  const below = longLiq.filter(([p]) => p < current && current - p < atr * 2).sort((a, b) => b[0] - a[0])[0]
 
-  let vote: AgentVote = "WAIT"
-  let confidence = 0
-  let detail = "no cluster in ATR x2 radius"
+  let score = 0
+  let detail = "no cluster within ATRx2"
   if (above && below) {
     const dAbove = above[0] - current
     const dBelow = current - below[0]
-    const densAbove = Math.min(1, above[1] / oiUsd)
-    const densBelow = Math.min(1, below[1] / oiUsd)
-    const scoreA = densAbove / Math.max(1e-8, dAbove)
-    const scoreB = densBelow / Math.max(1e-8, dBelow)
-    if (scoreA > scoreB * 1.2) { vote = "LONG"; confidence = densAbove; detail = `SHORT cluster above @ ${above[0].toFixed(2)}` }
-    else if (scoreB > scoreA * 1.2) { vote = "SHORT"; confidence = densBelow; detail = `LONG cluster below @ ${below[0].toFixed(2)}` }
-    else detail = "clusters balanced"
+    const scoreA = Math.min(1, above[1] / oiUsd) / Math.max(1e-8, dAbove)
+    const scoreB = Math.min(1, below[1] / oiUsd) / Math.max(1e-8, dBelow)
+    score = clamp((scoreA - scoreB) / Math.max(scoreA, scoreB, 1e-8), -1, 1)
+    detail = score > 0 ? `SHORT cluster magnet above @ ${above[0].toFixed(2)}` : `LONG cluster magnet below @ ${below[0].toFixed(2)}`
   } else if (above) {
-    vote = "LONG"; confidence = Math.min(1, above[1] / oiUsd); detail = `SHORT cluster above @ ${above[0].toFixed(2)}`
+    score = Math.min(1, above[1] / oiUsd); detail = `SHORT cluster above @ ${above[0].toFixed(2)}`
   } else if (below) {
-    vote = "SHORT"; confidence = Math.min(1, below[1] / oiUsd); detail = `LONG cluster below @ ${below[0].toFixed(2)}`
+    score = -Math.min(1, below[1] / oiUsd); detail = `LONG cluster below @ ${below[0].toFixed(2)}`
   }
-  return { agentId: id, vote, confidence, reasoning: detail, metrics: { atr, oiUsd } }
+  const { vote, confidence } = voteFromScore(score, 0.12)
+  return { agentId: id, vote, confidence, activity, reasoning: detail, metrics: { atr, oiUsd, score } }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// 6. ABSURDIST — liq magnet + tether + squeeze + whale inflow + kimchi premium
+// 6. ABSURDIST — crowd contrarian: funding + open-interest build-up vs price
 // ═══════════════════════════════════════════════════════════════════════════════
 async function absurdist(input: AgentInput): Promise<AgentOutput> {
   const id = "absurdist"
-  const signals: [string, number, number][] = []
+  const activity = "Hunting crowded trades — funding extremes & leverage build-up (squeeze risk)"
+  const c = input.closes
+  if (c.length < 10) return weakWait(id, "insufficient candles", activity)
 
-  const totalLiq = input.longLiq1h + input.shortLiq1h
-  let liqScore = 0
-  if (totalLiq > 1) {
-    const shortDom = input.shortLiq1h / totalLiq
-    const longDom = input.longLiq1h / totalLiq
-    if (shortDom > 0.6) liqScore = (shortDom - 0.5) * 2
-    else if (longDom > 0.6) liqScore = -(longDom - 0.5) * 2
-  }
-  signals.push(["LiqMagnet", liqScore, 0.3])
-
-  const tetherScore = clamp(input.usdtDeltaPct, -3, 3) / 3
-  signals.push(["TetherPrinter", tetherScore, 0.15])
-
-  let squeezeScore = 0
   const fr = input.fundingRate
-  if (fr > 0.001) squeezeScore = -Math.min(1, fr * 500)
-  else if (fr < -0.001) squeezeScore = Math.min(1, Math.abs(fr) * 500)
-  signals.push(["SqueezePred", squeezeScore, 0.25])
+  // Crowded longs (very positive funding) → fade to SHORT; crowded shorts → fade LONG.
+  const fundingTilt = -tanh(fr * 800) // fr ~0.0005 -> ~ -0.38
+  // Long/short crowd extremes.
+  const lsr = Math.max(1e-6, input.lsr)
+  const crowdTilt = -tanh((lsr - 1) * 1.5)
+  // But never fight a strong impulse — temper contrarian when momentum is strong.
+  const er = efficiencyRatio(c, 14)
+  const last = c[c.length - 1]
+  const ref = c[Math.max(0, c.length - 15)]
+  const momentumSign = last >= ref ? 1 : -1
+  const trendDamp = er > 0.45 ? 0.4 : 1
 
-  let whaleScore = 0
-  const inflow = input.whaleInflowUsd
-  if (inflow > 10_000_000) whaleScore = Math.min(1, inflow / 500_000_000)
-  else if (inflow < -10_000_000) whaleScore = Math.max(-1, inflow / 500_000_000)
-  signals.push(["WhaleInflow", whaleScore, 0.2])
-
-  const kimchiScore = clamp(input.kimchiPct / 5, -1, 1)
-  signals.push(["KimchiPrem", kimchiScore, 0.1])
-
-  const totalWeight = signals.reduce((a, [, , w]) => a + w, 0)
-  const weighted = signals.reduce((a, [, s, w]) => a + s * w, 0) / totalWeight
-
-  let vote: AgentVote = "WAIT"
-  let confidence = 0
-  if (weighted > 0.15) { vote = "LONG"; confidence = Math.min(1, weighted) }
-  else if (weighted < -0.15) { vote = "SHORT"; confidence = Math.min(1, Math.abs(weighted)) }
+  const score = clamp((fundingTilt * 0.6 + crowdTilt * 0.4) * trendDamp, -1, 1)
+  // If the contrarian read directly opposes a very strong trend, soften it further.
+  const aligned = Math.sign(score) === momentumSign
+  const finalScore = aligned ? score : score * (er > 0.5 ? 0.5 : 1)
+  const { vote, confidence } = voteFromScore(finalScore, 0.12)
 
   return {
     agentId: id,
     vote,
     confidence,
-    reasoning: `score=${weighted.toFixed(3)} liq=${liqScore.toFixed(2)} teth=${tetherScore.toFixed(2)} sqz=${squeezeScore.toFixed(2)} whale=${whaleScore.toFixed(2)} kimchi=${kimchiScore.toFixed(2)}`,
-    metrics: { weighted, liqScore, tetherScore, squeezeScore, whaleScore, kimchiScore },
+    activity,
+    reasoning: `funding=${fr.toFixed(5)} LSR=${lsr.toFixed(2)} fundTilt=${fundingTilt.toFixed(2)} crowdTilt=${crowdTilt.toFixed(2)} score=${finalScore.toFixed(2)}`,
+    metrics: { funding: fr, lsr, fundingTilt, crowdTilt, score: finalScore },
   }
 }
 
@@ -457,34 +496,49 @@ async function absurdist(input: AgentInput): Promise<AgentOutput> {
 // ═══════════════════════════════════════════════════════════════════════════════
 async function gameTheorist(input: AgentInput): Promise<AgentOutput> {
   const id = "game_theorist"
+  const activity = "Order-book game theory — top-of-book bid/ask imbalance"
   const bid = input.bid
   const ask = input.ask
   const total = bid + ask
-  if (total < 1e-9) return wait(id, "zero order book depth")
+  if (total < 1e-9) {
+    // No book depth → fall back to last-candle aggressor (close vs midpoint).
+    const lc = input.candles[input.candles.length - 1]
+    const score = lc ? clamp((lc.close - (lc.high + lc.low) / 2) / Math.max(1e-9, (lc.high - lc.low) / 2), -1, 1) : 0
+    const { vote, confidence } = voteFromScore(score, 0.2)
+    return { agentId: id, vote, confidence: confidence * 0.6, activity, reasoning: `No book depth — aggressor proxy score=${score.toFixed(2)}`, metrics: { score } }
+  }
   const obi = (bid - ask) / total
-  let vote: AgentVote = "WAIT"
-  let confidence = 0
-  if (obi > 0.15) { vote = "LONG"; confidence = Math.min(1, Math.abs(obi)) }
-  else if (obi < -0.15) { vote = "SHORT"; confidence = Math.min(1, Math.abs(obi)) }
-  return { agentId: id, vote, confidence, reasoning: `OBI=${obi.toFixed(3)} (Bid ${bid.toFixed(1)}, Ask ${ask.toFixed(1)})`, metrics: { obi, bid, ask } }
+  const { vote, confidence } = voteFromScore(obi, 0.1)
+  return { agentId: id, vote, confidence, activity, reasoning: `OBI=${obi.toFixed(3)} (bid ${bid.toFixed(1)} / ask ${ask.toFixed(1)})`, metrics: { obi, bid, ask } }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// 8. ECONOMIST — funding rate + liquidation bias
+// 8. ECONOMIST — carry & flow: funding carry + OI-weighted drift
 // ═══════════════════════════════════════════════════════════════════════════════
 async function economist(input: AgentInput): Promise<AgentOutput> {
   const id = "economist"
+  const activity = "Macro carry & flow — funding regime vs realised price drift"
+  const c = input.closes
+  if (c.length < 12) return weakWait(id, "insufficient candles", activity)
+
   const fr = input.fundingRate
-  const frScore = clamp(fr * 10_000, -1, 1)
-  const totalLiq = input.longLiq1h + input.shortLiq1h
-  const liqBias = totalLiq > 1e-5 ? (input.shortLiq1h - input.longLiq1h) / totalLiq : 0
-  const bias = -frScore * 0.6 + liqBias * 0.4
-  let vote: AgentVote = "WAIT"
-  let confidence = Math.min(1, Math.abs(bias))
-  if (bias > 0.2) vote = "LONG"
-  else if (bias < -0.2) vote = "SHORT"
-  else confidence = 0
-  return { agentId: id, vote, confidence, reasoning: `FR=${fr.toFixed(5)} OI=${input.openInterest.toFixed(0)} LiqBias=${liqBias.toFixed(2)}`, metrics: { fr, liqBias, bias } }
+  const rets = logReturns(c.slice(-24))
+  const drift = mean(rets)
+  const driftScore = tanh(drift * 400) // realised trend
+  // Modest funding carry: persistent positive funding slightly favours continuation
+  // until it gets extreme (handled by absurdist). Here funding is a confirmation tilt.
+  const fundingScore = tanh(fr * 300) * 0.5
+
+  const score = clamp(driftScore * 0.7 + fundingScore * 0.3, -1, 1)
+  const { vote, confidence } = voteFromScore(score, 0.12)
+  return {
+    agentId: id,
+    vote,
+    confidence,
+    activity,
+    reasoning: `drift=${drift.toFixed(4)} funding=${fr.toFixed(5)} OI=${input.openInterest.toFixed(0)} score=${score.toFixed(2)}`,
+    metrics: { drift, funding: fr, score },
+  }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -492,95 +546,166 @@ async function economist(input: AgentInput): Promise<AgentOutput> {
 // ═══════════════════════════════════════════════════════════════════════════════
 async function dataEngineer(input: AgentInput): Promise<AgentOutput> {
   const id = "data_engineer"
+  const activity = "Validating data integrity (gaps, flatlines, spikes)"
   const candles = input.candles
-  if (candles.length === 0) return blockingVeto(id, "Missing candles data")
-  if (input.price <= 0) return blockingVeto(id, "Invalid price (<= 0.0)")
-  // Stale / flatline
+  if (candles.length === 0) return blockingVeto(id, "Missing candles data", activity)
+  if (input.price <= 0) return blockingVeto(id, "Invalid price (<= 0.0)", activity)
   if (candles.length >= 5) {
     const last = candles.length - 1
     let allSame = true
     for (let i = last - 4; i <= last; i++) {
       if (Math.abs(candles[i].close - input.price) > 1e-8) { allSame = false; break }
     }
-    if (allSame) return blockingVeto(id, "Stale data: flatline in last 5 candles")
+    if (allSame) return blockingVeto(id, "Stale data: flatline in last 5 candles", activity)
   }
-  // Single-candle spike anomaly
   const lc = candles[candles.length - 1]
   if (lc.open > 0) {
     const pct = Math.abs(lc.close - lc.open) / lc.open
-    if (pct > 0.15) return blockingVeto(id, "Data spike anomaly (>15% in single candle)")
+    if (pct > 0.15) return blockingVeto(id, "Data spike anomaly (>15% in single candle)", activity)
   }
-  return wait(id, "Data Sanitized & Validated")
+  return { agentId: id, vote: "WAIT", confidence: 0, activity, reasoning: "Data sanitised & validated — clear to trade", metrics: {} }
 }
 
-function blockingVeto(id: string, reason: string): AgentOutput {
-  return { agentId: id, vote: "VETO", confidence: 1, reasoning: `Blocking execution: ${reason}`, metrics: {}, flags: ["DATA_BLOCK"] }
+function blockingVeto(id: string, reason: string, activity: string): AgentOutput {
+  return { agentId: id, vote: "VETO", confidence: 1, activity, reasoning: `Blocking execution: ${reason}`, metrics: {}, flags: ["DATA_BLOCK"] }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// 10. DATA SCIENTIST — ML proxy via short-window z-score
+// 10. DATA SCIENTIST — linear-regression forecast (trend slope + fit quality)
 // ═══════════════════════════════════════════════════════════════════════════════
 async function dataScientist(input: AgentInput): Promise<AgentOutput> {
   const id = "data_scientist"
+  const activity = "Fitting least-squares regression channel & projecting next-bar drift"
   const c = input.closes
-  if (c.length === 0) return wait(id, "No data")
-  const recent = Math.min(10, c.length)
-  const slice = c.slice(c.length - recent)
-  const mean = slice.reduce((a, b) => a + b, 0) / recent
-  const std = Math.sqrt(slice.reduce((a, b) => a + (b - mean) ** 2, 0) / recent)
-  const z = std > 0 ? (input.price - mean) / std : 0
-  let vote: AgentVote = "WAIT"
-  if (z > 2) vote = "SHORT"
-  else if (z < -2) vote = "LONG"
-  else if (z > 0.5) vote = "LONG"
-  else if (z < -0.5) vote = "SHORT"
-  const confidence = vote === "WAIT" ? 0 : clamp(Math.abs(z) / 3, 0, 1)
-  return { agentId: id, vote, confidence, reasoning: `Z-score=${z.toFixed(2)} (ML proxy)`, metrics: { z } }
+  if (c.length < 20) return weakWait(id, "insufficient candles", activity)
+
+  const window = Math.min(30, c.length)
+  const slice = c.slice(c.length - window)
+  const { slope, r2 } = linreg(slice)
+  const px = mean(slice)
+  // Normalise slope to a per-bar % move, scale conviction by fit quality (R²).
+  const slopePct = px > 1e-9 ? (slope / px) * 100 : 0
+  const score = clamp(tanh(slopePct * 6) * (0.4 + 0.6 * r2), -1, 1)
+  const { vote, confidence } = voteFromScore(score, 0.12)
+
+  return {
+    agentId: id,
+    vote,
+    confidence,
+    activity,
+    reasoning: `slope=${slopePct.toFixed(3)}%/bar R²=${r2.toFixed(2)} score=${score.toFixed(2)}`,
+    metrics: { slopePct, r2, score },
+  }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// 11. STATISTICIAN — stat-arb proxy via LSR + funding
+// 11. STATISTICIAN — mean reversion: z-score extension + crowd positioning
 // ═══════════════════════════════════════════════════════════════════════════════
 async function statistician(input: AgentInput): Promise<AgentOutput> {
   const id = "statistician"
-  if (input.candles.length === 0) return wait(id, "No data")
-  const lsr = input.lsr
-  const funding = input.fundingRate
-  let vote: AgentVote = "WAIT"
-  let confidence = 0
-  if (lsr > 1.2 && funding > 0.0001) { vote = "SHORT"; confidence = 0.7 }
-  else if (lsr < 0.8 && funding < -0.0001) { vote = "LONG"; confidence = 0.7 }
-  else if (lsr > 1.05) { vote = "LONG"; confidence = 0.3 }
-  else if (lsr < 0.95) { vote = "SHORT"; confidence = 0.3 }
-  return { agentId: id, vote, confidence, reasoning: `LSR=${lsr.toFixed(2)} Funding=${funding.toFixed(4)}`, metrics: { lsr, funding } }
+  const activity = "Mean-reversion stats — z-score extension & long/short positioning"
+  const c = input.closes
+  if (c.length < 20) return weakWait(id, "insufficient candles", activity)
+
+  const z = zscore(c, 20)
+  // Fade extension toward the mean.
+  const revertScore = clamp(-tanh(z * 0.8), -1, 1)
+  // Positioning tilt: crowded longs (lsr>1) lean SHORT.
+  const lsr = Math.max(1e-6, input.lsr)
+  const posTilt = -tanh((lsr - 1) * 1.2) * 0.4
+
+  const score = clamp(revertScore * 0.75 + posTilt * 0.25, -1, 1)
+  const { vote, confidence } = voteFromScore(score, 0.15)
+  return {
+    agentId: id,
+    vote,
+    confidence,
+    activity,
+    reasoning: `Z=${z.toFixed(2)} (revert ${revertScore.toFixed(2)}) LSR=${lsr.toFixed(2)} score=${score.toFixed(2)}`,
+    metrics: { z, lsr, score },
+  }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// 12. PSYCHOLOGIST — market psychology via sentiment + news volume
+// 12. PSYCHOLOGIST — fear/greed from candle wicks (rejection) & volatility
 // ═══════════════════════════════════════════════════════════════════════════════
 async function psychologist(input: AgentInput): Promise<AgentOutput> {
   const id = "psychologist"
-  const sentiment = input.sentimentScore
-  const newsVol = input.newsCount
-  if (newsVol === 0 || Math.abs(sentiment) < 0.1) return wait(id, "Neutral or no sentiment data")
-  let confidence = clamp(Math.abs(sentiment), 0, 1)
-  const vote: AgentVote = sentiment > 0 ? "LONG" : "SHORT"
-  if (newsVol > 10) confidence = clamp(confidence + 0.2, 0, 1)
-  return { agentId: id, vote, confidence, reasoning: `Sentiment=${sentiment.toFixed(2)} from ${newsVol} sources`, metrics: { sentiment, newsVol } }
+  const activity = "Reading crowd fear/greed via wick rejection & volatility expansion"
+  const candles = input.candles
+  const n = candles.length
+  if (n < 10) return weakWait(id, "insufficient candles", activity)
+
+  const window = Math.min(12, n)
+  const recent = candles.slice(n - window)
+  let wickBias = 0
+  let wsum = 0
+  for (const c of recent) {
+    const top = c.high - Math.max(c.open, c.close) // upper wick = rejection of highs
+    const bot = Math.min(c.open, c.close) - c.low   // lower wick = rejection of lows
+    const range = c.high - c.low
+    if (range > 1e-9) {
+      // lower wick dominance → buyers defend (bullish); upper wick → sellers (bearish).
+      wickBias += ((bot - top) / range) * c.vol
+      wsum += c.vol
+    }
+  }
+  const bias = wsum > 1e-9 ? wickBias / wsum : 0
+
+  // Volatility expansion amplifies emotion (conviction), not direction.
+  const rets = logReturns(c2(recent))
+  const volNow = std(rets.slice(-5))
+  const volBase = std(rets)
+  const expansion = volBase > 1e-9 ? clamp(volNow / volBase, 0.5, 2) : 1
+
+  const score = clamp(tanh(bias * 2.5) * (0.6 + 0.2 * expansion), -1, 1)
+  const { vote, confidence } = voteFromScore(score, 0.12)
+  const mood = score > 0.3 ? "ACCUMULATION" : score < -0.3 ? "DISTRIBUTION" : "INDECISION"
+  return {
+    agentId: id,
+    vote,
+    confidence,
+    activity,
+    reasoning: `${mood}: wick_bias=${bias.toFixed(2)} vol_expansion=${expansion.toFixed(2)} score=${score.toFixed(2)}`,
+    metrics: { wickBias: bias, expansion, score },
+  }
+}
+
+function c2(candles: AgentInput["candles"]): number[] {
+  return candles.map((c) => c.close)
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// 13. ASTROPHYSICIST — whale "gravity" (inflow relative to OI)
+// 13. ASTROPHYSICIST — momentum "gravity": open-interest mass × price momentum
 // ═══════════════════════════════════════════════════════════════════════════════
 async function astrophysicist(input: AgentInput): Promise<AgentOutput> {
   const id = "astrophysicist"
-  if (input.candles.length === 0) return wait(id, "No data")
-  const gravity = input.whaleInflowUsd / Math.max(1, input.openInterest)
-  let vote: AgentVote = "WAIT"
-  if (gravity > 0.01) vote = "LONG"
-  else if (gravity < -0.01) vote = "SHORT"
-  const confidence = vote === "WAIT" ? 0 : clamp(Math.abs(gravity) * 10, 0, 0.85)
-  return { agentId: id, vote, confidence, reasoning: `Whale gravity ${gravity.toFixed(4)}`, metrics: { gravity } }
+  const activity = "Modelling momentum gravity — open-interest mass behind price drift"
+  const c = input.closes
+  if (c.length < 20) return weakWait(id, "insufficient candles", activity)
+
+  const ref = sma(c, 20)
+  const priceMom = ref > 1e-9 ? (input.price - ref) / ref : 0 // % above/below mean
+  // OI acts as "mass": more open interest ⇒ stronger conviction behind the move.
+  const oiUsd = input.openInterest * input.price
+  const massFactor = clamp(Math.log10(Math.max(10, oiUsd)) / 10, 0.4, 1)
+
+  const score = clamp(tanh(priceMom * 25) * massFactor, -1, 1)
+  const { vote, confidence } = voteFromScore(score, 0.12)
+  return {
+    agentId: id,
+    vote,
+    confidence,
+    activity,
+    reasoning: `price_mom=${(priceMom * 100).toFixed(2)}% OI_mass=${massFactor.toFixed(2)} score=${score.toFixed(2)}`,
+    metrics: { priceMom, massFactor, score },
+  }
+}
+
+// A "soft" wait used only when there is genuinely not enough data yet. Carries the
+// activity string so the UI still shows what the agent would be doing.
+function weakWait(agentId: string, reasoning: string, activity: string): AgentOutput {
+  return { agentId, vote: "WAIT", confidence: 0, activity, reasoning, metrics: {} }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════

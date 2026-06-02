@@ -13,6 +13,7 @@
 import { agentRegistry } from "./registry"
 import { registerBuiltinAgents } from "./builtin-agents"
 import { EXPECTED_AGENT_COUNT } from "./config"
+import { getEvolutionState } from "./self-evaluation"
 import type {
   AgentInput,
   AgentOutput,
@@ -46,8 +47,8 @@ type ProgressCallback = (progress: PipelineProgress) => void
 
 // Mirror of the Rust scalping StyleConfig defaults (consensus/mod.rs).
 const STYLE = {
-  minConfidence: 0.2,
-  minAgree: 1,
+  minConfidence: 0.15,
+  minAgree: 2,
   noiseVeto: 1.5,
   tpAtrMult: 1.2,
   slAtrMult: 1.0,
@@ -178,7 +179,18 @@ function calcEffectiveWeights(
   input: AgentInput,
 ): Map<string, number> {
   const ew = new Map<string, number>()
-  for (const a of agents) ew.set(a.id, a.weight)
+  // Base weight × learned multiplier. The self-evaluation layer raises the weight of
+  // agents that have been right against TP/SL and lowers the ones that have been wrong,
+  // so the team improves itself over time without manual tuning.
+  const evo = getEvolutionState()
+  for (const a of agents) {
+    const learned = evo.agents[a.id]?.tunables.weight
+    // tunables.weight is an absolute learned weight (defaults to the agent's base
+    // weight on first sight); blend it with the config base so a fresh agent starts
+    // at its configured weight and drifts toward what it has earned.
+    const eff = learned !== undefined ? (a.weight + learned) / 2 : a.weight
+    ew.set(a.id, eff)
+  }
 
   // Absurdist conflicting with EMA trend → damp
   const ema9 = ema(input.closes, 9)
@@ -242,54 +254,52 @@ function buildConsensus(
 ): TeamConsensus {
   const last = input.price || input.closes[input.closes.length - 1] || 0
 
+  // Full vote tally for transparency (every agent counts toward the headline).
+  const votes = { long: 0, short: 0, hold: 0, veto: 0 }
+  for (const o of outputs) {
+    if (o.vote === "LONG") votes.long++
+    else if (o.vote === "SHORT") votes.short++
+    else if (o.vote === "VETO") votes.veto++
+    else votes.hold++
+  }
+
+  // ── DECISION = VETO ────────────────────────────────────────────────────────
+  // A gatekeeper/risk veto hard-blocks the trade regardless of the directional poll.
   if (veto.vetoed) {
     return {
+      decision: "VETO",
       signal: "WAIT",
       confidence: 0,
+      votes,
       agreeingAgents: [],
       dissentingAgents: [],
       vetoAgents: veto.agents,
-      reasoning: `VETO triggered: ${veto.reason}`,
+      reasoning: `VETO by ${veto.agents.join(", ")}: ${veto.reason}`,
       entry: last,
       tp: last,
       sl: last,
     }
   }
 
+  // ── DECISION = VOTED ─────────────────────────────────────────────────────────
+  // Weighted directional poll across every agent that cast a directional vote.
   let score = 0
   let activeW = 0
-  let buyCount = 0
-  let sellCount = 0
   for (const o of outputs) {
     if (o.vote !== "LONG" && o.vote !== "SHORT") continue
     const w = weights.get(o.agentId) ?? 0.05
     const sign = o.vote === "LONG" ? 1 : -1
-    if (sign > 0) buyCount++
-    else sellCount++
     score += w * o.confidence * sign
     activeW += w
   }
-
-  if (activeW <= 0.05) {
-    return {
-      signal: "WAIT",
-      confidence: 0,
-      agreeingAgents: [],
-      dissentingAgents: [],
-      vetoAgents: [],
-      reasoning: "Team deadlocked / waiting for a clearer setup",
-      entry: last,
-      tp: last,
-      sl: last,
-    }
-  }
-  score /= activeW
+  if (activeW > 0.001) score /= activeW
   const confidence = Math.min(1, Math.abs(score))
 
+  // The voted direction follows the weighted score + a simple majority check.
   let signal: AgentVote = "WAIT"
   if (confidence >= STYLE.minConfidence) {
-    if (score > 0 && buyCount >= STYLE.minAgree) signal = "LONG"
-    else if (score < 0 && sellCount >= STYLE.minAgree) signal = "SHORT"
+    if (score > 0 && votes.long >= STYLE.minAgree && votes.long >= votes.short) signal = "LONG"
+    else if (score < 0 && votes.short >= STYLE.minAgree && votes.short >= votes.long) signal = "SHORT"
   }
 
   const agreeingAgents = outputs.filter((o) => o.vote === signal).map((o) => o.agentId)
@@ -320,12 +330,14 @@ function buildConsensus(
     .map((o) => `${o.agentId}: ${o.reasoning}`)
   const reasoning =
     signal === "WAIT"
-      ? `No consensus (score=${score.toFixed(3)}, conf=${confidence.toFixed(3)} < ${STYLE.minConfidence})`
-      : `${signal} consensus (score=${score.toFixed(3)}) — ${topReasons.join(" | ")}`
+      ? `VOTED HOLD — no directional majority (L:${votes.long} S:${votes.short}, score=${score.toFixed(2)})`
+      : `VOTED ${signal} (L:${votes.long} S:${votes.short}, score=${score.toFixed(2)}) — ${topReasons.join(" | ")}`
 
   return {
+    decision: "VOTED",
     signal,
     confidence: Number(confidence.toFixed(3)),
+    votes,
     agreeingAgents,
     dissentingAgents,
     vetoAgents: [],
@@ -338,8 +350,10 @@ function buildConsensus(
 
 function emptyConsensus(reason: string, price: number): TeamConsensus {
   return {
+    decision: "VETO",
     signal: "WAIT",
     confidence: 0,
+    votes: { long: 0, short: 0, hold: 0, veto: 0 },
     agreeingAgents: [],
     dissentingAgents: [],
     vetoAgents: [],

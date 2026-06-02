@@ -76,6 +76,8 @@ export interface AgentOutput {
   reasoning: string
   metrics: Record<string, number>
   flags?: string[]
+  /** Short human-readable description of what the agent is currently analysing. */
+  activity?: string
 }
 
 // Pipeline progress tracking — ensures we don't stop at 2/3
@@ -166,10 +168,21 @@ export interface AgentState {
   lastReport?: SelfEvaluationReport | null
 }
 
+// Vote tally across the whole team (transparency for the UI).
+export interface VoteTally {
+  long: number
+  short: number
+  hold: number
+  veto: number
+}
+
 // Aggregated consensus from all agents
 export interface TeamConsensus {
+  /** Final decision model: the team either VOTED (a tradeable verdict) or was VETO'd (blocked). */
+  decision: "VOTED" | "VETO"
   signal: AgentVote
   confidence: number
+  votes: VoteTally
   agreeingAgents: string[]
   dissentingAgents: string[]
   vetoAgents: string[]
