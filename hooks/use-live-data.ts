@@ -104,7 +104,7 @@ export interface DryRunConfig {
 
 // ---- Mode & exchange configuration -------------------------------------
 
-export type CexId = "binance" | "bybit" | "okx"
+export type CexId = "binance" | "bybit" | "okx" | "mexc"
 export type TradingStyle = "scalp" | "intraday" | "swing"
 export type MarginMode = "isolated" | "cross"
 
@@ -176,6 +176,17 @@ const DEFAULT_TRADING_SETTINGS: TradingSettings = {
       marginUsagePct: 10,
       defaultLeverage: 3,
       pairLeverage: [],
+    },
+    {
+      id: "mexc",
+      label: "MEXC",
+      enabled: false,
+      apiKeyEnv: "MEXC_API_KEY",
+      apiSecretEnv: "MEXC_API_SECRET",
+      marginMode: "cross",
+      marginUsagePct: 10,
+      defaultLeverage: 5,
+      pairLeverage: [{ pair: "BTCUSDT", leverage: 10 }],
     },
   ],
 }
