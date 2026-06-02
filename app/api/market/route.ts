@@ -22,7 +22,7 @@ const SYMBOLS: { symbol: string; base: string }[] = [
   { symbol: "LINKUSDT", base: "LINK" },
 ]
 
-const OKX = "https://www.okx.com"
+const OKX = (process.env.MARKET_API_BASE || "https://www.okx.com").replace(/\/$/, "")
 
 async function okx(path: string): Promise<any | null> {
   try {
