@@ -2,6 +2,8 @@
 
 import { useEffect, useMemo, useRef, useState } from "react"
 import {
+  CalendarRange,
+  Clock,
   Database,
   Gauge,
   History,
@@ -17,7 +19,7 @@ import { Panel, Tag, Meter } from "./ui-kit"
 import { cn } from "@/lib/utils"
 import { num, usd } from "@/lib/format"
 import type { BacktestResult, ReplayChart, ReplayMarker } from "@/lib/backtest"
-import type { TradingSettings } from "@/hooks/use-live-data"
+import type { BacktestRunOptions, TradingSettings, Timeframe } from "@/hooks/use-live-data"
 
 // How many candles the replay cursor advances per tick.
 const STEP_OPTIONS = [1, 2, 5, 10, 25] as const
@@ -28,6 +30,30 @@ const BASE_TICK_MS = 240
 // How many candles are visible in the chart window at once (TradingView-style scroll).
 const VISIBLE_BARS = 90
 
+// Candle timeframes the user can backtest on (mapped to real exchange intervals).
+const TIMEFRAME_OPTIONS: { value: Timeframe; label: string }[] = [
+  { value: "15m", label: "15m" },
+  { value: "1h", label: "1H" },
+  { value: "4h", label: "4H" },
+  { value: "1d", label: "1D" },
+]
+
+// Lookback windows (in days) that scope how much history feeds the backtest.
+// Larger windows (months/years) only pull as much real history as the exchange
+// kline feed allows — finer timeframes saturate sooner, daily candles reach
+// furthest back.
+const PERIOD_OPTIONS: { value: number; label: string }[] = [
+  { value: 3, label: "3D" },
+  { value: 7, label: "7D" },
+  { value: 14, label: "14D" },
+  { value: 30, label: "30D" },
+  { value: 90, label: "90D" },
+  { value: 180, label: "6M" },
+  { value: 365, label: "1Y" },
+  { value: 730, label: "2Y" },
+  { value: 1095, label: "3Y" },
+]
+
 type ReplayPhase = "idle" | "loading" | "running" | "paused" | "done"
 
 export function BacktestPanel({
@@ -36,17 +62,47 @@ export function BacktestPanel({
   runBacktest,
   clearBacktests,
   tradingSettings,
+  selectedSymbol,
+  pairs,
 }: {
   backtests: BacktestResult[]
   isBacktesting: boolean
-  runBacktest: () => Promise<BacktestResult>
+  runBacktest: (opts?: BacktestRunOptions) => Promise<BacktestResult>
   clearBacktests: () => void
   /** Read-only — sourced from the Mode & Settings tab (no duplicate inputs here). */
   tradingSettings: TradingSettings
+  /** The pair currently selected/analysed in the app — the backtest focuses on it. */
+  selectedSymbol: string
+  /** Live, real pair universe of the active exchange (for the focus-pair picker). */
+  pairs: string[]
 }) {
   // ── Replay setup (the only settings owned by this tab) ──
   const [stepInterval, setStepInterval] = useState<number>(1)
   const [speed, setSpeed] = useState<number>(1)
+
+  // ── Data window owned by this tab: candle timeframe + lookback period + the
+  // focused pair. These define EXACTLY which real candles feed the backtest. ──
+  const [timeframe, setTimeframe] = useState<Timeframe>("1h")
+  const [periodDays, setPeriodDays] = useState<number>(14)
+  const [focusSymbol, setFocusSymbol] = useState<string>(selectedSymbol)
+
+  // Keep the focus pair in sync with the app's selected pair until the user
+  // explicitly overrides it here. We track whether the user touched the picker.
+  const userPickedRef = useRef(false)
+  useEffect(() => {
+    if (!userPickedRef.current && selectedSymbol) setFocusSymbol(selectedSymbol)
+  }, [selectedSymbol])
+
+  // If the focused pair isn't part of the live universe (e.g. exchange switched),
+  // snap back to the app's selected pair so we never request a stale/dummy pair.
+  useEffect(() => {
+    if (pairs.length === 0) return
+    const listed = pairs.some((p) => p.toUpperCase() === focusSymbol.toUpperCase())
+    if (!listed) {
+      userPickedRef.current = false
+      setFocusSymbol(selectedSymbol || pairs[0])
+    }
+  }, [pairs, focusSymbol, selectedSymbol])
 
   // ── Replay runtime ──
   const [phase, setPhase] = useState<ReplayPhase>("idle")
@@ -116,7 +172,7 @@ export function BacktestPanel({
     setError(null)
     setPhase("loading")
     try {
-      const result = await runBacktest()
+      const result = await runBacktest({ timeframe, periodDays, focusSymbol })
       setActive(result)
       const rep = result.replay
       if (rep && rep.bars.length > rep.warmup + 1) {
@@ -190,6 +246,120 @@ export function BacktestPanel({
           <Tag tone="outline">LEV {activeCex?.defaultLeverage ?? "—"}×</Tag>
           <Tag tone="primary">RISK {tradingSettings.riskModel.preset.toUpperCase()}</Tag>
           <Tag tone="muted">RR 1:{tradingSettings.riskModel.riskReward}</Tag>
+        </div>
+
+        {/* ── Backtest data window: pair + timeframe + lookback period ──
+            These define EXACTLY which real candles feed the backtest. */}
+        <div className="grid grid-cols-1 gap-3 rounded-md border border-border bg-background p-3">
+          {/* Focus pair — defaults to the app's selected pair, real universe only */}
+          <div className="flex flex-col gap-1.5">
+            <span className="flex items-center gap-1 text-[10px] uppercase tracking-wider text-muted-foreground">
+              <Database className="h-3 w-3" />
+              Pair
+              <span className="text-muted-foreground/70">(real candles)</span>
+            </span>
+            <div className="flex flex-wrap items-center gap-2">
+              <select
+                value={focusSymbol}
+                disabled={running || paused || loading || pairs.length === 0}
+                onChange={(e) => {
+                  userPickedRef.current = true
+                  setFocusSymbol(e.target.value)
+                }}
+                className="rounded border border-border bg-panel px-2 py-1 font-mono text-xs text-foreground disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                {pairs.length === 0 && <option value={focusSymbol}>{focusSymbol.replace("USDT", "/USDT")}</option>}
+                {pairs.map((p) => (
+                  <option key={p} value={p}>
+                    {p.replace("USDT", "/USDT")}
+                  </option>
+                ))}
+              </select>
+              {focusSymbol.toUpperCase() === selectedSymbol.toUpperCase() ? (
+                <Tag tone="primary">APP SELECTED</Tag>
+              ) : (
+                <button
+                  type="button"
+                  onClick={() => {
+                    userPickedRef.current = false
+                    setFocusSymbol(selectedSymbol)
+                  }}
+                  disabled={running || paused || loading}
+                  className="rounded border border-border px-2 py-1 text-[10px] font-semibold text-muted-foreground transition-colors hover:border-primary/50 hover:text-primary disabled:cursor-not-allowed disabled:opacity-50"
+                >
+                  Use app pair ({selectedSymbol.replace("USDT", "")})
+                </button>
+              )}
+            </div>
+          </div>
+
+          <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+            {/* Candle timeframe */}
+            <div className="flex flex-col gap-1.5">
+              <span className="flex items-center gap-1 text-[10px] uppercase tracking-wider text-muted-foreground">
+                <Clock className="h-3 w-3" />
+                Candle Timeframe
+              </span>
+              <div className="flex flex-wrap gap-1">
+                {TIMEFRAME_OPTIONS.map((tf) => (
+                  <button
+                    key={tf.value}
+                    type="button"
+                    onClick={() => setTimeframe(tf.value)}
+                    disabled={running || paused || loading}
+                    className={cn(
+                      "min-w-9 rounded border px-2 py-1 font-mono text-xs font-semibold transition-colors",
+                      timeframe === tf.value
+                        ? "border-primary bg-primary/15 text-primary"
+                        : "border-border text-muted-foreground hover:border-primary/50 hover:text-primary",
+                      (running || paused || loading) && "cursor-not-allowed opacity-50",
+                    )}
+                  >
+                    {tf.label}
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            {/* Lookback period */}
+            <div className="flex flex-col gap-1.5">
+              <span className="flex items-center gap-1 text-[10px] uppercase tracking-wider text-muted-foreground">
+                <CalendarRange className="h-3 w-3" />
+                Backtest Period
+                <span className="text-muted-foreground/70">(lookback)</span>
+              </span>
+              <div className="flex flex-wrap gap-1">
+                {PERIOD_OPTIONS.map((p) => (
+                  <button
+                    key={p.value}
+                    type="button"
+                    onClick={() => setPeriodDays(p.value)}
+                    disabled={running || paused || loading}
+                    className={cn(
+                      "min-w-9 rounded border px-2 py-1 font-mono text-xs font-semibold transition-colors",
+                      periodDays === p.value
+                        ? "border-primary bg-primary/15 text-primary"
+                        : "border-border text-muted-foreground hover:border-primary/50 hover:text-primary",
+                      (running || paused || loading) && "cursor-not-allowed opacity-50",
+                    )}
+                  >
+                    {p.label}
+                  </button>
+                ))}
+              </div>
+            </div>
+          </div>
+
+          <p className="text-[10px] leading-relaxed text-muted-foreground">
+            Backtesting{" "}
+            <span className="font-semibold text-foreground">{focusSymbol.replace("USDT", "/USDT")}</span> on{" "}
+            <span className="font-semibold text-foreground">
+              {TIMEFRAME_OPTIONS.find((t) => t.value === timeframe)?.label}
+            </span>{" "}
+            candles over the last{" "}
+            <span className="font-semibold text-foreground">{periodDays} days</span> of real history. The full pair
+            universe is still scanned for portfolio stats; the chart replays this pair.
+          </p>
         </div>
 
         {/* ── Replay setup: step interval + playback speed ── */}
@@ -338,7 +508,7 @@ export function BacktestPanel({
             <div className="flex flex-wrap items-center justify-between gap-2">
               <div className="flex items-center gap-2">
                 <span className="font-mono text-sm font-bold text-foreground">{replay.symbol}</span>
-                <Tag tone="muted">1H</Tag>
+                <Tag tone="muted">{TIMEFRAME_OPTIONS.find((t) => t.value === replay.timeframe)?.label ?? replay.timeframe}</Tag>
                 <Tag tone="outline">{replay.leverage}×</Tag>
                 {view.open && (
                   <Tag tone={view.open.side === "LONG" ? "positive" : "negative"}>{view.open.side} OPEN</Tag>
@@ -415,6 +585,8 @@ export function BacktestPanel({
                   <span className="text-muted-foreground">{new Date(bt.ranAt).toLocaleString("en-US")}</span>
                   <span className="font-mono">
                     {bt.cexLabel} · {bt.style}
+                    {bt.timeframe ? ` · ${TIMEFRAME_OPTIONS.find((t) => t.value === bt.timeframe)?.label ?? bt.timeframe}` : ""}
+                    {bt.periodDays ? ` · ${bt.periodDays}D` : ""}
                   </span>
                   <span
                     className={cn("font-mono font-semibold", bt.netPnlPct >= 0 ? "text-positive" : "text-negative")}

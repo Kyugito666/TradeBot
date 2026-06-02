@@ -12,6 +12,33 @@
 
 export type CexId = "mexc" | "binance" | "bybit" | "bitget" | "gateio" | "okx"
 
+// Candle timeframes supported across every exchange. The app/backtest pick ONE
+// of these; each adapter maps it to that venue's native interval string below.
+export type Timeframe = "15m" | "1h" | "4h" | "1d"
+
+// Milliseconds per bar — used to label replay periods and to translate a
+// lookback window (in days) into a candle count.
+export const TIMEFRAME_MS: Record<Timeframe, number> = {
+  "15m": 15 * 60_000,
+  "1h": 60 * 60_000,
+  "4h": 4 * 60 * 60_000,
+  "1d": 24 * 60 * 60_000,
+}
+
+// Per-exchange native interval strings for each supported timeframe.
+const TF_NATIVE: Record<CexId, Record<Timeframe, string>> = {
+  okx: { "15m": "15m", "1h": "1H", "4h": "4H", "1d": "1D" },
+  binance: { "15m": "15m", "1h": "1h", "4h": "4h", "1d": "1d" },
+  bybit: { "15m": "15", "1h": "60", "4h": "240", "1d": "D" },
+  bitget: { "15m": "15m", "1h": "1H", "4h": "4H", "1d": "1D" },
+  gateio: { "15m": "15m", "1h": "1h", "4h": "4h", "1d": "1d" },
+  mexc: { "15m": "Min15", "1h": "Min60", "4h": "Hour4", "1d": "Day1" },
+}
+
+function tfNative(cex: CexId, tf: Timeframe): string {
+  return TF_NATIVE[cex][tf] ?? TF_NATIVE[cex]["1h"]
+}
+
 export interface TickerLite {
   /** Canonical app symbol, always BASE+USDT (e.g. "BTCUSDT"). */
   symbol: string
@@ -103,8 +130,11 @@ const okx = {
     }
     return out
   },
-  async fetchCandles(native: string, limit = 100): Promise<Candles | null> {
-    const j = await getJson(`${base("okx")}/api/v5/market/candles?instId=${native}&bar=1H&limit=${limit}`, 60)
+  async fetchCandles(native: string, limit = 100, tf: Timeframe = "1h"): Promise<Candles | null> {
+    const j = await getJson(
+      `${base("okx")}/api/v5/market/candles?instId=${native}&bar=${tfNative("okx", tf)}&limit=${limit}`,
+      60,
+    )
     const data = j?.code === "0" ? j.data : null
     if (!Array.isArray(data) || data.length === 0) return null
     const rows = [...data].reverse() // newest-first → chronological
@@ -151,8 +181,11 @@ const binance = {
     }
     return out
   },
-  async fetchCandles(native: string, limit = 100): Promise<Candles | null> {
-    const data = await getJson(`${base("binance")}/fapi/v1/klines?symbol=${native}&interval=1h&limit=${limit}`, 60)
+  async fetchCandles(native: string, limit = 100, tf: Timeframe = "1h"): Promise<Candles | null> {
+    const data = await getJson(
+      `${base("binance")}/fapi/v1/klines?symbol=${native}&interval=${tfNative("binance", tf)}&limit=${limit}`,
+      60,
+    )
     if (!Array.isArray(data) || data.length === 0) return null
     return mapRows(data, 1, 2, 3, 4, 5)
   },
@@ -194,8 +227,11 @@ const bybit = {
     }
     return out
   },
-  async fetchCandles(native: string, limit = 100): Promise<Candles | null> {
-    const j = await getJson(`${base("bybit")}/v5/market/kline?category=linear&symbol=${native}&interval=60&limit=${limit}`, 60)
+  async fetchCandles(native: string, limit = 100, tf: Timeframe = "1h"): Promise<Candles | null> {
+    const j = await getJson(
+      `${base("bybit")}/v5/market/kline?category=linear&symbol=${native}&interval=${tfNative("bybit", tf)}&limit=${limit}`,
+      60,
+    )
     const list = j?.result?.list
     if (!Array.isArray(list) || list.length === 0) return null
     const rows = [...list].reverse() // newest-first → chronological
@@ -238,9 +274,9 @@ const bitget = {
     }
     return out
   },
-  async fetchCandles(native: string, limit = 100): Promise<Candles | null> {
+  async fetchCandles(native: string, limit = 100, tf: Timeframe = "1h"): Promise<Candles | null> {
     const data = (await getJson(
-      `${base("bitget")}/api/v2/mix/market/candles?symbol=${native}&productType=USDT-FUTURES&granularity=1H&limit=${limit}`,
+      `${base("bitget")}/api/v2/mix/market/candles?symbol=${native}&productType=USDT-FUTURES&granularity=${tfNative("bitget", tf)}&limit=${limit}`,
       60,
     ))?.data
     if (!Array.isArray(data) || data.length === 0) return null
@@ -282,9 +318,9 @@ const gateio = {
     }
     return out
   },
-  async fetchCandles(native: string, limit = 100): Promise<Candles | null> {
+  async fetchCandles(native: string, limit = 100, tf: Timeframe = "1h"): Promise<Candles | null> {
     const data = await getJson(
-      `${base("gateio")}/api/v4/futures/usdt/candlesticks?contract=${native}&interval=1h&limit=${limit}`,
+      `${base("gateio")}/api/v4/futures/usdt/candlesticks?contract=${native}&interval=${tfNative("gateio", tf)}&limit=${limit}`,
       60,
     )
     if (!Array.isArray(data) || data.length === 0) return null
@@ -338,8 +374,8 @@ const mexc = {
     }
     return out
   },
-  async fetchCandles(native: string, limit = 100): Promise<Candles | null> {
-    const j = await getJson(`${base("mexc")}/api/v1/contract/kline/${native}?interval=Min60`, 60)
+  async fetchCandles(native: string, limit = 100, tf: Timeframe = "1h"): Promise<Candles | null> {
+    const j = await getJson(`${base("mexc")}/api/v1/contract/kline/${native}?interval=${tfNative("mexc", tf)}`, 60)
     const d = j?.data
     if (!d || !Array.isArray(d.close) || d.close.length === 0) return null
     const take = (arr: any[]) => (Array.isArray(arr) ? arr.slice(-limit).map(num) : [])
@@ -383,7 +419,7 @@ function sumDepth(levels: any): number {
 export interface ExchangeAdapter {
   id: CexId
   fetchTickers(): Promise<TickerLite[]>
-  fetchCandles(native: string, limit?: number): Promise<Candles | null>
+  fetchCandles(native: string, limit?: number, tf?: Timeframe): Promise<Candles | null>
   fetchExtras(b: string, native: string, price: number): Promise<Partial<Extras>>
 }
 

@@ -6,6 +6,7 @@ import type { Consensus, MarketResponse, MarketRow, Snapshot } from "@/lib/types
 import { pollEngine, startEngine, stopEngine, type EngineSnapshot } from "@/lib/engine"
 import { localStore } from "@/lib/local-store"
 import type { BacktestResult, PairStat } from "@/lib/backtest"
+import type { Timeframe } from "@/lib/exchanges"
 import {
   buildConsensus,
   buildPerformance,
@@ -106,6 +107,21 @@ export interface DryRunConfig {
   initialBalance: number
   riskPerTrade: number // As decimal (0.02 = 2%)
 }
+
+// Options passed when the user runs a backtest from the Backtest tab. They scope
+// the run to a candle timeframe + lookback period and a focused pair.
+export interface BacktestRunOptions {
+  /** Candle timeframe (15m / 1h / 4h / 1d). */
+  timeframe?: Timeframe
+  /** Lookback window in days that determines how much history is replayed. */
+  periodDays?: number
+  /** Pair to focus the replay chart on (defaults to the app's selected pair). */
+  focusSymbol?: string
+}
+
+// Re-export so UI components can type their timeframe state without reaching
+// into the exchange layer directly.
+export type { Timeframe }
 
 // ---- Mode & exchange configuration -------------------------------------
 
@@ -608,12 +624,16 @@ export function useLiveData() {
   // Runs a REAL replay on the server over historical candles of the active CEX's
   // pairs, using the same signal + TP/SL strategy as the Signals/Consensus tabs.
   // The resulting per-pair stats are stored and shared back into those tabs.
-  const runBacktest = useCallback(async () => {
+  const runBacktest = useCallback(async (opts?: BacktestRunOptions) => {
     setIsBacktesting(true)
     try {
       const cex = tradingSettings.cexes.find((c) => c.id === tradingSettings.activeCex) ?? tradingSettings.cexes[0]
       const pairLeverage: Record<string, number> = {}
       for (const p of cex?.pairLeverage ?? []) pairLeverage[p.pair.toUpperCase()] = p.leverage
+
+      // The replay chart focuses on the pair the user is actively looking at in
+      // the app (analysisSymbol) unless the Backtest tab overrides it.
+      const focusSymbol = opts?.focusSymbol || analysisSymbol
 
       const res = await fetch("/api/backtest", {
         method: "POST",
@@ -631,6 +651,9 @@ export function useLiveData() {
           defaultLeverage: cex?.defaultLeverage,
           pairLeverage,
           symbols: snapshot.market.map((m) => m.symbol),
+          timeframe: opts?.timeframe ?? "1h",
+          periodDays: opts?.periodDays ?? 12,
+          focusSymbol,
         }),
       })
       const json = await res.json()
@@ -647,7 +670,7 @@ export function useLiveData() {
     } finally {
       setIsBacktesting(false)
     }
-  }, [tradingSettings, dryRunConfig, snapshot.market])
+  }, [tradingSettings, dryRunConfig, snapshot.market, analysisSymbol])
 
   const clearBacktests = useCallback(() => {
     setBacktests([])
