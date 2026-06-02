@@ -17,7 +17,10 @@ export const maxDuration = 60
 // Hard cap on candles requested per pair so a manual backtest stays responsive
 // regardless of the chosen period/timeframe. Most venues cap their kline feed
 // near this anyway.
-const MAX_CANDLES = 1000
+// Most venues cap their kline feed near 1500 candles per request; we request up
+// to that so longer (multi-year) lookback windows pull as much real history as
+// the exchange will give. Daily candles reach furthest back at this cap.
+const MAX_CANDLES = 1500
 const MIN_CANDLES = 60
 const SCAN_CONCURRENCY = 12
 const SCAN_BUDGET_MS = 45_000
@@ -75,7 +78,7 @@ export async function POST(request: Request) {
   const timeframe: Timeframe = VALID_TIMEFRAMES.includes(body.timeframe as Timeframe)
     ? (body.timeframe as Timeframe)
     : "1h"
-  const periodDays = clampNum(body.periodDays ?? 12, 1, 365)
+  const periodDays = clampNum(body.periodDays ?? 12, 1, 1095)
   const barsPerDay = 86_400_000 / TIMEFRAME_MS[timeframe]
   const candleLimit = Math.max(MIN_CANDLES, Math.min(MAX_CANDLES, Math.ceil(periodDays * barsPerDay)))
   const focusSymbol = body.focusSymbol?.toUpperCase()

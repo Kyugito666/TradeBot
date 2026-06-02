@@ -39,12 +39,19 @@ const TIMEFRAME_OPTIONS: { value: Timeframe; label: string }[] = [
 ]
 
 // Lookback windows (in days) that scope how much history feeds the backtest.
+// Larger windows (months/years) only pull as much real history as the exchange
+// kline feed allows — finer timeframes saturate sooner, daily candles reach
+// furthest back.
 const PERIOD_OPTIONS: { value: number; label: string }[] = [
   { value: 3, label: "3D" },
   { value: 7, label: "7D" },
   { value: 14, label: "14D" },
   { value: 30, label: "30D" },
   { value: 90, label: "90D" },
+  { value: 180, label: "6M" },
+  { value: 365, label: "1Y" },
+  { value: 730, label: "2Y" },
+  { value: 1095, label: "3Y" },
 ]
 
 type ReplayPhase = "idle" | "loading" | "running" | "paused" | "done"
