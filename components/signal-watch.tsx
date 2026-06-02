@@ -12,6 +12,28 @@ function sigTone(s: string) {
   return s === "LONG" ? "positive" : s === "SHORT" ? "negative" : "warning"
 }
 
+// Only the markets that actually matter are surfaced in the Overview so the
+// table stays compact. Each entry has a clean display label plus the set of
+// base-symbol aliases used by the various exchange feeds.
+const WATCHLIST: { label: string; aliases: string[] }[] = [
+  { label: "BTC", aliases: ["BTC", "XBT"] },
+  { label: "OIL", aliases: ["OIL", "WTI", "USOIL", "CRUDE"] },
+  { label: "GOLD", aliases: ["GOLD", "XAU", "PAXG"] },
+  { label: "S&P 500", aliases: ["SPX", "SP500", "SPX500", "US500", "SP"] },
+]
+
+function baseSymbol(symbol: string) {
+  return symbol.replace(/USDT$/i, "").replace(/[-_].*/, "").toUpperCase()
+}
+
+// Reduce the full market scan to just the watchlist, in the order declared above.
+function buildWatchRows(market: MarketRow[]) {
+  return WATCHLIST.map(({ label, aliases }) => {
+    const row = market.find((m) => aliases.includes(baseSymbol(m.symbol)))
+    return row ? { label, row } : null
+  }).filter((x): x is { label: string; row: MarketRow } => x !== null)
+}
+
 export function SignalWatch({
   market,
   marketOnline,
@@ -19,6 +41,7 @@ export function SignalWatch({
   market: MarketRow[]
   marketOnline: boolean
 }) {
+  const watchRows = buildWatchRows(market)
   return (
     <Panel
       title="Signal & Strategy Overview"
@@ -47,11 +70,11 @@ export function SignalWatch({
           </tr>
         </thead>
         <tbody>
-          {market.map((m) => {
+          {watchRows.map(({ label, row: m }) => {
             const up = m.pct24h >= 0
             return (
               <tr key={m.symbol} className="border-t border-border/60 transition-colors hover:bg-muted/40">
-                <td className="px-3 py-2 font-mono font-semibold text-foreground">{m.symbol.replace("USDT", "")}<span className="text-muted-foreground">/USDT</span></td>
+                <td className="px-3 py-2 font-mono font-semibold text-foreground">{label}</td>
                 <td className="px-2 py-2 text-right font-mono tabular text-foreground">{num(m.lastPrice, m.lastPrice < 1 ? 4 : 2)}</td>
                 <td className={cn("px-2 py-2 text-right font-mono tabular", up ? "text-positive" : "text-negative")}>{pct(m.pct24h)}</td>
                 <td className="px-2 py-2 text-center">
@@ -84,10 +107,10 @@ export function SignalWatch({
               </tr>
             )
           })}
-          {market.length === 0 && (
+          {watchRows.length === 0 && (
             <tr>
               <td colSpan={11} className="px-3 py-8 text-center text-xs text-muted-foreground">
-                {marketOnline ? "No market rows." : "Loading live market data…"}
+                {marketOnline ? "No watchlist markets available." : "Loading live market data…"}
               </td>
             </tr>
           )}
