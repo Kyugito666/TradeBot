@@ -1,7 +1,8 @@
 "use client"
 
+import { Boxes } from "lucide-react"
 import type { Position } from "@/lib/types"
-import { Panel, Tag } from "./ui-kit"
+import { Panel, Tag, EmptyState } from "./ui-kit"
 import { num, pct, usd } from "@/lib/format"
 import { cn } from "@/lib/utils"
 
@@ -71,10 +72,16 @@ export function PositionsTable({
           })}
           {positions.length === 0 && (
             <tr>
-              <td colSpan={9} className="px-3 py-8 text-center text-xs text-muted-foreground">
-                {engineOnline
-                  ? "No open positions — engine waiting for consensus."
-                  : "Engine offline — start your local TradeBot engine to see live positions."}
+              <td colSpan={9} className="p-0">
+                <EmptyState
+                  icon={Boxes}
+                  title={engineOnline ? "No open positions" : "Engine offline"}
+                  hint={
+                    engineOnline
+                      ? "The engine is waiting for a consensus signal before opening a trade."
+                      : "Start your local TradeBot engine to stream live positions here."
+                  }
+                />
               </td>
             </tr>
           )}

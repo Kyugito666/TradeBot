@@ -2,7 +2,7 @@
 
 import { Ban, CheckCircle2, Gavel, Loader2, Minus, TrendingDown, TrendingUp } from "lucide-react"
 import type { PendingForecast, TeamConsensus } from "@/hooks/use-live-data"
-import { Panel, Tag, Meter } from "./ui-kit"
+import { Panel, Tag, Meter, LoadingState } from "./ui-kit"
 import { num } from "@/lib/format"
 import { cn } from "@/lib/utils"
 
@@ -24,9 +24,8 @@ export function AgentConsensusPanel({
 }) {
   if (!consensus) {
     return (
-      <Panel title="Final Decision" className={className} bodyClassName="flex flex-col items-center justify-center gap-2 p-6 text-center">
-        <Loader2 className="h-6 w-6 animate-spin text-muted-foreground" />
-        <p className="text-xs text-muted-foreground">Polling the agent team for a verdict…</p>
+      <Panel title="Final Decision" className={className}>
+        <LoadingState label="Polling the agent team for a verdict…" />
       </Panel>
     )
   }

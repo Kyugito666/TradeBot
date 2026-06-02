@@ -11,7 +11,7 @@ import {
   Shield,
   Activity
 } from "lucide-react"
-import { Panel, Tag, Meter } from "./ui-kit"
+import { Panel, Tag, Meter, LoadingState } from "./ui-kit"
 import { cn } from "@/lib/utils"
 
 export interface PipelineProgress {
@@ -62,10 +62,7 @@ export function AnalysisProgress({
   if (!progress) {
     return (
       <Panel title="Analysis Pipeline" className={className}>
-        <div className="flex items-center justify-center p-6 text-muted-foreground">
-          <Loader2 className="h-5 w-5 animate-spin mr-2" />
-          <span className="text-sm">Initializing pipeline...</span>
-        </div>
+        <LoadingState label="Initializing pipeline…" />
       </Panel>
     )
   }

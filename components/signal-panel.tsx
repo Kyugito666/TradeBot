@@ -2,8 +2,11 @@
 
 import {
   Crosshair,
+  History,
+  Inbox,
   Layers,
   Play,
+  Radar,
   ShieldCheck,
   ToggleLeft,
   ToggleRight,
@@ -11,7 +14,7 @@ import {
   TrendingDown,
   TrendingUp,
 } from "lucide-react"
-import { Panel, Stat, StatusDot, Tag } from "./ui-kit"
+import { Panel, Stat, StatusDot, Tag, EmptyState } from "./ui-kit"
 import { cn } from "@/lib/utils"
 import { num, pct } from "@/lib/format"
 import type { MarketRow } from "@/lib/types"
@@ -240,10 +243,16 @@ export function SignalPanel({
             })}
             {candidates.length === 0 && (
               <tr>
-                <td colSpan={10} className="px-3 py-8 text-center text-xs text-muted-foreground">
-                  {marketOnline
-                    ? "No pairs currently pass the signal filter. Waiting for qualifying setups…"
-                    : "Loading live market data…"}
+                <td colSpan={10} className="p-0">
+                  <EmptyState
+                    icon={Radar}
+                    title={marketOnline ? "No qualifying signals" : "Loading live market data…"}
+                    hint={
+                      marketOnline
+                        ? "No pairs currently pass the signal filter. The scanner will surface setups as soon as they qualify."
+                        : "Connecting to the market feed — qualifying setups will appear shortly."
+                    }
+                  />
                 </td>
               </tr>
             )}
@@ -311,10 +320,17 @@ export function SignalPanel({
             })}
             {open.length === 0 && (
               <tr>
-                <td colSpan={8} className="px-3 py-8 text-center text-xs text-muted-foreground">
-                  No open paper positions. Enable{" "}
-                  <span className="font-semibold text-foreground">Auto Entry</span> or open one manually from the
-                  signals above.
+                <td colSpan={8} className="p-0">
+                  <EmptyState
+                    icon={Inbox}
+                    title="No open paper positions"
+                    hint={
+                      <>
+                        Enable <span className="font-semibold text-foreground">Auto Entry</span> or open a trade
+                        manually from the filtered signals above.
+                      </>
+                    }
+                  />
                 </td>
               </tr>
             )}
@@ -390,8 +406,12 @@ export function SignalPanel({
             })}
             {history.length === 0 && (
               <tr>
-                <td colSpan={7} className="px-3 py-8 text-center text-xs text-muted-foreground">
-                  No closed paper trades yet. Results appear here as signals hit TP or SL.
+                <td colSpan={7} className="p-0">
+                  <EmptyState
+                    icon={History}
+                    title="No closed paper trades yet"
+                    hint="Results appear here automatically as open signals hit their TP or SL."
+                  />
                 </td>
               </tr>
             )}

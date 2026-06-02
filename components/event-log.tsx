@@ -1,8 +1,8 @@
 "use client"
 
-import { WifiOff } from "lucide-react"
+import { ScrollText } from "lucide-react"
 import type { LogEvent } from "@/lib/types"
-import { Panel } from "./ui-kit"
+import { Panel, EmptyState } from "./ui-kit"
 import { cn } from "@/lib/utils"
 
 const levelBg: Record<LogEvent["level"], string> = {
@@ -33,12 +33,16 @@ export function EventLog({
       bodyClassName="overflow-auto scroll-thin"
     >
       {log.length === 0 ? (
-        <div className="flex h-full min-h-32 flex-col items-center justify-center gap-2 p-6 text-center">
-          <WifiOff className="h-5 w-5 text-muted-foreground" />
-          <p className="text-xs text-muted-foreground">
-            {engineOnline ? "No log events yet." : "Engine offline — logs stream from your local TradeBot engine."}
-          </p>
-        </div>
+        <EmptyState
+          icon={ScrollText}
+          title={engineOnline ? "No events yet" : "Engine offline"}
+          hint={
+            engineOnline
+              ? "Signals, executions and risk events will stream here as they happen."
+              : "Logs stream from your local TradeBot engine once it's connected."
+          }
+          className="h-full min-h-32"
+        />
       ) : (
         <ul className="flex flex-col">
           {log.map((e) => (

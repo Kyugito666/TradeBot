@@ -6,7 +6,7 @@ const inter = Inter({ subsets: ["latin"], variable: "--font-sans", display: "swa
 const mono = JetBrains_Mono({ subsets: ["latin"], variable: "--font-mono", display: "swap" })
 
 export const metadata: Metadata = {
-  title: "AXIOM — Quant Trading Terminal",
+  title: "TradeBot — Quant Trading Terminal",
   description:
     "Multi-agent consensus quant trading terminal. Monitor signals, strategy status, positions, risk and performance in real time.",
 }

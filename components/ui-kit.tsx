@@ -1,4 +1,5 @@
 import type React from "react"
+import { Loader2 } from "lucide-react"
 import { cn } from "@/lib/utils"
 
 export function Panel({
@@ -163,6 +164,48 @@ export function Meter({ value, tone = "primary" }: { value: number; tone?: "posi
   return (
     <div className="h-1.5 w-full overflow-hidden rounded-full bg-muted">
       <div className={cn("h-full rounded-full transition-all duration-500", map[tone])} style={{ width: `${Math.min(100, Math.max(0, value * 100))}%` }} />
+    </div>
+  )
+}
+
+/**
+ * Shared empty-state block — keeps every "nothing here yet" message visually
+ * consistent (icon + title + optional hint), whether it sits inside a panel
+ * body or a table cell.
+ */
+export function EmptyState({
+  icon: Icon,
+  title,
+  hint,
+  className,
+}: {
+  icon?: React.ComponentType<{ className?: string }>
+  title: React.ReactNode
+  hint?: React.ReactNode
+  className?: string
+}) {
+  return (
+    <div className={cn("flex flex-col items-center justify-center gap-2 px-4 py-10 text-center", className)}>
+      {Icon && (
+        <span className="flex h-9 w-9 items-center justify-center rounded-full bg-muted/60">
+          <Icon className="h-4 w-4 text-muted-foreground" />
+        </span>
+      )}
+      <p className="text-xs font-medium text-foreground/90">{title}</p>
+      {hint && <p className="max-w-sm text-[11px] leading-relaxed text-muted-foreground">{hint}</p>}
+    </div>
+  )
+}
+
+/**
+ * Shared loading-state block — a spinner with a label, matching the empty-state
+ * spacing so panels never jump between loading and loaded layouts.
+ */
+export function LoadingState({ label, className }: { label?: React.ReactNode; className?: string }) {
+  return (
+    <div className={cn("flex flex-col items-center justify-center gap-2 px-4 py-10 text-center", className)}>
+      <Loader2 className="h-6 w-6 animate-spin text-primary" />
+      {label && <p className="text-xs text-muted-foreground">{label}</p>}
     </div>
   )
 }
