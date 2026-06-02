@@ -4,6 +4,7 @@ import {
   BarChart3,
   Bot,
   Boxes,
+  FlaskConical,
   GaugeCircle,
   LayoutDashboard,
   Radar,
@@ -22,10 +23,12 @@ export type TabId =
   | "performance"
   | "logs"
   | "settings"
+  | "backtest"
 
 export const NAV_ITEMS: { id: TabId; label: string; icon: typeof LayoutDashboard }[] = [
   { id: "overview", label: "Overview", icon: LayoutDashboard },
   { id: "settings", label: "Mode & Settings", icon: SlidersHorizontal },
+  { id: "backtest", label: "Backtest", icon: FlaskConical },
   { id: "signals", label: "Signals", icon: Radar },
   { id: "consensus", label: "Consensus", icon: Bot },
   { id: "positions", label: "Positions", icon: Boxes },
