@@ -13,12 +13,14 @@ export interface MarketRow {
   lsrVal: number // long/short account ratio (real)
   trendState: TrendState
   whaleBias: WhaleBias
-  signalStatus: SignalStatus // bot consensus, only meaningful for the active symbol
-  confidence: number // 0..1, bot confidence for the active symbol
+  signalStatus: SignalStatus // computed TA signal (or engine verdict for the active pair)
+  confidence: number // 0..1 signal agreement strength
+  rsi: number // Wilder RSI(14) from real candles
   spark: number[]
 }
 
-// Live consensus decision from the trading engine (single real verdict).
+// A single consensus verdict. Sourced either from the live Go engine
+// ("engine") or computed server-side from real market analytics ("analytics").
 export interface Consensus {
   symbol: string
   action: SignalStatus
@@ -30,6 +32,16 @@ export interface Consensus {
   tpTarget: number
   slTarget: number
   updatedAt: string
+  source: "engine" | "analytics"
+}
+
+// Shape returned by GET /api/market.
+export interface MarketResponse {
+  ok: boolean
+  ts: number
+  market: MarketRow[]
+  consensus: Consensus | null
+  error?: string
 }
 
 export interface Position {
