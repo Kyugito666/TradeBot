@@ -298,9 +298,21 @@ export function useLiveData() {
   useEffect(() => {
     const savedSettings = localStore.loadTradingSettings()
     if (savedSettings) {
+      // Merge in any default CEXes the saved config predates (keeps the user's
+      // per-exchange tweaks while still exposing newly-added exchanges).
+      const savedById = new Map(savedSettings.cexes.map((c) => [c.id, c]))
+      const mergedCexes = DEFAULT_TRADING_SETTINGS.cexes.map((def) => ({
+        ...def,
+        ...savedById.get(def.id),
+      }))
+      // Preserve any saved CEX that is no longer in defaults, just in case.
+      for (const c of savedSettings.cexes) {
+        if (!mergedCexes.some((m) => m.id === c.id)) mergedCexes.push(c)
+      }
       // Backfill the flexible risk model for configs saved before it existed.
       setTradingSettings({
         ...savedSettings,
+        cexes: mergedCexes,
         riskModel: savedSettings.riskModel ?? RISK_PRESETS.balanced,
       })
     }
