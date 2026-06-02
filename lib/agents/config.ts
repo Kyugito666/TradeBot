@@ -29,11 +29,12 @@ export interface AgentConfigEntry {
 }
 
 // 13-agent quant team. Weights mirror the Rust consensus `WEIGHTS` constant.
-// `data_engineer` is a gatekeeper (weight 0) — it only vetoes bad data.
 // All directional agents carry a meaningful, comparable weight so none of them is a
-// "dead" vote. `data_engineer` stays a pure gatekeeper (weight 0 — it only vetoes
-// bad data and never tilts direction). Weights are the BASE; the self-evaluation
-// layer scales each one up/down over time based on TP/SL outcomes.
+// "dead" vote. `data_engineer` is a DUAL-ROLE agent: it still gatekeeps (vetoes bad
+// data) but, once the dataset passes integrity checks, it ALSO casts a real
+// volume-confirmed directional read — so it actively participates instead of just
+// sitting on WAIT. Weights are the BASE; the self-evaluation layer scales each one
+// up/down over time based on TP/SL outcomes.
 export const AGENT_TEAM_CONFIG: AgentConfigEntry[] = [
   { id: "mathematician",  name: "Mathematician",   category: "quant",      weight: 0.12, enabled: true },
   { id: "physicist",      name: "Physicist",       category: "risk",       weight: 0.11, enabled: true },
@@ -43,7 +44,7 @@ export const AGENT_TEAM_CONFIG: AgentConfigEntry[] = [
   { id: "absurdist",      name: "Absurdist",       category: "onchain",    weight: 0.08, enabled: true },
   { id: "game_theorist",  name: "Game Theorist",   category: "orderflow",  weight: 0.10, enabled: true },
   { id: "economist",      name: "Economist",       category: "macro",      weight: 0.10, enabled: true },
-  { id: "data_engineer",  name: "Data Engineer",   category: "gatekeeper", weight: 0.0,  enabled: true },
+  { id: "data_engineer",  name: "Data Engineer",   category: "gatekeeper", weight: 0.07, enabled: true },
   { id: "data_scientist", name: "Data Scientist",  category: "quant",      weight: 0.12, enabled: true },
   { id: "statistician",   name: "Statistician",    category: "macro",      weight: 0.09, enabled: true },
   { id: "psychologist",   name: "Psychologist",    category: "sentiment",  weight: 0.09, enabled: true },

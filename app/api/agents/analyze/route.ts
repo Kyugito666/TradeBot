@@ -5,6 +5,7 @@ import { agentRegistry } from "@/lib/agents/registry"
 import { registerBuiltinAgents } from "@/lib/agents/builtin-agents"
 import { EXPECTED_AGENT_COUNT } from "@/lib/agents/config"
 import type { AgentInput, Candle, PipelineProgress } from "@/lib/agents/types"
+import { getExchange } from "@/lib/exchanges"
 
 export const dynamic = "force-dynamic"
 export const revalidate = 0
@@ -17,79 +18,45 @@ function ensureInit() {
   }
 }
 
-const OKX = (process.env.MARKET_API_BASE || "https://www.okx.com").replace(/\/$/, "")
-
-async function okx(path: string): Promise<any | null> {
-  try {
-    const res = await fetch(OKX + path, { headers: { accept: "application/json" }, next: { revalidate: 15 } })
-    if (!res.ok) return null
-    const json = await res.json()
-    if (json?.code !== "0") return null
-    return json.data
-  } catch {
-    return null
-  }
-}
-
 function baseOf(symbol: string): string {
-  return symbol.replace(/USDT$/i, "").replace(/-.*/, "").toUpperCase()
+  return symbol.replace(/USDT$/i, "").replace(/[-_].*/, "").toUpperCase()
 }
 
-// Build a full AgentInput from real OKX data. Fields the public feed cannot
-// provide (sentiment, whale flow, liquidations, kimchi, usdt supply) default to 0
-// so the data-dependent agents WAIT gracefully instead of failing.
-async function buildAgentInput(symbol: string): Promise<AgentInput | null> {
+// Build a full AgentInput from real data on the ACTIVE exchange. Fields the public
+// feed cannot provide (sentiment, news, liquidations, kimchi, usdt supply) default
+// to 0 so those data-dependent agents WAIT gracefully instead of failing.
+async function buildAgentInput(symbol: string, cexId: string): Promise<AgentInput | null> {
   const base = baseOf(symbol)
-  const instId = `${base}-USDT-SWAP`
+  const ex = getExchange(cexId)
 
-  const [candleData, ticker, oiData, fundingData, lsrData, books] = await Promise.all([
-    okx(`/api/v5/market/candles?instId=${instId}&bar=1H&limit=100`),
-    okx(`/api/v5/market/ticker?instId=${instId}`),
-    okx(`/api/v5/public/open-interest?instType=SWAP&instId=${instId}`),
-    okx(`/api/v5/public/funding-rate?instId=${instId}`),
-    okx(`/api/v5/rubik/stat/contracts/long-short-account-ratio?ccy=${base}&period=1H&limit=1`),
-    okx(`/api/v5/market/books?instId=${instId}&sz=25`),
+  // Resolve the exchange-native instrument id for this canonical symbol.
+  const tickers = await ex.fetchTickers()
+  const ticker = tickers.find((t) => t.symbol.toUpperCase() === symbol.toUpperCase() || t.base === base)
+  const native = ticker?.native ?? symbol
+
+  const [candleData, extras] = await Promise.all([
+    ex.fetchCandles(native, 100),
+    ex.fetchExtras(base, native, ticker?.last ?? 0),
   ])
 
-  // OKX candles are newest-first [ts,o,h,l,c,vol,...]; reverse to chronological.
-  const rows: string[][] = Array.isArray(candleData) ? [...candleData].reverse() : []
-  const candles: Candle[] = rows
-    .map((c) => ({
-      open: Number(c[1]),
-      high: Number(c[2]),
-      low: Number(c[3]),
-      close: Number(c[4]),
-      vol: Number(c[5]),
-    }))
+  if (!candleData || candleData.closes.length === 0) return null
+
+  const { opens, highs, lows, closes, volumes } = candleData
+  const candles: Candle[] = closes
+    .map((close, i) => ({ open: opens[i], high: highs[i], low: lows[i], close, vol: volumes[i] }))
     .filter((c) => Number.isFinite(c.close) && Number.isFinite(c.open))
 
   if (candles.length === 0) return null
 
-  const closes = candles.map((c) => c.close)
-  const highs = candles.map((c) => c.high)
-  const lows = candles.map((c) => c.low)
-  const volumes = candles.map((c) => c.vol)
-
-  const t = Array.isArray(ticker) ? ticker[0] : null
-  const price = Number(t?.last) || closes[closes.length - 1] || 0
+  const price = ticker?.last || closes[closes.length - 1] || 0
 
   // OI in base units (agents multiply by price for USD notional).
-  let openInterest = 0
-  if (Array.isArray(oiData) && oiData[0]) {
-    openInterest = Number(oiData[0].oiCcy) || (Number(oiData[0].oiUsd) || 0) / Math.max(1, price)
-  }
-
-  const fundingRate = Array.isArray(fundingData) && fundingData[0] ? Number(fundingData[0].fundingRate) || 0 : 0
-  const lsr = Array.isArray(lsrData) && lsrData[0] ? Number(lsrData[0][1]) || 1 : 1
-
-  // Order-book depth as bid/ask proxy for the game-theorist agent.
-  let bid = 0
-  let ask = 0
-  const book = Array.isArray(books) ? books[0] : null
-  if (book) {
-    bid = (book.bids || []).reduce((a: number, b: string[]) => a + (Number(b[1]) || 0), 0)
-    ask = (book.asks || []).reduce((a: number, b: string[]) => a + (Number(b[1]) || 0), 0)
-  }
+  const oiUsd = extras.openInterestUsd ?? (ticker?.oiUsd || 0)
+  const openInterest = price > 0 ? oiUsd / price : 0
+  const fundingRate = extras.fundingRate ?? 0
+  const lsr = extras.lsr ?? 1
+  const bid = extras.bid ?? 0
+  const ask = extras.ask ?? 0
 
   const atr14 = wilderAtr(highs, lows, closes, 14)
 
@@ -138,9 +105,10 @@ export async function GET(request: Request) {
   ensureInit()
   const { searchParams } = new URL(request.url)
   const symbol = searchParams.get("symbol") || "BTCUSDT"
+  const cexId = searchParams.get("cex") || "okx"
 
   try {
-    const input = await buildAgentInput(symbol)
+    const input = await buildAgentInput(symbol, cexId)
     if (!input) {
       return NextResponse.json({
         ok: false,

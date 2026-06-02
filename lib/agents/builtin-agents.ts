@@ -542,11 +542,14 @@ async function economist(input: AgentInput): Promise<AgentOutput> {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// 9. DATA ENGINEER — gatekeeper. Only WAITs / VETOs on bad data (weight 0)
+// 9. DATA ENGINEER — dual-role: data-integrity gatekeeper + volume-confirmed read.
+//    First it VETOs bad data (gaps, flatlines, spikes). Once the dataset is clean
+//    it ACTIVELY analyses it — casting a real directional vote from a volume-backed
+//    trend confirmation, scaled by the measured data quality. No more idle WAIT.
 // ═══════════════════════════════════════════════════════════════════════════════
 async function dataEngineer(input: AgentInput): Promise<AgentOutput> {
   const id = "data_engineer"
-  const activity = "Validating data integrity (gaps, flatlines, spikes)"
+  const activity = "Validating data integrity, then confirming the volume-backed trend"
   const candles = input.candles
   if (candles.length === 0) return blockingVeto(id, "Missing candles data", activity)
   if (input.price <= 0) return blockingVeto(id, "Invalid price (<= 0.0)", activity)
@@ -560,10 +563,45 @@ async function dataEngineer(input: AgentInput): Promise<AgentOutput> {
   }
   const lc = candles[candles.length - 1]
   if (lc.open > 0) {
-    const pct = Math.abs(lc.close - lc.open) / lc.open
-    if (pct > 0.15) return blockingVeto(id, "Data spike anomaly (>15% in single candle)", activity)
+    const spikePct = Math.abs(lc.close - lc.open) / lc.open
+    if (spikePct > 0.15) return blockingVeto(id, "Data spike anomaly (>15% in single candle)", activity)
   }
-  return { agentId: id, vote: "WAIT", confidence: 0, activity, reasoning: "Data sanitised & validated — clear to trade", metrics: {} }
+
+  // ── Data passed integrity checks → ACTIVELY analyse the validated dataset ──
+  const c = input.closes
+  if (c.length < 21) {
+    return { agentId: id, vote: "WAIT", confidence: 0, activity, reasoning: "Data sanitised & validated — clear to trade (insufficient history for a directional read)", metrics: { dataQuality: 1 } }
+  }
+
+  // Data-quality score: volume completeness + finite-close completeness.
+  const vols = input.volumes
+  const nonZeroVol = vols.filter((v) => v > 0).length
+  const volCompleteness = vols.length > 0 ? nonZeroVol / vols.length : 0
+  const finiteCloses = c.filter((x) => Number.isFinite(x) && x > 0).length
+  const closeCompleteness = c.length > 0 ? finiteCloses / c.length : 0
+  const dataQuality = clamp(0.5 * volCompleteness + 0.5 * closeCompleteness, 0, 1)
+
+  // Volume-confirmed momentum: fast vs slow SMA spread, gated by trend efficiency
+  // and confirmed by whether recent participation (volume) is supporting the move.
+  const fast = sma(c, 9)
+  const slow = sma(c, 21)
+  const trendSpread = slow > 1e-9 ? (fast - slow) / slow : 0
+  const recentVol = mean(vols.slice(-5))
+  const baseVol = mean(vols.slice(0, Math.max(1, vols.length - 5)))
+  const volSupport = baseVol > 1e-9 ? clamp(recentVol / baseVol, 0.5, 2) : 1
+  const er = efficiencyRatio(c, 14)
+
+  const score = clamp(tanh(trendSpread * 40) * (0.4 + 0.3 * er) * (volSupport / 1.5) * dataQuality, -1, 1)
+  const { vote, confidence } = voteFromScore(score, 0.12)
+
+  return {
+    agentId: id,
+    vote,
+    confidence,
+    activity,
+    reasoning: `Data OK (quality ${(dataQuality * 100).toFixed(0)}%) — vol-confirmed trend spread=${(trendSpread * 100).toFixed(2)}% ER=${er.toFixed(2)} volSupport=${volSupport.toFixed(2)} score=${score.toFixed(2)}`,
+    metrics: { dataQuality, trendSpread, er, volSupport, score },
+  }
 }
 
 function blockingVeto(id: string, reason: string, activity: string): AgentOutput {

@@ -5,7 +5,7 @@ import useSWR from "swr"
 import type { Consensus, MarketResponse, MarketRow, Snapshot } from "@/lib/types"
 import { pollEngine, startEngine, stopEngine, type EngineSnapshot } from "@/lib/engine"
 import { localStore } from "@/lib/local-store"
-import { runLocalBacktest, type BacktestResult } from "@/lib/backtest"
+import type { BacktestResult, PairStat } from "@/lib/backtest"
 import {
   buildConsensus,
   buildPerformance,
@@ -257,16 +257,16 @@ const DEFAULT_TRADING_SETTINGS: TradingSettings = {
 const EMPTY_PERF = buildPerformance([], 0)
 const EMPTY_RISK = buildRisk(null, [], EMPTY_PERF)
 
-async function marketFetcher(): Promise<MarketResponse> {
-  const res = await fetch("/api/market", { cache: "no-store" })
+async function marketFetcher(cex: string): Promise<MarketResponse> {
+  const res = await fetch(`/api/market?cex=${encodeURIComponent(cex)}`, { cache: "no-store" })
   if (!res.ok) return { ok: false, ts: Date.now(), market: [], consensus: null }
   return (await res.json()) as MarketResponse
 }
 
-async function agentAnalysisFetcher(symbol: string): Promise<AgentAnalysisResponse | null> {
+async function agentAnalysisFetcher(symbol: string, cex: string): Promise<AgentAnalysisResponse | null> {
   try {
-    const res = await fetch(`/api/agents/analyze?symbol=${encodeURIComponent(symbol)}`, { 
-      cache: "no-store" 
+    const res = await fetch(`/api/agents/analyze?symbol=${encodeURIComponent(symbol)}&cex=${encodeURIComponent(cex)}`, {
+      cache: "no-store",
     })
     if (!res.ok) return null
     return (await res.json()) as AgentAnalysisResponse
@@ -331,6 +331,9 @@ export function useLiveData() {
   const [hydrated, setHydrated] = useState(false)
   const [backtests, setBacktests] = useState<BacktestResult[]>([])
   const [isBacktesting, setIsBacktesting] = useState(false)
+  // Per-pair backtest stats (keyed by symbol) from the latest run — shared with the
+  // Signals and Consensus tabs so all three views analyse the same data.
+  const [pairStats, setPairStats] = useState<Record<string, PairStat>>({})
 
   // Load persisted state AFTER mount so server/client first render match
   // (avoids hydration mismatches). Defaults render first, then we swap in
@@ -358,7 +361,11 @@ export function useLiveData() {
     }
     const savedDryRun = localStore.loadDryRun()
     if (savedDryRun) setDryRunConfig(savedDryRun)
-    setBacktests(localStore.loadBacktests())
+    const savedBacktests = localStore.loadBacktests()
+    setBacktests(savedBacktests)
+    if (savedBacktests[0]?.pairStats) {
+      setPairStats(Object.fromEntries(savedBacktests[0].pairStats.map((p) => [p.symbol, p])))
+    }
     setHydrated(true)
   }, [])
 
@@ -372,8 +379,11 @@ export function useLiveData() {
   }, [hydrated, dryRunConfig])
   
   // Real public market data + server-computed analytics (works on localhost + Vercel).
-  const market = useSWR("market", marketFetcher, {
-    refreshInterval: 15000,
+  // Keyed on the ACTIVE exchange so switching CEX in Settings re-pulls that
+  // exchange's real, dynamic pair universe.
+  const activeCexId = tradingSettings.activeCex
+  const market = useSWR(["market", activeCexId], () => marketFetcher(activeCexId), {
+    refreshInterval: 30000,
     keepPreviousData: true,
   })
 
@@ -383,10 +393,21 @@ export function useLiveData() {
     keepPreviousData: true,
   })
   
-  // Agent analysis with progress tracking
+  // Keep the analysed pair valid for the ACTIVE exchange. The pair list is fully
+  // DYNAMIC — derived from the exchange's real market feed — so when the user
+  // switches CEX (or the current symbol isn't listed there) we snap the analysis
+  // to that exchange's most-liquid real pair instead of a hardcoded default.
+  useEffect(() => {
+    const rows = market.data?.market
+    if (!rows || rows.length === 0) return
+    const listed = rows.some((m) => m.symbol.toUpperCase() === analysisSymbol.toUpperCase())
+    if (!listed) setAnalysisSymbol(rows[0].symbol)
+  }, [market.data, analysisSymbol])
+
+  // Agent analysis with progress tracking — runs on the chosen pair of the ACTIVE CEX.
   const agentAnalysis = useSWR<AgentAnalysisResponse | null>(
-    `agent-analysis-${analysisSymbol}`,
-    () => agentAnalysisFetcher(analysisSymbol),
+    [`agent-analysis`, analysisSymbol, activeCexId],
+    () => agentAnalysisFetcher(analysisSymbol, activeCexId),
     {
       refreshInterval: 30000, // Refresh every 30s
       keepPreviousData: true,
@@ -583,19 +604,45 @@ export function useLiveData() {
     }))
   }, [])
 
-  // Manual, per-user backtest. Triggered explicitly by the user (never auto-run);
-  // computed locally from the current config and saved to this browser only.
+  // Manual, per-user backtest. Triggered explicitly by the user (never auto-run).
+  // Runs a REAL replay on the server over historical candles of the active CEX's
+  // pairs, using the same signal + TP/SL strategy as the Signals/Consensus tabs.
+  // The resulting per-pair stats are stored and shared back into those tabs.
   const runBacktest = useCallback(async () => {
     setIsBacktesting(true)
     try {
-      // Small async yield so the UI can show the running state.
-      await new Promise(r => setTimeout(r, 400))
-      const result = runLocalBacktest(tradingSettings, dryRunConfig, snapshot.market)
-      setBacktests(prev => {
+      const cex = tradingSettings.cexes.find((c) => c.id === tradingSettings.activeCex) ?? tradingSettings.cexes[0]
+      const pairLeverage: Record<string, number> = {}
+      for (const p of cex?.pairLeverage ?? []) pairLeverage[p.pair.toUpperCase()] = p.leverage
+
+      const res = await fetch("/api/backtest", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          cex: tradingSettings.activeCex,
+          cexLabel: cex?.label,
+          style: tradingSettings.tradingStyle,
+          risk: tradingSettings.riskModel,
+          dryRun: dryRunConfig.enabled,
+          initialBalance: dryRunConfig.initialBalance,
+          riskPerTrade: dryRunConfig.riskPerTrade,
+          marginMode: cex?.marginMode,
+          marginUsagePct: cex?.marginUsagePct,
+          defaultLeverage: cex?.defaultLeverage,
+          pairLeverage,
+          symbols: snapshot.market.map((m) => m.symbol),
+        }),
+      })
+      const json = await res.json()
+      if (!json?.ok || !json.result) throw new Error(json?.error || "Backtest failed")
+      const result = json.result as BacktestResult
+
+      setBacktests((prev) => {
         const next = [result, ...prev].slice(0, 20) // keep last 20 per user
         localStore.saveBacktests(next)
         return next
       })
+      setPairStats(Object.fromEntries((result.pairStats ?? []).map((p) => [p.symbol, p])))
       return result
     } finally {
       setIsBacktesting(false)
@@ -643,6 +690,9 @@ export function useLiveData() {
     isBacktesting,
     runBacktest,
     clearBacktests,
+    // Per-pair backtest stats — shared with the Signals & Consensus tabs so all
+    // three views analyse the exact same pairs/data of the active exchange.
+    pairStats,
   }
 }
 
