@@ -1,7 +1,8 @@
 "use client"
 
+import { Radar } from "lucide-react"
 import type { MarketRow } from "@/lib/types"
-import { Panel, Sparkline, StatusDot, Tag } from "./ui-kit"
+import { Panel, Sparkline, StatusDot, Tag, EmptyState } from "./ui-kit"
 import { compact, num, pct } from "@/lib/format"
 import { cn } from "@/lib/utils"
 
@@ -113,8 +114,16 @@ export function SignalWatch({
           })}
           {watchRows.length === 0 && (
             <tr>
-              <td colSpan={11} className="px-3 py-8 text-center text-xs text-muted-foreground">
-                {marketOnline ? "No watchlist markets available." : "Loading live market data…"}
+              <td colSpan={11} className="p-0">
+                <EmptyState
+                  icon={Radar}
+                  title={marketOnline ? "No watchlist markets available" : "Loading live market data…"}
+                  hint={
+                    marketOnline
+                      ? "None of the tracked reference markets are reporting on the active exchange right now."
+                      : "Connecting to the market feed — reference pairs will appear momentarily."
+                  }
+                />
               </td>
             </tr>
           )}

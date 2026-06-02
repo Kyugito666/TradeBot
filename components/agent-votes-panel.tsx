@@ -15,7 +15,7 @@ import {
   Shield,
   BarChart3
 } from "lucide-react"
-import { Panel, Tag, Meter, Stat } from "./ui-kit"
+import { Panel, Tag, Meter, Stat, EmptyState } from "./ui-kit"
 import { cn } from "@/lib/utils"
 import { pct } from "@/lib/format"
 
@@ -328,10 +328,11 @@ export function AgentVotesPanel({
       </div>
       
       {outputs.length === 0 && (
-        <div className="flex items-center justify-center p-6 text-muted-foreground">
-          <Brain className="h-5 w-5 mr-2 opacity-50" />
-          <span className="text-sm">No agent votes yet</span>
-        </div>
+        <EmptyState
+          icon={Brain}
+          title="No agent votes yet"
+          hint="Run an analysis to see each agent's live read and vote on the selected market."
+        />
       )}
     </Panel>
   )

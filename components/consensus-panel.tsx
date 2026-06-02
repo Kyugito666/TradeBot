@@ -1,8 +1,8 @@
 "use client"
 
-import { Ban, Loader2, Minus, TrendingDown, TrendingUp } from "lucide-react"
+import { Ban, Minus, TrendingDown, TrendingUp } from "lucide-react"
 import type { Consensus } from "@/lib/types"
-import { Panel, Tag, Meter } from "./ui-kit"
+import { Panel, Tag, Meter, LoadingState } from "./ui-kit"
 import { num } from "@/lib/format"
 import { cn } from "@/lib/utils"
 
@@ -17,9 +17,8 @@ export function ConsensusPanel({
 }) {
   if (!consensus) {
     return (
-      <Panel title="Consensus Engine" className={className} bodyClassName="flex flex-col items-center justify-center gap-2 p-6 text-center">
-        <Loader2 className="h-6 w-6 animate-spin text-muted-foreground" />
-        <p className="text-xs text-muted-foreground">Computing consensus from live market data…</p>
+      <Panel title="Consensus Engine" className={className}>
+        <LoadingState label="Computing consensus from live market data…" />
       </Panel>
     )
   }

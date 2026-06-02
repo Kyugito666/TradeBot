@@ -40,8 +40,8 @@ export const NAV_ITEMS: { id: TabId; label: string; icon: typeof LayoutDashboard
 export function NavRail({ active, onChange }: { active: TabId; onChange: (id: TabId) => void }) {
   return (
     <nav className="flex w-14 shrink-0 flex-col items-center gap-1 border-r border-border bg-panel py-3">
-      <div className="mb-2 flex h-8 w-8 items-center justify-center rounded bg-primary/15 text-primary">
-        <GaugeCircle className="h-4.5 w-4.5" strokeWidth={2.2} />
+      <div className="mb-2 flex h-8 w-8 items-center justify-center rounded-md bg-primary/15 text-primary">
+        <GaugeCircle className="h-5 w-5" strokeWidth={2.2} />
       </div>
       {NAV_ITEMS.map((it) => {
         const Icon = it.icon

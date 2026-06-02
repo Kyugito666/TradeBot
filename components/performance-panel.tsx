@@ -1,8 +1,9 @@
 "use client"
 
 import { Area, AreaChart, CartesianGrid, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts"
+import { LineChart } from "lucide-react"
 import type { Performance } from "@/lib/types"
-import { Panel } from "./ui-kit"
+import { Panel, EmptyState } from "./ui-kit"
 import { compact, num, pct, usd } from "@/lib/format"
 import { cn } from "@/lib/utils"
 
@@ -59,11 +60,16 @@ export function PerformancePanel({
             </AreaChart>
           </ResponsiveContainer>
         ) : (
-          <div className="flex h-full flex-col items-center justify-center gap-1 text-center">
-            <p className="text-xs text-muted-foreground">
-              {engineOnline ? "No closed trades yet — equity curve appears after the first exit." : "Engine offline — performance is built from real trade history."}
-            </p>
-          </div>
+          <EmptyState
+            icon={LineChart}
+            title={engineOnline ? "No closed trades yet" : "Engine offline"}
+            hint={
+              engineOnline
+                ? "Your equity curve will plot here after the first position is closed."
+                : "Performance is built from real trade history — start the engine to populate it."
+            }
+            className="h-full py-0"
+          />
         )}
       </div>
 
