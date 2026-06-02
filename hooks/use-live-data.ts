@@ -102,6 +102,84 @@ export interface DryRunConfig {
   riskPerTrade: number // As decimal (0.02 = 2%)
 }
 
+// ---- Mode & exchange configuration -------------------------------------
+
+export type CexId = "binance" | "bybit" | "okx"
+export type TradingStyle = "scalp" | "intraday" | "swing"
+export type MarginMode = "isolated" | "cross"
+
+export interface PairLeverage {
+  pair: string
+  leverage: number
+}
+
+export interface CexConfig {
+  id: CexId
+  label: string
+  enabled: boolean
+  /** Names of the env vars that hold this exchange's credentials. */
+  apiKeyEnv: string
+  apiSecretEnv: string
+  passphraseEnv?: string
+  marginMode: MarginMode
+  /** Percentage of available balance committed as margin (0-100). */
+  marginUsagePct: number
+  /** Fallback leverage applied to any pair without a specific override. */
+  defaultLeverage: number
+  /** Flexible per-pair leverage overrides for this exchange. */
+  pairLeverage: PairLeverage[]
+}
+
+export interface TradingSettings {
+  activeCex: CexId
+  tradingStyle: TradingStyle
+  cexes: CexConfig[]
+}
+
+const DEFAULT_TRADING_SETTINGS: TradingSettings = {
+  activeCex: "binance",
+  tradingStyle: "intraday",
+  cexes: [
+    {
+      id: "binance",
+      label: "Binance",
+      enabled: true,
+      apiKeyEnv: "BINANCE_API_KEY",
+      apiSecretEnv: "BINANCE_API_SECRET",
+      marginMode: "isolated",
+      marginUsagePct: 20,
+      defaultLeverage: 5,
+      pairLeverage: [
+        { pair: "BTCUSDT", leverage: 10 },
+        { pair: "ETHUSDT", leverage: 8 },
+      ],
+    },
+    {
+      id: "bybit",
+      label: "Bybit",
+      enabled: false,
+      apiKeyEnv: "BYBIT_API_KEY",
+      apiSecretEnv: "BYBIT_API_SECRET",
+      marginMode: "cross",
+      marginUsagePct: 15,
+      defaultLeverage: 3,
+      pairLeverage: [{ pair: "SOLUSDT", leverage: 6 }],
+    },
+    {
+      id: "okx",
+      label: "OKX",
+      enabled: false,
+      apiKeyEnv: "OKX_API_KEY",
+      apiSecretEnv: "OKX_API_SECRET",
+      passphraseEnv: "OKX_API_PASSPHRASE",
+      marginMode: "isolated",
+      marginUsagePct: 10,
+      defaultLeverage: 3,
+      pairLeverage: [],
+    },
+  ],
+}
+
 const EMPTY_PERF = buildPerformance([], 0)
 const EMPTY_RISK = buildRisk(null, [], EMPTY_PERF)
 
@@ -134,6 +212,9 @@ export function useLiveData() {
   // Track analysis state
   const [analysisSymbol, setAnalysisSymbol] = useState("BTCUSDT")
   const [isAnalyzing, setIsAnalyzing] = useState(false)
+
+  // Mode & exchange configuration (mode/settings tab)
+  const [tradingSettings, setTradingSettings] = useState<TradingSettings>(DEFAULT_TRADING_SETTINGS)
   
   // Real public market data + server-computed analytics (works on localhost + Vercel).
   const market = useSWR("market", marketFetcher, {
@@ -258,6 +339,18 @@ export function useLiveData() {
     setDryRunConfig(prev => ({ ...prev, ...config }))
   }, [])
 
+  const updateTradingSettings = useCallback((patch: Partial<TradingSettings>) => {
+    setTradingSettings(prev => ({ ...prev, ...patch }))
+  }, [])
+
+  // Patch a single exchange's config by id.
+  const updateCexConfig = useCallback((id: CexId, patch: Partial<CexConfig>) => {
+    setTradingSettings(prev => ({
+      ...prev,
+      cexes: prev.cexes.map(cex => (cex.id === id ? { ...cex, ...patch } : cex)),
+    }))
+  }, [])
+
   return {
     snapshot,
     start,
@@ -276,6 +369,11 @@ export function useLiveData() {
     dryRunConfig,
     toggleDryRun,
     updateDryRunConfig,
+
+    // Mode & exchange settings
+    tradingSettings,
+    updateTradingSettings,
+    updateCexConfig,
   }
 }
 
