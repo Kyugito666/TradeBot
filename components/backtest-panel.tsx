@@ -16,15 +16,17 @@ import {
 import { Panel, Tag, Meter } from "./ui-kit"
 import { cn } from "@/lib/utils"
 import { num, usd } from "@/lib/format"
-import type { BacktestResult } from "@/lib/backtest"
+import type { BacktestResult, ReplayChart, ReplayMarker } from "@/lib/backtest"
 import type { TradingSettings } from "@/hooks/use-live-data"
 
-// How many equity-curve events the replay cursor advances per tick.
+// How many candles the replay cursor advances per tick.
 const STEP_OPTIONS = [1, 2, 5, 10, 25] as const
-// Playback speed multipliers — higher = faster period-to-period stepping.
+// Playback speed multipliers — higher = faster bar-to-bar stepping.
 const SPEED_OPTIONS = [0.5, 1, 2, 4, 8] as const
 // Base tick delay (ms) at 1× before the speed multiplier is applied.
-const BASE_TICK_MS = 260
+const BASE_TICK_MS = 240
+// How many candles are visible in the chart window at once (TradingView-style scroll).
+const VISIBLE_BARS = 90
 
 type ReplayPhase = "idle" | "loading" | "running" | "paused" | "done"
 
@@ -49,77 +51,81 @@ export function BacktestPanel({
   // ── Replay runtime ──
   const [phase, setPhase] = useState<ReplayPhase>("idle")
   const [active, setActive] = useState<BacktestResult | null>(null)
-  const [cursor, setCursor] = useState(0)
+  const [bar, setBar] = useState(0)
   const [error, setError] = useState<string | null>(null)
   const startGuard = useRef(false)
 
   const activeCex = tradingSettings.cexes.find((c) => c.id === tradingSettings.activeCex)
-  const total = active ? active.equityCurve.length : 0
-  const atEnd = total > 0 && cursor >= total - 1
+  const riskReward = tradingSettings.riskModel.riskReward
+  const replay = active?.replay ?? null
+  const totalBars = replay ? replay.bars.length : 0
+  const startBar = replay ? Math.min(replay.warmup, Math.max(0, totalBars - 1)) : 0
+  const lastBar = Math.max(0, totalBars - 1)
+  const atEnd = totalBars > 0 && bar >= lastBar
 
-  // Drive the step-by-step playback. Each tick advances the cursor by the chosen
-  // interval; the delay between ticks shrinks as the speed multiplier rises, so it
-  // genuinely "runs" through the historical periods like a TradingView replay.
+  // Drive the step-by-step playback. Each tick advances the candle cursor by the
+  // chosen interval; the delay shrinks as the speed multiplier rises, so it
+  // genuinely "runs" through historical bars like a TradingView replay.
   useEffect(() => {
-    if (phase !== "running" || !active) return
-    if (cursor >= total - 1) {
+    if (phase !== "running" || !replay) return
+    if (bar >= lastBar) {
       setPhase("done")
       return
     }
-    const delay = Math.max(24, BASE_TICK_MS / speed)
+    const delay = Math.max(20, BASE_TICK_MS / speed)
     const id = setTimeout(() => {
-      setCursor((c) => Math.min(total - 1, c + stepInterval))
+      setBar((b) => Math.min(lastBar, b + stepInterval))
     }, delay)
     return () => clearTimeout(id)
-  }, [phase, cursor, active, total, speed, stepInterval])
+  }, [phase, bar, replay, lastBar, speed, stepInterval])
 
-  // Progressive view of the run up to the current cursor — stats "build" live.
+  // Progressive view of the run up to the current bar — stats "build" live as
+  // trades on the headline pair close out.
   const view = useMemo(() => {
-    if (!active || total === 0) return null
-    const curve = active.equityCurve.slice(0, cursor + 1)
-    const balance = curve[curve.length - 1] ?? active.initialBalance
+    if (!replay) return null
+    const realized = replay.markers
+      .filter((m) => m.exitBar <= bar)
+      .sort((a, b) => a.exitBar - b.exitBar)
+    const open = replay.markers.find((m) => m.entryBar <= bar && m.exitBar > bar) ?? null
+
+    let balance = replay.initialBalance
+    let peak = balance
+    let maxDd = 0
     let wins = 0
     let losses = 0
-    let peak = curve[0] ?? active.initialBalance
-    let maxDd = 0
-    for (let i = 1; i < curve.length; i++) {
-      const delta = curve[i] - curve[i - 1]
-      if (delta >= 0) wins++
+    for (const m of realized) {
+      const r = m.outcome === "TP" ? riskReward : -1
+      balance += balance * replay.riskPerTrade * r
+      if (m.outcome === "TP") wins++
       else losses++
-    }
-    for (const b of curve) {
-      if (b > peak) peak = b
-      const dd = peak > 0 ? (peak - b) / peak : 0
+      if (balance > peak) peak = balance
+      const dd = peak > 0 ? (peak - balance) / peak : 0
       if (dd > maxDd) maxDd = dd
     }
-    const trades = Math.max(0, curve.length - 1)
+    const trades = realized.length
     const netPct =
-      active.initialBalance > 0 ? ((balance - active.initialBalance) / active.initialBalance) * 100 : 0
+      replay.initialBalance > 0 ? ((balance - replay.initialBalance) / replay.initialBalance) * 100 : 0
     const winRate = trades > 0 ? (wins / trades) * 100 : 0
-    return {
-      curve,
-      balance,
-      wins,
-      losses,
-      trades,
-      netPct,
-      winRate,
-      maxDd: maxDd * 100,
-    }
-  }, [active, cursor, total])
+    const barTime = replay.endTime - (lastBar - bar) * replay.intervalMs
+    return { realized, open, balance, peak, maxDd: maxDd * 100, wins, losses, trades, netPct, winRate, barTime }
+  }, [replay, bar, riskReward, lastBar])
 
   async function handleStart() {
     if (startGuard.current) return
     startGuard.current = true
     setError(null)
     setPhase("loading")
-    setCursor(0)
     try {
       const result = await runBacktest()
       setActive(result)
-      setCursor(0)
-      // A meaningful replay needs at least 2 equity points; otherwise just show it.
-      setPhase(result.equityCurve.length > 1 ? "running" : "done")
+      const rep = result.replay
+      if (rep && rep.bars.length > rep.warmup + 1) {
+        setBar(Math.min(rep.warmup, rep.bars.length - 1))
+        setPhase("running")
+      } else {
+        setBar(rep ? rep.bars.length - 1 : 0)
+        setPhase("done")
+      }
     } catch (e) {
       setError(e instanceof Error ? e.message : "Backtest failed")
       setPhase("idle")
@@ -129,12 +135,12 @@ export function BacktestPanel({
   }
 
   function replayAgain() {
-    if (!active) return
-    setCursor(0)
-    setPhase(active.equityCurve.length > 1 ? "running" : "done")
+    if (!replay) return
+    setBar(startBar)
+    setPhase(totalBars > startBar + 1 ? "running" : "done")
   }
 
-  const progress = total > 1 ? cursor / (total - 1) : phase === "done" ? 1 : 0
+  const progress = lastBar > startBar ? (bar - startBar) / (lastBar - startBar) : phase === "done" ? 1 : 0
   const running = phase === "running"
   const paused = phase === "paused"
   const loading = phase === "loading" || isBacktesting
@@ -165,9 +171,10 @@ export function BacktestPanel({
     >
       <div className="space-y-3 p-3">
         <p className="text-[11px] leading-relaxed text-muted-foreground">
-          Replays a deterministic backtest period-by-period, like a TradingView replay. Mode, style, leverage and risk
-          are read straight from the <span className="font-semibold text-foreground">Mode &amp; Settings</span> tab —
-          set the <span className="font-semibold text-foreground">step interval</span> and{" "}
+          Replays a real backtest candle-by-candle on live historical data, like a TradingView replay. Mode, style,
+          leverage and risk are read straight from the{" "}
+          <span className="font-semibold text-foreground">Mode &amp; Settings</span> tab — set the{" "}
+          <span className="font-semibold text-foreground">step interval</span> and{" "}
           <span className="font-semibold text-foreground">playback speed</span> below, then press Start to watch it run.
         </p>
 
@@ -208,7 +215,7 @@ export function BacktestPanel({
                     (running || paused || loading) && "cursor-not-allowed opacity-50",
                   )}
                 >
-                  {s}×
+                  {s}
                 </button>
               ))}
             </div>
@@ -259,7 +266,7 @@ export function BacktestPanel({
             </button>
           )}
 
-          {phase === "done" && active && active.equityCurve.length > 1 && (
+          {phase === "done" && replay && totalBars > startBar + 1 && (
             <button
               onClick={replayAgain}
               className="flex items-center gap-1.5 rounded border border-border px-3 py-1.5 text-xs font-semibold text-muted-foreground transition-colors hover:border-primary/50 hover:text-primary"
@@ -292,7 +299,7 @@ export function BacktestPanel({
           {(running || paused) && (
             <button
               onClick={() => {
-                setCursor(total > 0 ? total - 1 : 0)
+                setBar(lastBar)
                 setPhase("done")
               }}
               className="flex items-center gap-1.5 rounded border border-border px-3 py-1.5 text-xs font-semibold text-muted-foreground transition-colors hover:border-negative/50 hover:text-negative"
@@ -326,15 +333,20 @@ export function BacktestPanel({
         )}
 
         {/* ── Live replay surface ── */}
-        {active && view && (
+        {active && replay && view && (
           <div className="space-y-3 rounded-md border border-border bg-background p-3">
             <div className="flex flex-wrap items-center justify-between gap-2">
-              <span className="text-xs font-semibold text-foreground">
-                {active.cexLabel} · {active.style} · {active.dryRun ? "Dry-Run" : "Real"}
-              </span>
+              <div className="flex items-center gap-2">
+                <span className="font-mono text-sm font-bold text-foreground">{replay.symbol}</span>
+                <Tag tone="muted">1H</Tag>
+                <Tag tone="outline">{replay.leverage}×</Tag>
+                {view.open && (
+                  <Tag tone={view.open.side === "LONG" ? "positive" : "negative"}>{view.open.side} OPEN</Tag>
+                )}
+              </div>
               <div className="flex items-center gap-2 font-mono text-[10px] text-muted-foreground">
                 <span>
-                  step {Math.min(cursor, Math.max(0, total - 1))} / {Math.max(0, total - 1)}
+                  bar {Math.max(0, bar - startBar)} / {Math.max(0, lastBar - startBar)}
                 </span>
                 <Tag tone={view.netPct >= 0 ? "positive" : "negative"}>
                   {view.netPct >= 0 ? "+" : ""}
@@ -343,8 +355,21 @@ export function BacktestPanel({
               </div>
             </div>
 
-            {/* Growing equity curve */}
-            <EquityChart data={view.curve} baseline={active.initialBalance} />
+            {/* Period / time axis — moves as the replay runs */}
+            <div className="flex items-center justify-between font-mono text-[10px] text-muted-foreground">
+              <span>
+                Period:{" "}
+                <span className="text-foreground">
+                  {fmtTime(view.barTime - Math.min(VISIBLE_BARS - 1, bar) * replay.intervalMs)}
+                </span>
+              </span>
+              <span>
+                Now: <span className="text-foreground">{fmtTime(view.barTime)}</span>
+              </span>
+            </div>
+
+            {/* Live candlestick chart */}
+            <CandleChart replay={replay} bar={bar} open={view.open} />
 
             <Meter value={progress} tone={running ? "primary" : view.netPct >= 0 ? "positive" : "warning"} />
 
@@ -356,9 +381,21 @@ export function BacktestPanel({
               <Stat label="Max Drawdown" value={`${view.maxDd.toFixed(2)}%`} tone="negative" />
               <Stat label="Wins" value={num(view.wins, 0)} tone="positive" />
               <Stat label="Losses" value={num(view.losses, 0)} tone="negative" />
-              <Stat label="Profit Factor" value={atEnd ? String(active.profitFactor) : "…"} />
+              <Stat label="Portfolio PF" value={atEnd ? String(active.profitFactor) : "…"} />
               <Stat label="Margin" value={`${active.marginUsagePct}% ${active.marginMode}`} />
             </div>
+
+            {atEnd && (
+              <p className="text-[10px] leading-relaxed text-muted-foreground">
+                Chart shows the most active pair ({replay.symbol}). Full portfolio result across{" "}
+                {active.scannedPairs} pairs: {active.trades} trades · {active.winRate}% win ·{" "}
+                <span className={active.netPnlPct >= 0 ? "text-positive" : "text-negative"}>
+                  {active.netPnlPct >= 0 ? "+" : ""}
+                  {active.netPnlPct}%
+                </span>{" "}
+                net.
+              </p>
+            )}
           </div>
         )}
 
@@ -402,40 +439,212 @@ export function BacktestPanel({
   )
 }
 
-// Responsive equity line + fill that scales to the panel width as the run grows.
-function EquityChart({ data, baseline }: { data: number[]; baseline: number }) {
-  if (data.length < 2) {
-    return (
-      <div className="flex h-32 items-center justify-center rounded border border-border bg-panel text-[11px] text-muted-foreground">
-        Waiting for the first periods…
-      </div>
-    )
-  }
-  const W = 100
-  const H = 40
-  const min = Math.min(...data, baseline)
-  const max = Math.max(...data, baseline)
-  const range = max - min || 1
-  const x = (i: number) => (i / (data.length - 1)) * W
-  const y = (v: number) => H - ((v - min) / range) * H
-  const line = data.map((d, i) => `${x(i).toFixed(2)},${y(d).toFixed(2)}`).join(" ")
-  const area = `0,${H} ${line} ${W},${H}`
-  const up = data[data.length - 1] >= baseline
-  const stroke = up ? "hsl(var(--positive))" : "hsl(var(--negative))"
-  const baseY = y(baseline)
+function fmtTime(ms: number) {
+  const d = new Date(ms)
+  return d.toLocaleString("en-US", {
+    month: "short",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+  })
+}
+
+// ── Canvas candlestick chart that "plays" up to the current bar ──────────────
+function CandleChart({
+  replay,
+  bar,
+  open,
+}: {
+  replay: ReplayChart
+  bar: number
+  open: ReplayMarker | null
+}) {
+  const canvasRef = useRef<HTMLCanvasElement | null>(null)
+  const wrapRef = useRef<HTMLDivElement | null>(null)
+
+  useEffect(() => {
+    const canvas = canvasRef.current
+    const wrap = wrapRef.current
+    if (!canvas || !wrap) return
+    const ctx = canvas.getContext("2d")
+    if (!ctx) return
+
+    const dpr = Math.min(2, window.devicePixelRatio || 1)
+    const cssW = wrap.clientWidth
+    const cssH = 220
+    canvas.width = Math.floor(cssW * dpr)
+    canvas.height = Math.floor(cssH * dpr)
+    canvas.style.width = `${cssW}px`
+    canvas.style.height = `${cssH}px`
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0)
+    ctx.clearRect(0, 0, cssW, cssH)
+
+    const css = (name: string, fallback: string) => {
+      const v = getComputedStyle(document.documentElement).getPropertyValue(name).trim()
+      return v ? `hsl(${v})` : fallback
+    }
+    const colUp = css("--positive", "#16a34a")
+    const colDown = css("--negative", "#dc2626")
+    const colBorder = css("--border", "#27272a")
+    const colMuted = css("--muted-foreground", "#71717a")
+
+    const padL = 6
+    const padR = 52
+    const padT = 8
+    const padB = 8
+    const plotW = cssW - padL - padR
+    const plotH = cssH - padT - padB
+
+    // Visible window: the last VISIBLE_BARS candles ending at the current bar.
+    const end = Math.max(0, Math.min(bar, replay.bars.length - 1))
+    const start = Math.max(0, end - VISIBLE_BARS + 1)
+    const slice = replay.bars.slice(start, end + 1)
+    if (slice.length === 0) return
+
+    let hi = -Infinity
+    let lo = Infinity
+    for (const b of slice) {
+      if (b.h > hi) hi = b.h
+      if (b.l < lo) lo = b.l
+    }
+    // Include any visible trade levels so markers stay on-screen.
+    for (const m of replay.markers) {
+      if (m.entryBar >= start && m.entryBar <= end) {
+        hi = Math.max(hi, m.entry, m.exit)
+        lo = Math.min(lo, m.entry, m.exit)
+      }
+    }
+    const range = hi - lo || 1
+    const pad = range * 0.08
+    hi += pad
+    lo -= pad
+    const span = hi - lo || 1
+
+    const n = slice.length
+    const slot = plotW / Math.max(VISIBLE_BARS, n)
+    const bodyW = Math.max(1, slot * 0.62)
+    const xOf = (i: number) => padL + i * slot + slot / 2
+    const yOf = (price: number) => padT + (1 - (price - lo) / span) * plotH
+
+    // Horizontal grid + price labels
+    ctx.strokeStyle = colBorder
+    ctx.fillStyle = colMuted
+    ctx.lineWidth = 1
+    ctx.font = "9px ui-monospace, monospace"
+    ctx.textBaseline = "middle"
+    const GRID = 4
+    for (let g = 0; g <= GRID; g++) {
+      const price = lo + (span * g) / GRID
+      const y = yOf(price)
+      ctx.globalAlpha = 0.35
+      ctx.beginPath()
+      ctx.moveTo(padL, y)
+      ctx.lineTo(padL + plotW, y)
+      ctx.stroke()
+      ctx.globalAlpha = 1
+      ctx.fillText(fmtPrice(price), padL + plotW + 4, y)
+    }
+
+    // Candles
+    for (let i = 0; i < n; i++) {
+      const b = slice[i]
+      const up = b.c >= b.o
+      const color = up ? colUp : colDown
+      const x = xOf(i)
+      ctx.strokeStyle = color
+      ctx.fillStyle = color
+      ctx.lineWidth = 1
+      // wick
+      ctx.beginPath()
+      ctx.moveTo(x, yOf(b.h))
+      ctx.lineTo(x, yOf(b.l))
+      ctx.stroke()
+      // body
+      const yO = yOf(b.o)
+      const yC = yOf(b.c)
+      const top = Math.min(yO, yC)
+      const h = Math.max(1, Math.abs(yC - yO))
+      ctx.fillRect(x - bodyW / 2, top, bodyW, h)
+    }
+
+    // Trade markers (entry/exit) within the window
+    for (const m of replay.markers) {
+      if (m.exitBar < start || m.entryBar > end) continue
+      const long = m.side === "LONG"
+      const mColor = m.outcome === "TP" ? colUp : colDown
+      // entry marker
+      if (m.entryBar >= start && m.entryBar <= end) {
+        const x = xOf(m.entryBar - start)
+        const y = yOf(m.entry)
+        ctx.fillStyle = long ? colUp : colDown
+        ctx.beginPath()
+        if (long) {
+          ctx.moveTo(x, y + 7)
+          ctx.lineTo(x - 4, y + 13)
+          ctx.lineTo(x + 4, y + 13)
+        } else {
+          ctx.moveTo(x, y - 7)
+          ctx.lineTo(x - 4, y - 13)
+          ctx.lineTo(x + 4, y - 13)
+        }
+        ctx.closePath()
+        ctx.fill()
+      }
+      // exit marker (only once the bar has been reached)
+      if (m.exitBar >= start && m.exitBar <= end && m.exitBar <= bar) {
+        const x = xOf(m.exitBar - start)
+        const y = yOf(m.exit)
+        ctx.strokeStyle = mColor
+        ctx.lineWidth = 1.5
+        ctx.beginPath()
+        ctx.arc(x, y, 3, 0, Math.PI * 2)
+        ctx.stroke()
+      }
+    }
+
+    // Active open-trade entry line
+    if (open && open.entryBar <= end) {
+      const y = yOf(open.entry)
+      ctx.strokeStyle = open.side === "LONG" ? colUp : colDown
+      ctx.globalAlpha = 0.7
+      ctx.setLineDash([4, 3])
+      ctx.lineWidth = 1
+      ctx.beginPath()
+      ctx.moveTo(padL, y)
+      ctx.lineTo(padL + plotW, y)
+      ctx.stroke()
+      ctx.setLineDash([])
+      ctx.globalAlpha = 1
+    }
+
+    // Last price line
+    const lastClose = slice[slice.length - 1].c
+    const yLast = yOf(lastClose)
+    ctx.strokeStyle = colMuted
+    ctx.globalAlpha = 0.6
+    ctx.setLineDash([2, 2])
+    ctx.beginPath()
+    ctx.moveTo(padL, yLast)
+    ctx.lineTo(padL + plotW, yLast)
+    ctx.stroke()
+    ctx.setLineDash([])
+    ctx.globalAlpha = 1
+    ctx.fillStyle = colMuted
+    ctx.fillText(fmtPrice(lastClose), padL + plotW + 4, yLast)
+  }, [replay, bar, open])
+
   return (
-    <svg
-      viewBox={`0 0 ${W} ${H}`}
-      preserveAspectRatio="none"
-      className="h-32 w-full rounded border border-border bg-panel"
-      aria-label="Equity curve replay"
-    >
-      {/* baseline (starting balance) */}
-      <line x1={0} y1={baseY} x2={W} y2={baseY} stroke="hsl(var(--border))" strokeWidth={0.4} strokeDasharray="2 2" />
-      <polygon points={area} fill={stroke} fillOpacity={0.12} />
-      <polyline points={line} fill="none" stroke={stroke} strokeWidth={0.8} strokeLinejoin="round" vectorEffect="non-scaling-stroke" />
-    </svg>
+    <div ref={wrapRef} className="w-full overflow-hidden rounded border border-border bg-panel">
+      <canvas ref={canvasRef} aria-label={`Candlestick replay of ${replay.symbol}`} />
+    </div>
   )
+}
+
+function fmtPrice(p: number) {
+  if (p >= 1000) return p.toFixed(0)
+  if (p >= 1) return p.toFixed(2)
+  return p.toFixed(5)
 }
 
 function Stat({
