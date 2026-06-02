@@ -3,7 +3,7 @@
 import { Area, AreaChart, CartesianGrid, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts"
 import type { Performance } from "@/lib/types"
 import { Panel } from "./ui-kit"
-import { compact, pct, usd } from "@/lib/format"
+import { compact, num, pct, usd } from "@/lib/format"
 import { cn } from "@/lib/utils"
 
 export function PerformancePanel({
@@ -68,7 +68,7 @@ export function PerformancePanel({
       </div>
 
       <div className="mt-2 grid grid-cols-3 gap-3 border-t border-border pt-2 text-[10px]">
-        <Mini label="Trades" value={performance.trades.toLocaleString()} />
+        <Mini label="Trades" value={num(performance.trades, 0)} />
         <Mini label="Profit Factor" value={hasTrades ? performance.profitFactor.toFixed(2) : "—"} />
         <Mini label="Wins / Losses" value={`${performance.wins} / ${performance.losses}`} />
         <Mini label="Avg Win" value={usd(performance.avgWin, 2)} tone="positive" />

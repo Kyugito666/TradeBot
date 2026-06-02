@@ -17,6 +17,7 @@ import { AgentVotesPanel } from "./agent-votes-panel"
 import { ENGINE_URL } from "@/lib/engine"
 import { Panel, Tag } from "./ui-kit"
 import { cn } from "@/lib/utils"
+import { num } from "@/lib/format"
 
 export function Dashboard() {
   const { 
@@ -46,7 +47,7 @@ export function Dashboard() {
           <div className="flex flex-wrap items-center gap-2 border-b border-primary/30 bg-primary/10 px-4 py-2 text-[11px] text-primary">
             <Tag tone="primary">DRY-RUN MODE</Tag>
             <span className="text-primary/80">
-              Paper trading enabled. No real orders will be executed. Balance: ${dryRunConfig.initialBalance.toLocaleString()}
+              Paper trading enabled. No real orders will be executed. Balance: ${num(dryRunConfig.initialBalance, 0)}
             </span>
             <button
               onClick={() => toggleDryRun(false)}
@@ -326,15 +327,15 @@ export function Dashboard() {
                         <div className="space-y-3 text-sm">
                           <div className="grid grid-cols-3 gap-2 text-center">
                             <div>
-                              <div className="font-mono font-bold">${agentAnalysis.consensus.entry.toLocaleString()}</div>
+                              <div className="font-mono font-bold">${num(agentAnalysis.consensus.entry, 0)}</div>
                               <div className="text-[10px] text-muted-foreground">Entry</div>
                             </div>
                             <div>
-                              <div className="font-mono font-bold text-positive">${agentAnalysis.consensus.tp.toLocaleString()}</div>
+                              <div className="font-mono font-bold text-positive">${num(agentAnalysis.consensus.tp, 0)}</div>
                               <div className="text-[10px] text-muted-foreground">Take Profit</div>
                             </div>
                             <div>
-                              <div className="font-mono font-bold text-negative">${agentAnalysis.consensus.sl.toLocaleString()}</div>
+                              <div className="font-mono font-bold text-negative">${num(agentAnalysis.consensus.sl, 0)}</div>
                               <div className="text-[10px] text-muted-foreground">Stop Loss</div>
                             </div>
                           </div>
