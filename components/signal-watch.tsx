@@ -12,13 +12,20 @@ function sigTone(s: string) {
   return s === "LONG" ? "positive" : s === "SHORT" ? "negative" : "warning"
 }
 
-export function SignalWatch({ market }: { market: MarketRow[] }) {
+export function SignalWatch({
+  market,
+  marketOnline,
+}: {
+  market: MarketRow[]
+  marketOnline: boolean
+}) {
   return (
     <Panel
       title="Signal & Strategy Overview"
       right={
         <div className="flex items-center gap-1.5 text-[10px] text-muted-foreground">
-          <StatusDot tone="primary" pulse /> live scan
+          <StatusDot tone={marketOnline ? "primary" : "warning"} pulse={marketOnline} />
+          {marketOnline ? "live scan" : "connecting…"}
         </div>
       }
       bodyClassName="overflow-auto scroll-thin"
@@ -75,6 +82,13 @@ export function SignalWatch({ market }: { market: MarketRow[] }) {
               </tr>
             )
           })}
+          {market.length === 0 && (
+            <tr>
+              <td colSpan={10} className="px-3 py-8 text-center text-xs text-muted-foreground">
+                {marketOnline ? "No market rows." : "Loading live market data…"}
+              </td>
+            </tr>
+          )}
         </tbody>
       </table>
     </Panel>
