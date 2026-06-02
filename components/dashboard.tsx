@@ -290,6 +290,7 @@ export function Dashboard() {
               isBacktesting={isBacktesting}
               runBacktest={runBacktest}
               clearBacktests={clearBacktests}
+              tradingSettings={tradingSettings}
             />
           )}
         </main>
