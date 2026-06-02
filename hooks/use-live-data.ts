@@ -106,10 +106,42 @@ export interface DryRunConfig {
 
 // ---- Mode & exchange configuration -------------------------------------
 
-// MEXC-only build. Kept as a union for forward-compat if more CEXes return.
-export type CexId = "mexc"
+// Supported centralized exchanges.
+export type CexId = "mexc" | "binance" | "bybit" | "bitget" | "gateio" | "okx"
 export type TradingStyle = "scalp" | "intraday" | "swing"
 export type MarginMode = "isolated" | "cross"
+
+// ---- Flexible (preset-based) risk model ---------------------------------
+// No free-form numeric input: every metric is chosen from a controlled set of
+// safe options, so the user can flex the risk profile without breaking config.
+export type RiskPreset = "conservative" | "balanced" | "aggressive"
+
+export interface RiskModel {
+  /** High-level baseline. Selecting it snaps every metric to a safe combo. */
+  preset: RiskPreset
+  /** ATR multiplier used for stop-loss distance. */
+  atrMultiplier: number
+  /** Risk : reward ratio (reward side). */
+  riskReward: number
+  /** Target ROI per position (%). */
+  targetRoiPct: number
+  /** Max PnL risked per trade (%) — this also drives risk-per-trade sizing. */
+  maxPnlPct: number
+}
+
+// Controlled option sets — the only values a user can pick from.
+export const RISK_OPTIONS = {
+  atrMultiplier: [1, 1.5, 2, 2.5, 3],
+  riskReward: [1.5, 2, 2.5, 3],
+  targetRoiPct: [5, 10, 20, 50],
+  maxPnlPct: [0.5, 1, 2, 3, 5],
+} as const
+
+export const RISK_PRESETS: Record<RiskPreset, RiskModel> = {
+  conservative: { preset: "conservative", atrMultiplier: 2.5, riskReward: 3, targetRoiPct: 5, maxPnlPct: 0.5 },
+  balanced: { preset: "balanced", atrMultiplier: 2, riskReward: 2, targetRoiPct: 10, maxPnlPct: 1 },
+  aggressive: { preset: "aggressive", atrMultiplier: 1.5, riskReward: 1.5, targetRoiPct: 20, maxPnlPct: 3 },
+}
 
 export interface PairLeverage {
   pair: string
@@ -136,12 +168,14 @@ export interface CexConfig {
 export interface TradingSettings {
   activeCex: CexId
   tradingStyle: TradingStyle
+  riskModel: RiskModel
   cexes: CexConfig[]
 }
 
 const DEFAULT_TRADING_SETTINGS: TradingSettings = {
   activeCex: "mexc",
   tradingStyle: "intraday",
+  riskModel: RISK_PRESETS.balanced,
   cexes: [
     {
       id: "mexc",
@@ -156,6 +190,63 @@ const DEFAULT_TRADING_SETTINGS: TradingSettings = {
         { pair: "BTCUSDT", leverage: 10 },
         { pair: "ETHUSDT", leverage: 8 },
       ],
+    },
+    {
+      id: "binance",
+      label: "Binance",
+      enabled: false,
+      apiKeyEnv: "BINANCE_API_KEY",
+      apiSecretEnv: "BINANCE_API_SECRET",
+      marginMode: "cross",
+      marginUsagePct: 10,
+      defaultLeverage: 5,
+      pairLeverage: [],
+    },
+    {
+      id: "bybit",
+      label: "Bybit",
+      enabled: false,
+      apiKeyEnv: "BYBIT_API_KEY",
+      apiSecretEnv: "BYBIT_API_SECRET",
+      marginMode: "cross",
+      marginUsagePct: 10,
+      defaultLeverage: 5,
+      pairLeverage: [],
+    },
+    {
+      id: "bitget",
+      label: "Bitget",
+      enabled: false,
+      apiKeyEnv: "BITGET_API_KEY",
+      apiSecretEnv: "BITGET_API_SECRET",
+      passphraseEnv: "BITGET_API_PASSPHRASE",
+      marginMode: "cross",
+      marginUsagePct: 10,
+      defaultLeverage: 5,
+      pairLeverage: [],
+    },
+    {
+      id: "gateio",
+      label: "Gate.io",
+      enabled: false,
+      apiKeyEnv: "GATEIO_API_KEY",
+      apiSecretEnv: "GATEIO_API_SECRET",
+      marginMode: "cross",
+      marginUsagePct: 10,
+      defaultLeverage: 5,
+      pairLeverage: [],
+    },
+    {
+      id: "okx",
+      label: "OKX",
+      enabled: false,
+      apiKeyEnv: "OKX_API_KEY",
+      apiSecretEnv: "OKX_API_SECRET",
+      passphraseEnv: "OKX_API_PASSPHRASE",
+      marginMode: "cross",
+      marginUsagePct: 10,
+      defaultLeverage: 5,
+      pairLeverage: [],
     },
   ],
 }
@@ -206,7 +297,13 @@ export function useLiveData() {
   // whatever this browser previously saved.
   useEffect(() => {
     const savedSettings = localStore.loadTradingSettings()
-    if (savedSettings) setTradingSettings(savedSettings)
+    if (savedSettings) {
+      // Backfill the flexible risk model for configs saved before it existed.
+      setTradingSettings({
+        ...savedSettings,
+        riskModel: savedSettings.riskModel ?? RISK_PRESETS.balanced,
+      })
+    }
     const savedDryRun = localStore.loadDryRun()
     if (savedDryRun) setDryRunConfig(savedDryRun)
     setBacktests(localStore.loadBacktests())
@@ -349,6 +446,23 @@ export function useLiveData() {
     setTradingSettings(prev => ({ ...prev, ...patch }))
   }, [])
 
+  // Flexible risk model. Any change re-derives risk-per-trade sizing from the
+  // selected max-PnL metric so the dry-run engine stays in sync — no manual
+  // numeric entry, so the config can't be put into an unsafe state.
+  const updateRiskModel = useCallback((patch: Partial<RiskModel>) => {
+    setTradingSettings(prev => {
+      const nextModel = { ...prev.riskModel, ...patch }
+      setDryRunConfig(cfg => ({ ...cfg, riskPerTrade: nextModel.maxPnlPct / 100 }))
+      return { ...prev, riskModel: nextModel }
+    })
+  }, [])
+
+  const applyRiskPreset = useCallback((preset: RiskPreset) => {
+    const model = RISK_PRESETS[preset]
+    setTradingSettings(prev => ({ ...prev, riskModel: model }))
+    setDryRunConfig(cfg => ({ ...cfg, riskPerTrade: model.maxPnlPct / 100 }))
+  }, [])
+
   // Patch a single exchange's config by id.
   const updateCexConfig = useCallback((id: CexId, patch: Partial<CexConfig>) => {
     setTradingSettings(prev => ({
@@ -404,6 +518,8 @@ export function useLiveData() {
     tradingSettings,
     updateTradingSettings,
     updateCexConfig,
+    updateRiskModel,
+    applyRiskPreset,
 
     // Local-first persistence + manual backtest
     hydrated,

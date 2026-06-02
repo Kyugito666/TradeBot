@@ -2,32 +2,35 @@
 
 import { useState } from "react"
 import {
+  Activity,
   AlertTriangle,
-  Database,
   DollarSign,
-  History,
+  Gauge,
   KeyRound,
-  Percent,
-  Play,
   Plus,
+  Scale,
   ShieldCheck,
+  Target,
   ToggleLeft,
   ToggleRight,
   Trash2,
+  TrendingUp,
   Zap,
 } from "lucide-react"
 import { Panel, Tag } from "./ui-kit"
 import { cn } from "@/lib/utils"
-import { num, usd } from "@/lib/format"
-import type {
-  CexConfig,
-  CexId,
-  DryRunConfig,
-  MarginMode,
-  TradingSettings,
-  TradingStyle,
+import {
+  RISK_OPTIONS,
+  RISK_PRESETS,
+  type CexConfig,
+  type CexId,
+  type DryRunConfig,
+  type MarginMode,
+  type RiskModel,
+  type RiskPreset,
+  type TradingSettings,
+  type TradingStyle,
 } from "@/hooks/use-live-data"
-import type { BacktestResult } from "@/lib/backtest"
 
 const TRADING_STYLES: { id: TradingStyle; label: string; hint: string }[] = [
   { id: "scalp", label: "Scalp", hint: "Seconds–minutes, high frequency" },
@@ -37,6 +40,12 @@ const TRADING_STYLES: { id: TradingStyle; label: string; hint: string }[] = [
 
 const MARGIN_MODES: MarginMode[] = ["isolated", "cross"]
 
+const RISK_PRESET_META: { id: RiskPreset; label: string; hint: string }[] = [
+  { id: "conservative", label: "Conservative", hint: "Tight risk, wide stops" },
+  { id: "balanced", label: "Balanced", hint: "Even risk / reward" },
+  { id: "aggressive", label: "Aggressive", hint: "Higher risk, faster targets" },
+]
+
 export function SettingsPanel({
   dryRunConfig,
   toggleDryRun,
@@ -44,10 +53,8 @@ export function SettingsPanel({
   tradingSettings,
   updateTradingSettings,
   updateCexConfig,
-  backtests,
-  isBacktesting,
-  runBacktest,
-  clearBacktests,
+  updateRiskModel,
+  applyRiskPreset,
 }: {
   dryRunConfig: DryRunConfig
   toggleDryRun: (enabled?: boolean) => void
@@ -55,10 +62,8 @@ export function SettingsPanel({
   tradingSettings: TradingSettings
   updateTradingSettings: (patch: Partial<TradingSettings>) => void
   updateCexConfig: (id: CexId, patch: Partial<CexConfig>) => void
-  backtests: BacktestResult[]
-  isBacktesting: boolean
-  runBacktest: () => Promise<BacktestResult>
-  clearBacktests: () => void
+  updateRiskModel: (patch: Partial<RiskModel>) => void
+  applyRiskPreset: (preset: RiskPreset) => void
 }) {
   const activeCex =
     tradingSettings.cexes.find((c) => c.id === tradingSettings.activeCex) ?? tradingSettings.cexes[0]
@@ -139,23 +144,15 @@ export function SettingsPanel({
               </div>
             </div>
 
-            <div className="space-y-1">
-              <label className="text-[10px] uppercase tracking-wider text-muted-foreground">
-                Risk Per Trade ({(dryRunConfig.riskPerTrade * 100).toFixed(1)}%)
-              </label>
-              <div className="flex items-center gap-2">
-                <Percent className="h-4 w-4 text-muted-foreground" />
-                <input
-                  type="number"
-                  step="0.5"
-                  min="0.5"
-                  max="10"
-                  value={dryRunConfig.riskPerTrade * 100}
-                  onChange={(e) => updateDryRunConfig({ riskPerTrade: Number(e.target.value) / 100 })}
-                  className="flex-1 rounded border border-border bg-background px-2 py-1.5 font-mono text-sm"
-                />
-              </div>
-            </div>
+            <p className="rounded border border-border bg-background px-2.5 py-2 text-[11px] text-muted-foreground">
+              Risk sizing is controlled from the{" "}
+              <span className="font-semibold text-foreground">Risk Trade</span> panel below using a flexible,
+              preset-based model — current risk per trade:{" "}
+              <span className="font-mono font-semibold text-primary">
+                {(dryRunConfig.riskPerTrade * 100).toFixed(1)}%
+              </span>
+              .
+            </p>
           </div>
         </Panel>
 
