@@ -53,6 +53,10 @@ export function SignalWatch({
       }
       bodyClassName="overflow-auto scroll-thin"
     >
+      <p className="border-b border-border/60 px-3 py-2 text-[11px] leading-relaxed text-muted-foreground">
+        Hanya menampilkan pasangan yang paling relevan dan paling berpengaruh terhadap market global —
+        <span className="font-semibold text-foreground"> BTC, OIL, GOLD, dan S&amp;P 500</span> — sebagai acuan arah pasar.
+      </p>
       <table className="w-full border-collapse text-xs">
         <thead className="sticky top-0 z-10 bg-panel">
           <tr className="text-[10px] uppercase tracking-wider text-muted-foreground">

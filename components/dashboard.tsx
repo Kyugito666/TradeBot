@@ -112,69 +112,10 @@ export function Dashboard() {
               <div className="grid grid-cols-1 gap-3 xl:grid-cols-[1fr_320px]">
                 <div className="flex min-w-0 flex-col gap-3">
                   {/* Analysis Progress Panel */}
-                  <div className="grid grid-cols-1 gap-3 lg:grid-cols-2">
-                    <AnalysisProgress 
-                      progress={agentAnalysis?.progress ?? null}
-                    />
-                    <Panel 
-                      title="Run Analysis" 
-                      right={
-                        <Tag tone={isAnalyzing ? "warning" : "positive"}>
-                          {isAnalyzing ? "RUNNING" : "READY"}
-                        </Tag>
-                      }
-                    >
-                      <div className="p-3 space-y-3">
-                        <p className="text-[11px] text-muted-foreground">
-                          Run the multi-agent analysis pipeline on any live pair of the active exchange to get a
-                          consensus signal with full progress tracking.
-                        </p>
-                        <div className="flex flex-wrap gap-2">
-                          {analyzeSymbols.length === 0 && (
-                            <span className="text-[11px] text-muted-foreground">Loading live pairs…</span>
-                          )}
-                          {analyzeSymbols.map((sym) => (
-                            <button
-                              key={sym}
-                              onClick={() => runAnalysis(sym)}
-                              disabled={isAnalyzing}
-                              className={cn(
-                                "flex items-center gap-1.5 rounded border px-3 py-1.5 text-xs font-semibold transition-colors",
-                                analysisSymbol === sym && !isAnalyzing
-                                  ? "border-primary bg-primary/15 text-primary"
-                                  : "border-border text-muted-foreground hover:border-primary/50 hover:text-primary",
-                                isAnalyzing && "opacity-50 cursor-not-allowed"
-                              )}
-                            >
-                              <Play className="h-3 w-3" />
-                              {sym.replace("USDT", "")}
-                            </button>
-                          ))}
-                        </div>
-                        {agentAnalysis?.consensus && (
-                          <div className={cn(
-                            "rounded border p-2 text-center",
-                            agentAnalysis.consensus.signal === "LONG" && "border-positive/30 bg-positive/10",
-                            agentAnalysis.consensus.signal === "SHORT" && "border-negative/30 bg-negative/10",
-                            agentAnalysis.consensus.signal === "WAIT" && "border-warning/30 bg-warning/10"
-                          )}>
-                            <div className={cn(
-                              "font-mono text-xl font-bold",
-                              agentAnalysis.consensus.signal === "LONG" && "text-positive",
-                              agentAnalysis.consensus.signal === "SHORT" && "text-negative",
-                              agentAnalysis.consensus.signal === "WAIT" && "text-warning"
-                            )}>
-                              {agentAnalysis.consensus.signal}
-                            </div>
-                            <div className="text-[10px] text-muted-foreground">
-                              Confidence: {(agentAnalysis.consensus.confidence * 100).toFixed(1)}%
-                            </div>
-                          </div>
-                        )}
-                      </div>
-                    </Panel>
-                  </div>
-                  
+                  <AnalysisProgress 
+                    progress={agentAnalysis?.progress ?? null}
+                  />
+
                   <SignalWatch market={snapshot.market} marketOnline={snapshot.marketOnline} />
                   <div className="grid grid-cols-1 gap-3 lg:grid-cols-2">
                     <PerformancePanel performance={snapshot.performance} engineOnline={online} />
