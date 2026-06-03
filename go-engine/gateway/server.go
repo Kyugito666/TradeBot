@@ -25,11 +25,14 @@
 package gateway
 
 import (
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
+	
+	_ "github.com/mattn/go-sqlite3"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -379,6 +382,102 @@ func (s *Server) Start() {
 	mux.HandleFunc("/api/proxy/tickers", s.handleTickers)
 	mux.HandleFunc("/api/ai_history", s.handleAIHistory)
 
+	mux.HandleFunc("/api/market", s.handleMarket)
+	// Proxied from Next.js (New Architecture)
+	mux.HandleFunc("/api/engine/consensus", s.handleEngineConsensus)
+	mux.HandleFunc("/api/agents/analyze", func(w http.ResponseWriter, r *http.Request) {
+		path := filepath.Join(s.baseDir, "agent_analysis.json")
+		raw, err := os.ReadFile(path)
+		if err == nil {
+			w.Header().Set("Content-Type", "application/json")
+			w.Write(raw)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(s.insight)
+	})
+	mux.HandleFunc("/api/agents", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(s.insight)
+	})
+
+	mux.HandleFunc("/api/engine/backtest/run", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		
+		var req struct {
+			Symbol    string `json:"symbol"`
+			Timeframe string `json:"timeframe"`
+			Period    int    `json:"period"`
+		}
+		json.NewDecoder(r.Body).Decode(&req)
+
+		period := req.Period
+		if period <= 0 {
+			period = 30 // default 30 days
+		}
+
+		dbPath := filepath.Join(s.baseDir, "paper_trades.db")
+		db, err := sql.Open("sqlite3", dbPath)
+		var startMaxId int
+		if err == nil {
+			db.QueryRow("SELECT COALESCE(MAX(id), 0) FROM paper_trades").Scan(&startMaxId)
+		}
+
+		s.SetBacktesting(true)
+		s.BacktestReqCh <- BacktestReq{
+			Period: period,
+			Speed:  2, // 2ms per candle (super fast historical replay)
+		}
+
+		// Wait until backtest completes (max 60 seconds)
+		for i := 0; i < 600; i++ {
+			if !s.IsBacktesting() {
+				break
+			}
+			time.Sleep(100 * time.Millisecond)
+		}
+
+		trades := 0
+		wins := 0
+		netPnlPct := 0.0
+
+		if err == nil {
+			rows, err2 := db.Query("SELECT pnl FROM paper_trades WHERE is_active = 0 AND id > ?", startMaxId)
+			if err2 == nil {
+				defer rows.Close()
+				for rows.Next() {
+					var pnl float64
+					if err3 := rows.Scan(&pnl); err3 == nil {
+						trades++
+						netPnlPct += pnl
+						if pnl > 0 {
+							wins++
+						}
+					}
+				}
+			}
+			db.Close()
+		}
+
+		winRate := 0.0
+		if trades > 0 {
+			winRate = float64(wins) / float64(trades) * 100
+		}
+
+		result := map[string]interface{}{
+			"trades":      trades,
+			"wins":        wins,
+			"winRate":     winRate,
+			"netPnlPct":   netPnlPct,
+			"equityCurve": []interface{}{},
+		}
+
+		s.jsonOK(w, map[string]interface{}{
+			"ok":     true,
+			"result": result,
+		})
+	})
+
 	addr := fmt.Sprintf(":%d", Port)
 	log.Printf("[Gateway] Dashboard: http://localhost%s", addr)
 
@@ -399,6 +498,8 @@ func (s *Server) Start() {
 		s.SetBacktesting(false)
 		w.WriteHeader(http.StatusOK)
 	})
+
+	// Removed old /api/backtest/run
 
 	srv := &http.Server{
 		Addr:         addr,
@@ -430,6 +531,85 @@ func (s *Server) handleForceExec(w http.ResponseWriter, r *http.Request) {
 	s.forceExec.Store(true)
 	w.Header().Set("Content-Type", "application/json")
 	w.Write([]byte(`{"status":"ok", "message":"Force execution requested"}`))
+}
+
+func (s *Server) handleMarket(w http.ResponseWriter, r *http.Request) {
+	resp, err := http.Get("https://api.bytick.com/v5/market/tickers?category=linear")
+	if err != nil {
+		s.jsonOK(w, map[string]interface{}{"ok": false, "error": err.Error()})
+		return
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		s.jsonOK(w, map[string]interface{}{"ok": false, "error": err.Error()})
+		return
+	}
+
+	type BybitResp struct {
+		Result struct {
+			List []struct {
+				Symbol       string `json:"symbol"`
+				LastPrice    string `json:"lastPrice"`
+				Price24hPcnt string `json:"price24hPcnt"`
+			} `json:"list"`
+		} `json:"result"`
+	}
+
+	var data BybitResp
+	if err := json.Unmarshal(body, &data); err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode([]interface{}{})
+		return
+	}
+
+	marketRows := make([]map[string]interface{}, 0, len(data.Result.List))
+	activeSymbol := s.GetActiveSymbol()
+
+	s.mu.RLock()
+	insightData := s.insight
+	s.mu.RUnlock()
+
+	for _, item := range data.Result.List {
+		lastPrice, _ := strconv.ParseFloat(item.LastPrice, 64)
+		price24hPcnt, _ := strconv.ParseFloat(item.Price24hPcnt, 64)
+		pct24h := price24hPcnt * 100
+
+		row := map[string]interface{}{
+			"symbol":    item.Symbol,
+			"lastPrice": lastPrice,
+			"pct24h":    pct24h,
+		}
+
+		if item.Symbol == activeSymbol {
+			row["signalStatus"] = insightData.SignalStatus
+			row["confidence"] = 1.0
+			row["trendState"] = insightData.TrendState
+		} else {
+			row["signalStatus"] = "WAIT"
+			row["confidence"] = 0.0
+		}
+
+		marketRows = append(marketRows, row)
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(marketRows)
+}
+
+func (s *Server) handleEngineConsensus(w http.ResponseWriter, r *http.Request) {
+	path := filepath.Join(s.baseDir, "agent_analysis.json")
+	raw, err := os.ReadFile(path)
+	if err == nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.Write(raw)
+		return
+	}
+	s.mu.RLock()
+	data := s.insight
+	s.mu.RUnlock()
+	s.jsonOK(w, data)
 }
 
 func (s *Server) PopForceExec() bool {

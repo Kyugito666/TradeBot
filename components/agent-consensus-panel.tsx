@@ -136,8 +136,8 @@ export function AgentConsensusPanel({
             </span>
           </div>
           <p className="mt-1 font-mono text-[11px] text-muted-foreground">
-            {pendingForecast.direction} {pendingForecast.symbol.replace("USDT", "")} · entry {num(pendingForecast.entry, 2)} · TP{" "}
-            {num(pendingForecast.tp, 2)} · SL {num(pendingForecast.sl, 2)}
+            {pendingForecast.direction} {(pendingForecast.symbol || "").replace("USDT", "")} · entry {num(pendingForecast.entry || 0, 2)} · TP{" "}
+            {num(pendingForecast.tp || 0, 2)} · SL {num(pendingForecast.sl || 0, 2)}
           </p>
           <p className="mt-0.5 text-[10px] text-muted-foreground">
             Agents are watching price to TP/SL — the outcome will be fed back to update their weights automatically.
@@ -164,8 +164,8 @@ export function AgentConsensusPanel({
             </span>
             <span className="text-muted-foreground">
               {" "}
-              ({lastGrade.pnlR >= 0 ? "+" : ""}
-              {lastGrade.pnlR.toFixed(2)}R) — agents self-adjusted.
+              ({(lastGrade.pnlR || 0) >= 0 ? "+" : ""}
+              {(lastGrade.pnlR || 0).toFixed(2)}R) — agents self-adjusted.
             </span>
           </div>
         </div>

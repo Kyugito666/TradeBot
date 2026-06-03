@@ -415,6 +415,97 @@ impl ConsensusEngine {
             *self.active_trade.lock().unwrap() = Some(trade);
         }
         
+        // --- START DUMP JSON FOR FRONTEND CONSENSUS TAB ---
+        let mut agent_outputs = Vec::new();
+        for v in votes {
+            let vote_str = match v.direction {
+                Direction::Buy => "LONG",
+                Direction::Sell => "SHORT",
+                Direction::Wait => "WAIT",
+            };
+            agent_outputs.push(serde_json::json!({
+                "agentId": v.agent,
+                "vote": vote_str,
+                "confidence": v.conviction,
+                "reasoning": v.reasoning,
+                "metrics": {}
+            }));
+        }
+
+        let mut agreeing = Vec::new();
+        let mut dissenting = Vec::new();
+        let mut vetoing = Vec::new();
+        let mut long_votes = 0;
+        let mut short_votes = 0;
+        let mut hold_votes = 0;
+        let mut veto_votes = 0;
+
+        for v in votes {
+            match v.direction {
+                Direction::Buy => long_votes += 1,
+                Direction::Sell => short_votes += 1,
+                Direction::Wait => hold_votes += 1,
+            }
+            if v.direction == action && action != Direction::Wait {
+                agreeing.push(v.agent.to_string());
+            } else if v.direction != Direction::Wait {
+                dissenting.push(v.agent.to_string());
+            }
+            if v.reasoning.to_lowercase().contains("veto") {
+                vetoing.push(v.agent.to_string());
+                veto_votes += 1;
+            }
+        }
+
+        let final_sig = match action {
+            Direction::Buy => "LONG",
+            Direction::Sell => "SHORT",
+            Direction::Wait => "WAIT",
+        };
+
+        let sym_str = std::str::from_utf8(&snap.symbol)
+            .unwrap_or("???")
+            .trim_matches('\0');
+
+        let json_dump = serde_json::json!({
+            "ok": true,
+            "ts": ts_ms,
+            "symbol": sym_str,
+            "consensus": {
+                "decision": if action != Direction::Wait { "VOTED" } else { "VETO" },
+                "signal": final_sig,
+                "confidence": confidence,
+                "votes": { "long": long_votes, "short": short_votes, "hold": hold_votes, "veto": veto_votes },
+                "agreeingAgents": agreeing,
+                "dissentingAgents": dissenting,
+                "vetoAgents": vetoing,
+                "reasoning": format!("Score: {:.3}, Buy/Sell/Wait: {}/{}/{}", score, long_votes, short_votes, hold_votes),
+                "entry": entry,
+                "tp": tp,
+                "sl": sl
+            },
+            "agentOutputs": agent_outputs,
+            "progress": {
+                "stage": "Consensus Reached",
+                "currentStep": 3,
+                "totalSteps": 3,
+                "agentsCompleted": votes.len(),
+                "totalAgents": 13,
+                "message": "Done",
+                "startedAt": ts_ms
+            },
+            "evolution": {
+                "version": 1,
+                "agentCount": votes.len(),
+            },
+            "agents": []
+        });
+
+        if let Ok(json_str) = serde_json::to_string(&json_dump) {
+            let _ = std::fs::write("agent_analysis.json", json_str);
+        }
+        // --- END DUMP JSON ---
+
         sig
     }
 

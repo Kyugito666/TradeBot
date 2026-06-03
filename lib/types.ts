@@ -231,3 +231,35 @@ export interface AgentsResponse {
   state: EvolutionState | null
   error?: string
 }
+
+export interface PaperTrade {
+  id: string
+  symbol: string
+  side: "LONG" | "SHORT"
+  entry: number
+  tp: number
+  sl: number
+  leverage: number
+  confidence: number
+  openedAt: number
+  reason: string
+  agentVotes?: any[]
+  exitPrice?: number
+  outcome?: string
+  pnlR?: number
+  pnlPct?: number
+}
+
+export interface SignalCandidate {
+  row: MarketRow
+  levels: {
+    side: "LONG" | "SHORT"
+    entry: number
+    tp: number
+    sl: number
+    leverage: number
+    riskReward: number
+    expectedRoiPct: number
+  }
+}
+

@@ -21,7 +21,20 @@ import type { MarketRow } from "@/lib/types"
 import type { AgentAnalysisResponse, TradingSettings } from "@/hooks/use-live-data"
 import type { PairStat } from "@/lib/backtest"
 import { useSignalTrades } from "@/hooks/use-signal-trades"
-import { styleConfidenceGate, type PaperTrade } from "@/lib/signal-engine"
+import type { PaperTrade } from "@/lib/types"
+
+function styleConfidenceGate(style: string) {
+  switch (style) {
+    case "scalp":
+      return 0.4
+    case "intraday":
+      return 0.6
+    case "swing":
+      return 0.75
+    default:
+      return 0.5
+  }
+}
 
 function priceFmt(n: number) {
   return num(n, n < 1 ? 5 : 2)

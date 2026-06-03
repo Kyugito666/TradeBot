@@ -76,37 +76,37 @@ export function SignalWatch({
         </thead>
         <tbody>
           {watchRows.map(({ label, row: m }) => {
-            const up = m.pct24h >= 0
+            const up = (m.pct24h || 0) >= 0
             return (
-              <tr key={m.symbol} className="border-t border-border/60 transition-colors hover:bg-muted/40">
+              <tr key={m.symbol || label} className="border-t border-border/60 transition-colors hover:bg-muted/40">
                 <td className="px-3 py-2 font-mono font-semibold text-foreground">{label}</td>
-                <td className="px-2 py-2 text-right font-mono tabular text-foreground">{num(m.lastPrice, m.lastPrice < 1 ? 4 : 2)}</td>
-                <td className={cn("px-2 py-2 text-right font-mono tabular", up ? "text-positive" : "text-negative")}>{pct(m.pct24h)}</td>
+                <td className="px-2 py-2 text-right font-mono tabular text-foreground">{num(m.lastPrice || 0, (m.lastPrice || 0) < 1 ? 4 : 2)}</td>
+                <td className={cn("px-2 py-2 text-right font-mono tabular", up ? "text-positive" : "text-negative")}>{pct(m.pct24h || 0)}</td>
                 <td className="px-2 py-2 text-center">
-                  <Tag tone={trendTone(m.trendState)}>{m.trendState.slice(0, 4)}</Tag>
+                  <Tag tone={trendTone(m.trendState || "FLAT")}>{(m.trendState || "FLAT").slice(0, 4)}</Tag>
                 </td>
-                <td className={cn("px-2 py-2 text-right font-mono tabular", m.rsi >= 70 ? "text-negative" : m.rsi <= 30 ? "text-positive" : "text-muted-foreground")}>{m.rsi.toFixed(0)}</td>
-                <td className={cn("px-2 py-2 text-right font-mono tabular", m.lsrVal > 1 ? "text-positive" : "text-negative")}>{num(m.lsrVal, 2)}</td>
+                <td className={cn("px-2 py-2 text-right font-mono tabular", (m.rsi || 50) >= 70 ? "text-negative" : (m.rsi || 50) <= 30 ? "text-positive" : "text-muted-foreground")}>{(m.rsi || 50).toFixed(0)}</td>
+                <td className={cn("px-2 py-2 text-right font-mono tabular", (m.lsrVal || 1) > 1 ? "text-positive" : "text-negative")}>{num(m.lsrVal || 1, 2)}</td>
                 <td className="px-2 py-2 text-center">
                   <span className={cn("font-mono text-[10px] font-semibold", m.whaleBias === "LONG_HEAVY" ? "text-positive" : m.whaleBias === "SHORT_HEAVY" ? "text-negative" : "text-muted-foreground")}>
                     {m.whaleBias === "LONG_HEAVY" ? "LONG" : m.whaleBias === "SHORT_HEAVY" ? "SHORT" : "BAL"}
                   </span>
                 </td>
-                <td className="px-2 py-2 text-right font-mono tabular text-muted-foreground">{compact(m.openInterest)}</td>
+                <td className="px-2 py-2 text-right font-mono tabular text-muted-foreground">{compact(m.openInterest || 0)}</td>
                 <td className="px-2 py-2">
                   <div className="mx-auto flex w-16 items-center gap-1.5">
                     <div className="h-1 flex-1 overflow-hidden rounded-full bg-muted">
-                      <div className={cn("h-full rounded-full", m.confidence > 0.6 ? "bg-positive" : m.confidence > 0.3 ? "bg-warning" : "bg-muted-foreground")} style={{ width: `${m.confidence * 100}%` }} />
+                      <div className={cn("h-full rounded-full", (m.confidence || 0) > 0.6 ? "bg-positive" : (m.confidence || 0) > 0.3 ? "bg-warning" : "bg-muted-foreground")} style={{ width: `${(m.confidence || 0) * 100}%` }} />
                     </div>
-                    <span className="w-6 text-right font-mono text-[10px] tabular text-muted-foreground">{(m.confidence * 100).toFixed(0)}</span>
+                    <span className="w-6 text-right font-mono text-[10px] tabular text-muted-foreground">{((m.confidence || 0) * 100).toFixed(0)}</span>
                   </div>
                 </td>
                 <td className="px-2 py-2 text-center">
-                  <Tag tone={sigTone(m.signalStatus)}>{m.signalStatus}</Tag>
+                  <Tag tone={sigTone(m.signalStatus || "WAIT")}>{m.signalStatus || "WAIT"}</Tag>
                 </td>
                 <td className="px-3 py-2">
                   <div className="flex justify-end">
-                    <Sparkline data={m.spark} tone={up ? "positive" : "negative"} width={76} height={22} />
+                    <Sparkline data={m.spark || []} tone={up ? "positive" : "negative"} width={76} height={22} />
                   </div>
                 </td>
               </tr>
