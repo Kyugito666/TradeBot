@@ -68,6 +68,7 @@ type Executor struct {
 	cfg    Config
 	client *http.Client
 	base   string
+	wsClient *WSClient
 }
 
 func New(cfg Config) *Executor {
@@ -76,6 +77,12 @@ func New(cfg Config) *Executor {
 		client: &http.Client{Timeout: 10 * time.Second},
 		base:   "https://contract.mexc.com",
 	}
+	
+	e.wsClient = NewWSClient(cfg.APIKey, cfg.APISecret)
+	if err := e.wsClient.Connect(context.Background()); err != nil {
+		log.Printf("[MEXC] WARNING: WS Connect failed: %v", err)
+	}
+	
 	return e
 }
 

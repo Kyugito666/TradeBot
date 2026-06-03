@@ -127,7 +127,8 @@ type Executor struct {
 	cfg      Config
 	client   *http.Client
 	base     string
-	balCache balanceCache // [FIX-BAL-SPAM] cached balance
+	balCache balanceCache
+	wsClient *WSClient
 }
 
 func New(cfg Config) *Executor {
@@ -143,6 +144,12 @@ func New(cfg Config) *Executor {
 		base: base,
 	}
 	e.balCache.ttl = balanceCacheTTL
+
+	e.wsClient = NewWSClient(cfg.Testnet, cfg.APIKey, cfg.APISecret)
+	if err := e.wsClient.Connect(context.Background()); err != nil {
+		log.Printf("[Executor] WARNING: WS Connect failed: %v", err)
+	}
+
 	return e
 }
 
@@ -209,41 +216,52 @@ func (e *Executor) execute(ctx context.Context, req OrderRequest) error {
 // ── Order placement ───────────────────────────────────────────────────────────
 
 func (e *Executor) placeOrder(ctx context.Context, req OrderRequest, size float64) (string, error) {
-	body := map[string]interface{}{
-		"category":    "linear",
-		"symbol":      bybitSymbol(req.Symbol),
-		"side":        req.Side,
-		"orderType":   "Limit",
-		"qty":         fmt.Sprintf("%.4f", size),
-		"price":       fmt.Sprintf("%.4f", req.Entry),
-		"timeInForce": "GTC",
-		"positionIdx": 0,
-		"takeProfit":  fmt.Sprintf("%.4f", req.TakeProfit),
-		"stopLoss":    fmt.Sprintf("%.4f", req.StopLoss),
-		"tpTriggerBy": "LastPrice",
-		"slTriggerBy": "LastPrice",
-		"tpslMode":    "Full",
+	reqID := fmt.Sprintf("order_%d", time.Now().UnixNano())
+	args := []interface{}{
+		map[string]interface{}{
+			"category":    "linear",
+			"symbol":      bybitSymbol(req.Symbol),
+			"side":        req.Side,
+			"orderType":   "Limit",
+			"qty":         fmt.Sprintf("%.4f", size),
+			"price":       fmt.Sprintf("%.4f", req.Entry),
+			"timeInForce": "GTC",
+			"positionIdx": 0,
+			"takeProfit":  fmt.Sprintf("%.4f", req.TakeProfit),
+			"stopLoss":    fmt.Sprintf("%.4f", req.StopLoss),
+			"tpTriggerBy": "LastPrice",
+			"slTriggerBy": "LastPrice",
+			"tpslMode":    "Full",
+			"orderLinkId": reqID,
+		},
 	}
 
-	resp, err := e.signedPost(ctx, "/v5/order/create", body)
+	cb, err := e.wsClient.SendRequest("order.create", args, reqID)
 	if err != nil {
 		return "", err
 	}
 
-	var result struct {
-		RetCode int    `json:"retCode"`
-		RetMsg  string `json:"retMsg"`
-		Result  struct {
-			OrderID string `json:"orderId"`
-		} `json:"result"`
+	select {
+	case <-ctx.Done():
+		return "", ctx.Err()
+	case resp := <-cb:
+		var result struct {
+			RetCode int    `json:"retCode"`
+			RetMsg  string `json:"retMsg"`
+			Data    struct {
+				OrderId string `json:"orderId"`
+			} `json:"data"`
+		}
+		if err := json.Unmarshal(resp, &result); err != nil {
+			return "", err
+		}
+		if result.RetCode != 0 {
+			return "", fmt.Errorf("bybit WS API %d: %s", result.RetCode, result.RetMsg)
+		}
+		return result.Data.OrderId, nil
+	case <-time.After(5 * time.Second):
+		return "", fmt.Errorf("websocket order creation timeout")
 	}
-	if err := json.Unmarshal(resp, &result); err != nil {
-		return "", err
-	}
-	if result.RetCode != 0 {
-		return "", fmt.Errorf("bybit API %d: %s", result.RetCode, result.RetMsg)
-	}
-	return result.Result.OrderID, nil
 }
 
 // ── Layer 2 / 3: TP/SL verification & fallback ───────────────────────────────

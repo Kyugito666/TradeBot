@@ -63,7 +63,7 @@ fn main() -> anyhow::Result<()> {
         Box::new(LinguistAgent),
         Box::new(LiquidatorAgent),
         Box::new(AbsurdistAgent),
-        Box::new(DataScientist),
+        Box::new(DataScientist::new()),
         Box::new(Statistician),
         Box::new(Psychologist),
         Box::new(Astrophysicist),

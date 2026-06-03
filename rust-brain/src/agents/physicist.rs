@@ -5,9 +5,9 @@
 // Runs 1000 × 24-step paths; derives directional bias from P5/P50/P95 spread.
 
 use rand::{rngs::SmallRng, SeedableRng};
-use rand_distr::{Distribution, StandardNormal};
+use rand_distr::{Distribution, StudentT};
 
-use super::{closes, wilder_atr, Agent, AgentVote, Direction};
+use super::{closes, Agent, AgentVote, Direction};
 use crate::shm::MarketSnapshot;
 
 pub struct PhysicistAgent {
@@ -24,8 +24,8 @@ impl Agent for PhysicistAgent {
 
     fn analyze(&self, snap: &MarketSnapshot) -> AgentVote {
         let c = closes(snap);
-        if c.len() < 30 {
-            return AgentVote::wait("physicist", "insufficient candles for GBM");
+        if c.len() < 200 {
+            return AgentVote::wait("physicist", "insufficient candles for GBM (need 200+)");
         }
 
         let price = snap.price;
@@ -77,7 +77,7 @@ impl Agent for PhysicistAgent {
         for fp in final_prices.iter_mut() {
             let mut p = price;
             for _ in 0..self.horizon {
-                let z: f64 = StandardNormal.sample(&mut rng);
+                let z: f64 = StudentT::new(3.0).unwrap().sample(&mut rng);
                 p *= (drift + diff * z).exp();
             }
             *fp = p;
@@ -123,7 +123,7 @@ fn percentile(sorted: &[f64], p: f64) -> f64 {
 /// Expose vol_crisis for consensus veto
 pub fn is_vol_crisis(snap: &MarketSnapshot) -> bool {
     let c = closes(snap);
-    if c.len() < 22 { return false; }
+    if c.len() < 200 { return false; }
     let returns: Vec<f64> = c.windows(2).map(|w| (w[1]/w[0]).ln()).collect();
     let n = returns.len() as f64;
     let mu = returns.iter().sum::<f64>() / n;

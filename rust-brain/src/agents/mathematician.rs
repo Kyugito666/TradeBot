@@ -20,8 +20,8 @@ impl Agent for MathematicianAgent {
 
     fn analyze(&self, snap: &MarketSnapshot) -> AgentVote {
         let c = closes(snap);
-        let h = highs(snap);
-        let l = lows(snap);
+        let _h = highs(snap);
+        let _l = lows(snap);
 
         if c.len() < self.period * 2 {
             return AgentVote::wait("mathematician", "insufficient candles");
@@ -100,7 +100,7 @@ impl Agent for MathematicianAgent {
         let prob_down = 1.0 - prob_up;
 
         // ── Noise ratio (veto trigger in consensus) ───────────────────────────
-        let atr       = wilder_atr(&h, &l, &c, self.period);
+        let atr       = wilder_atr(&_h, &_l, &c, self.period);
         let body_last = (c.last().unwrap() - snap.candles.last().unwrap().open).abs();
         let range_last = snap.candles.last().map(|c| c.high - c.low).unwrap_or(1.0);
         let noise_ratio = if range_last > 1e-9 {
@@ -118,13 +118,16 @@ impl Agent for MathematicianAgent {
             (Direction::Wait, 0.5)
         };
 
+        let rsi_pct = rolling_percentile(rsi_val, &c);
+        let z_pct = rolling_percentile(z, &c);
+
         AgentVote {
             agent:      "mathematician",
             direction:  dir,
             conviction,
             reasoning:  format!(
-                "RSI={:.1} Z={:.2} P(up)={:.3} P(dn)={:.3} noise={:.2} anomaly={anomaly} ATR={:.4}",
-                rsi_val, z, prob_up, prob_down, noise_ratio, atr
+                "RSI_Pct={:.1}% Z_Pct={:.1}% P(up)={:.3} P(dn)={:.3} noise={:.2} anomaly={anomaly} ATR={:.4}",
+                rsi_pct, z_pct, prob_up, prob_down, noise_ratio, atr
             ),
         }
     }
@@ -143,4 +146,11 @@ pub fn compute_veto_fields(snap: &MarketSnapshot) -> (f64, bool) {
     let noise_ratio = if range > 1e-9 { (range - body) / range } else { 0.0 };
     let anomaly     = z.abs() > 4.0;
     (noise_ratio, anomaly)
+}
+
+
+fn rolling_percentile(val: f64, history: &[f64]) -> f64 {
+    if history.is_empty() { return 50.0; }
+    let count = history.iter().filter(|&&x| x <= val).count();
+    (count as f64 / history.len() as f64) * 100.0
 }

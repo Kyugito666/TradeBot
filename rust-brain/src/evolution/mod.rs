@@ -31,11 +31,15 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
 use std::sync::Mutex;
+use rusqlite::Connection;
+use std::sync::mpsc;
+use std::thread;
 
 pub const EVOLUTION_FILE: &str = "agent_evolution.json";
 pub const LEGACY_WEIGHTS_FILE: &str = "agent_rl_weights.json";
 
-const MAX_RECENT: usize = 20; // rolling window untuk recent-accuracy
+const MAX_RECENT: usize = 20;
+const MAX_RECENT_PNL: usize = 50; // rolling window untuk recent-accuracy
 const MAX_REPORTS: usize = 60; // ring-buffer laporan evaluasi
 const BASE_LR: f64 = 0.05; // learning-rate dasar
 
@@ -77,10 +81,13 @@ pub struct AgentScorecard {
     pub incorrect: u64,
     pub accuracy: f64,
     pub recent_accuracy: f64,
-    pub pnl_contrib: f64, // proxy kontribusi R: +rr kalau ikut menang, -1 kalau ikut kalah
+    pub expected_value: f64, // EV dari MAX_RECENT_PNL
+    pub pnl_contrib: f64,
     pub wrong_streak: u32,
     #[serde(default)]
-    pub recent: Vec<bool>, // true = benar, false = salah (window MAX_RECENT)
+    pub recent: Vec<bool>, 
+    #[serde(default)]
+    pub recent_pnl: Vec<f64>,
 }
 
 // ── Laporan evaluasi (format SAMA untuk semua agent) ─────────────────────────
@@ -102,6 +109,7 @@ pub struct EvaluationReport {
     pub activation_gate_after: f64,
     pub accuracy: f64,
     pub recent_accuracy: f64,
+    pub expected_value: f64,
 }
 
 // ── Scorecard level-team (agregasi) ──────────────────────────────────────────
@@ -115,9 +123,12 @@ pub struct TeamScorecard {
     pub drawdown_r: f64,
     pub win_streak: u32,
     pub loss_streak: u32,
-    pub conservatism_bias: f64, // ditambahkan ke min_confidence consensus
+    pub conservatism_bias: f64,
+    pub expected_value: f64,
     #[serde(default)]
     pub recent_results: Vec<bool>,
+    #[serde(default)]
+    pub recent_pnl: Vec<f64>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -140,22 +151,70 @@ pub struct EvolutionState {
 
 pub struct EvolutionEngine {
     state: Mutex<EvolutionState>,
+    tx: mpsc::Sender<EvolutionState>,
 }
 
 impl EvolutionEngine {
     /// `defaults` = daftar (nama_agent, bobot_awal). Menambah agent baru cukup
     /// menambahkan entri di sini (atau di WEIGHTS consensus) — framework otomatis
     /// menyiapkan scorecard + tunable-nya.
+    
     pub fn new(defaults: &[(&str, f64)]) -> Self {
-        let mut state = Self::load_state().unwrap_or_default();
+        let conn = Connection::open("agent_evolution.db").unwrap();
+        conn.pragma_update(None, "journal_mode", "WAL").unwrap();
+        conn.pragma_update(None, "synchronous", "NORMAL").unwrap();
+
+        conn.execute("CREATE TABLE IF NOT EXISTS agents (name TEXT PRIMARY KEY, tunables_json TEXT, scorecard_json TEXT, last_report_json TEXT)", []).unwrap();
+        conn.execute("CREATE TABLE IF NOT EXISTS team (id INTEGER PRIMARY KEY, team_json TEXT)", []).unwrap();
+        conn.execute("CREATE TABLE IF NOT EXISTS reports (id INTEGER PRIMARY KEY AUTOINCREMENT, report_json TEXT)", []).unwrap();
+
+        let mut state = EvolutionState::default();
         state.version = 1;
+
+        if let Ok(mut stmt) = conn.prepare("SELECT name, tunables_json, scorecard_json, last_report_json FROM agents") {
+            if let Ok(agent_iter) = stmt.query_map([], |row| {
+                let name: String = row.get(0)?;
+                let t_json: String = row.get(1)?;
+                let s_json: String = row.get(2)?;
+                let r_json: Option<String> = row.get(3)?;
+                
+                let tunables = serde_json::from_str(&t_json).unwrap_or_default();
+                let scorecard = serde_json::from_str(&s_json).unwrap_or_default();
+                let last_report = r_json.and_then(|j| serde_json::from_str(&j).ok());
+                
+                Ok((name, AgentRecord { tunables, scorecard, last_report }))
+            }) {
+                for a in agent_iter {
+                    if let Ok((name, rec)) = a {
+                        state.agents.insert(name, rec);
+                    }
+                }
+            }
+        }
+
+        if let Ok(team_json) = conn.query_row("SELECT team_json FROM team WHERE id=1", [], |row| row.get::<_, String>(0)) {
+            state.team = serde_json::from_str(&team_json).unwrap_or_default();
+        }
+
+        if let Ok(mut stmt) = conn.prepare("SELECT report_json FROM reports ORDER BY id DESC LIMIT 60") {
+            if let Ok(reports_iter) = stmt.query_map([], |row| {
+                let j: String = row.get(0)?;
+                Ok(serde_json::from_str(&j).ok())
+            }) {
+                for r in reports_iter {
+                    if let Ok(Some(report)) = r {
+                        state.reports.push(report);
+                    }
+                }
+                state.reports.reverse();
+            }
+        }
 
         let legacy = Self::load_legacy_weights();
 
         for (name, w) in defaults {
             if !state.agents.contains_key(*name) {
                 let mut rec = AgentRecord::default();
-                // Seed bobot: pakai file lama kalau ada, kalau tidak pakai default.
                 rec.tunables.weight = legacy.get(*name).copied().unwrap_or(*w);
                 state.agents.insert((*name).to_string(), rec);
                 log::info!(
@@ -174,17 +233,52 @@ impl EvolutionEngine {
             state.team.conservatism_bias
         );
 
+        let (tx, rx) = mpsc::channel::<EvolutionState>();
+        thread::spawn(move || {
+            let mut conn = Connection::open("agent_evolution.db").unwrap();
+            conn.pragma_update(None, "journal_mode", "WAL").unwrap();
+            conn.pragma_update(None, "synchronous", "NORMAL").unwrap();
+
+            while let Ok(s) = rx.recv() {
+                if let Ok(tx_db) = conn.transaction() {
+                    for (name, rec) in &s.agents {
+                        let t_json = serde_json::to_string(&rec.tunables).unwrap();
+                        let s_json = serde_json::to_string(&rec.scorecard).unwrap();
+                        let r_json = rec.last_report.as_ref().map(|r| serde_json::to_string(r).unwrap());
+                        
+                        let _ = tx_db.execute(
+                            "INSERT OR REPLACE INTO agents (name, tunables_json, scorecard_json, last_report_json) VALUES (?1, ?2, ?3, ?4)",
+                            (name, &t_json, &s_json, &r_json),
+                        );
+                    }
+
+                    if let Ok(team_json) = serde_json::to_string(&s.team) {
+                        let _ = tx_db.execute(
+                            "INSERT OR REPLACE INTO team (id, team_json) VALUES (1, ?1)",
+                            (&team_json,),
+                        );
+                    }
+
+                    let _ = tx_db.execute("DELETE FROM reports", []);
+                    for r in &s.reports {
+                        if let Ok(j) = serde_json::to_string(r) {
+                            let _ = tx_db.execute("INSERT INTO reports (report_json) VALUES (?1)", (&j,));
+                        }
+                    }
+
+                    let _ = tx_db.commit();
+                }
+            }
+        });
+
         Self {
             state: Mutex::new(state),
+            tx,
         }
     }
 
-    fn load_state() -> Option<EvolutionState> {
-        let data = fs::read_to_string(EVOLUTION_FILE).ok()?;
-        serde_json::from_str(&data).ok()
-    }
-
     fn load_legacy_weights() -> HashMap<String, f64> {
+
         fs::read_to_string(LEGACY_WEIGHTS_FILE)
             .ok()
             .and_then(|d| serde_json::from_str::<HashMap<String, f64>>(&d).ok())
@@ -202,6 +296,33 @@ impl EvolutionEngine {
     }
 
     /// Bias konservatisme team — ditambahkan ke min_confidence consensus.
+        pub fn team_expected_value(&self) -> f64 {
+        self.state.lock().unwrap().team.expected_value
+    }
+    
+    pub fn team_recent_pnl(&self) -> Vec<f64> {
+        self.state.lock().unwrap().team.recent_pnl.clone()
+    }
+
+    pub fn team_kelly_stats(&self) -> (f64, f64) {
+        let s = self.state.lock().unwrap();
+        let w = if s.team.trades > 0 {
+            s.team.wins as f64 / s.team.trades as f64
+        } else {
+            0.5
+        };
+        let mut sum_r = 0.0;
+        let mut count_r = 0.0;
+        for &p in &s.team.recent_pnl {
+            if p > 0.0 {
+                sum_r += p;
+                count_r += 1.0;
+            }
+        }
+        let r = if count_r > 0.0 { sum_r / count_r } else { 1.0 };
+        (w, r)
+    }
+
     pub fn conservatism_bias(&self) -> f64 {
         self.state.lock().unwrap().team.conservatism_bias
     }
@@ -233,6 +354,8 @@ impl EvolutionEngine {
             state.team.net_pnl_r -= 1.0;
         }
         push_capped(&mut state.team.recent_results, is_win);
+        push_capped_pnl(&mut state.team.recent_pnl, if is_win { rr.max(0.1) } else { -1.0 });
+        state.team.expected_value = calc_ev(&state.team.recent_pnl);
         if state.team.net_pnl_r > state.team.peak_r {
             state.team.peak_r = state.team.net_pnl_r;
         }
@@ -278,6 +401,7 @@ impl EvolutionEngine {
                 activation_gate_after: 0.0,
                 accuracy: acc,
                 recent_accuracy: rec_acc,
+                expected_value: state.team.expected_value,
             };
             emitted.push(report);
         }
@@ -309,17 +433,21 @@ impl EvolutionEngine {
                 rec.scorecard.wrong_streak += 1;
             }
             push_capped(&mut rec.scorecard.recent, was_correct);
-            rec.scorecard.accuracy = rec.scorecard.correct as f64 / rec.scorecard.trades.max(1) as f64;
-            rec.scorecard.recent_accuracy = recent_rate(&rec.scorecard.recent);
-            rec.scorecard.pnl_contrib += if agreed {
-                if is_win {
-                    rr.max(0.1)
-                } else {
-                    -1.0
-                }
+            
+            let pnl_this_trade = if agreed {
+                if is_win { rr.max(0.1) } else { -1.0 }
             } else {
                 0.0
             };
+            
+            if agreed {
+                push_capped_pnl(&mut rec.scorecard.recent_pnl, pnl_this_trade);
+            }
+            
+            rec.scorecard.accuracy = rec.scorecard.correct as f64 / rec.scorecard.trades.max(1) as f64;
+            rec.scorecard.recent_accuracy = recent_rate(&rec.scorecard.recent);
+            rec.scorecard.expected_value = calc_ev(&rec.scorecard.recent_pnl);
+            rec.scorecard.pnl_contrib += pnl_this_trade;
 
             let before_w = rec.tunables.weight;
             let before_cs = rec.tunables.conviction_scale;
@@ -328,25 +456,24 @@ impl EvolutionEngine {
             let lr = BASE_LR * conv.max(0.05);
             let mut adjustments: Vec<String> = Vec::new();
 
-            // Adaptasi bobot (aturan konsisten untuk semua agent):
+            // Adaptasi bobot berdasarkan PROPORTIONAL R/R:
             let dw = if agreed && is_win {
-                lr // reward: ikut trade menang
+                lr * rr.clamp(0.1, 5.0) // reward proporsional thd RR
             } else if agreed && !is_win {
-                -lr * 1.5 // punish keras: ikut trade kalah
+                -lr * 1.5 
             } else if !agreed && is_win {
-                -lr * 0.5 // punish ringan: nolak trade menang
+                -lr * 0.5 
             } else {
-                lr * 0.5 // reward ringan: nolak trade kalah (nyelametin)
+                lr * 0.5 
             };
             rec.tunables.weight = (rec.tunables.weight + dw).clamp(WEIGHT_MIN, WEIGHT_MAX);
             if (rec.tunables.weight - before_w).abs() > 1e-9 {
                 adjustments.push(format!("weight {:+.4} -> {:.4}", dw, rec.tunables.weight));
             }
 
-            // Self-evaluation: kalau agent SALAH di trade ini -> dia mengetatkan
-            // dirinya sendiri (turunkan keberanian, naikkan ambang aktivasi).
+            // Self-evaluation: Gunakan Expected Value sebagai penentu
             if !was_correct {
-                if rec.scorecard.recent_accuracy < 0.45 {
+                if rec.scorecard.expected_value < 0.0 {
                     rec.tunables.activation_gate =
                         (rec.tunables.activation_gate + 0.05).min(GATE_MAX);
                     rec.tunables.conviction_scale =
@@ -367,7 +494,7 @@ impl EvolutionEngine {
                         rec.tunables.conviction_scale
                     ));
                 }
-            } else if rec.scorecard.recent_accuracy > 0.60 {
+            } else if rec.scorecard.expected_value > 0.20 {
                 // Track-record bagus -> pulihkan keberanian & buka gate pelan-pelan.
                 let cs = (rec.tunables.conviction_scale + 0.02).min(CONV_SCALE_MAX);
                 let ag = (rec.tunables.activation_gate - 0.02).max(0.0);
@@ -403,6 +530,7 @@ impl EvolutionEngine {
                 activation_gate_after: rec.tunables.activation_gate,
                 accuracy: rec.scorecard.accuracy,
                 recent_accuracy: rec.scorecard.recent_accuracy,
+                expected_value: rec.scorecard.expected_value,
             };
             rec.last_report = Some(report.clone());
 
@@ -422,25 +550,16 @@ impl EvolutionEngine {
         }
         state.updated_ms = ts_ms;
 
-        Self::persist(&state);
+        
+        Self::persist(&state, &self.tx);
         emitted
     }
 
-    fn persist(state: &EvolutionState) {
-        if let Ok(json) = serde_json::to_string_pretty(state) {
-            let _ = fs::write(EVOLUTION_FILE, json);
-        }
-        // Kompatibilitas mundur: tulis peta bobot datar.
-        let weights: HashMap<String, f64> = state
-            .agents
-            .iter()
-            .map(|(k, v)| (k.clone(), v.tunables.weight))
-            .collect();
-        if let Ok(json) = serde_json::to_string_pretty(&weights) {
-            let _ = fs::write(LEGACY_WEIGHTS_FILE, json);
-        }
+    fn persist(state: &EvolutionState, tx: &mpsc::Sender<EvolutionState>) {
+        let _ = tx.send(state.clone());
     }
 }
+
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -458,6 +577,19 @@ fn dir_str(d: Direction) -> String {
         Direction::Sell => "SELL".to_string(),
         Direction::Wait => "WAIT".to_string(),
     }
+}
+
+fn push_capped_pnl(v: &mut Vec<f64>, val: f64) {
+    v.push(val);
+    let len = v.len();
+    if len > MAX_RECENT_PNL {
+        v.drain(0..len - MAX_RECENT_PNL);
+    }
+}
+
+fn calc_ev(v: &[f64]) -> f64 {
+    if v.is_empty() { return 0.0; }
+    v.iter().sum::<f64>() / v.len() as f64
 }
 
 fn push_capped(v: &mut Vec<bool>, val: bool) {
@@ -490,14 +622,14 @@ fn build_verdict(
         (false, false) => "nolak trade yang kalah (bantu nyelametin)",
     };
     format!(
-        "Trade {outcome}: {agent} {role}. Self-eval -> {}. acc={:.0}% recent={:.0}% wrong_streak={}",
+        "Trade {outcome}: {agent} {role}. Self-eval -> {}. acc={:.0}% EV={:.2}R wrong_streak={}",
         if was_correct {
             "perkuat sinyal"
         } else {
             "ketatkan threshold"
         },
         sc.accuracy * 100.0,
-        sc.recent_accuracy * 100.0,
+        sc.expected_value,
         sc.wrong_streak
     )
 }

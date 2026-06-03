@@ -47,6 +47,7 @@ import (
 	"tradebot/go-engine/gateway"
 	"tradebot/go-engine/market"
 	"tradebot/go-engine/nlp"
+	"tradebot/go-engine/repository"
 	"tradebot/go-engine/shm"
 )
 
@@ -216,42 +217,35 @@ func main() {
 	paperTradeOpenedAts := make(map[string]time.Time)
 	var paperHistory []gateway.Position
 
-	type PaperTradesState struct {
-		Active   map[string]*gateway.Position `json:"active"`
-		History  []gateway.Position           `json:"history"`
-		OpenedAt map[string]time.Time         `json:"opened_at"`
-	}
-
-	stateFile := filepath.Join(cfg.BaseDir, "paper_trades.json")
-	if b, err := os.ReadFile(stateFile); err == nil {
-		var state PaperTradesState
-		if err := json.Unmarshal(b, &state); err == nil {
-			if state.Active != nil {
-				activePaperTrades = state.Active
-			}
-			paperHistory = state.History
-			if state.OpenedAt != nil {
-				paperTradeOpenedAts = state.OpenedAt
-			}
-			log.Printf("[Paper] Hydrated persistent state: actives=%d history_len=%d", len(activePaperTrades), len(paperHistory))
-			// Just send the first active one for dashboard backward compatibility, or update dashboard to handle multiple
+	dbPath := filepath.Join(cfg.BaseDir, "paper_trades.db")
+	paperRepo, err := repository.NewPaperTradeRepo(dbPath)
+	if err != nil {
+		log.Printf("[Paper] WARNING: Failed to initialize SQLite repo: %v", err)
+	} else {
+		act, opAts, hist, err := paperRepo.LoadState()
+		if err == nil {
+			activePaperTrades = act
+			paperTradeOpenedAts = opAts
+			paperHistory = hist
+			log.Printf("[Paper] Hydrated persistent state from SQLite: actives=%d history_len=%d", len(activePaperTrades), len(paperHistory))
+			
 			var anyActive *gateway.Position
 			for _, v := range activePaperTrades {
 				anyActive = v
 				break
 			}
 			srv.UpdatePositions(anyActive, paperHistory)
+		} else {
+			log.Printf("[Paper] ERROR loading state from SQLite: %v", err)
 		}
 	}
 
 	savePaperState := func() {
-		state := PaperTradesState{
-			Active:   activePaperTrades,
-			History:  paperHistory,
-			OpenedAt: paperTradeOpenedAts,
-		}
-		if b, err := json.MarshalIndent(state, "", "  "); err == nil {
-			os.WriteFile(stateFile, b, 0644)
+		if paperRepo != nil {
+			err := paperRepo.SaveActiveTrades(activePaperTrades, paperTradeOpenedAts)
+			if err != nil {
+				log.Printf("[Paper] ERROR saving active trades: %v", err)
+			}
 		}
 	}
 
@@ -457,6 +451,14 @@ func main() {
 						if len(paperHistory) > 50 {
 							paperHistory = paperHistory[:50]
 						}
+						
+						if paperRepo != nil {
+							err := paperRepo.SaveHistory(activePaperTrade, paperTradeOpenedAts[currentSym])
+							if err != nil {
+								log.Printf("[Paper] ERROR saving history to SQLite: %v", err)
+							}
+						}
+
 						delete(activePaperTrades, currentSym)
 						delete(paperTradeOpenedAts, currentSym)
 						activePaperTrade = nil

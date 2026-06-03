@@ -364,6 +364,19 @@ impl ConsensusEngine {
             return self.make_wait(votes, reason, ts_ms);
         }
 
+        let (w, r_kelly) = self.evolution.team_kelly_stats();
+        let f = if r_kelly > 0.0 {
+            w - ((1.0 - w) / r_kelly)
+        } else {
+            0.0
+        };
+
+        if matches!(action, Direction::Buy | Direction::Sell) && f <= 0.02 {
+            let reason = format!("VETO: Kelly Criterion negatif/rendah (f={:.3}). Expected Value tidak menguntungkan untuk risk ini.", f);
+            log::warn!("[Otak-AI] {}", reason);
+            return self.make_wait(votes, reason.clone(), ts_ms);
+        }
+
         let mut agent_dirs        = [0u8; AGENT_COUNT];
         let mut agent_convictions = [0.0f64; AGENT_COUNT];
         for (i, vote) in votes.iter().take(AGENT_COUNT).enumerate() {
