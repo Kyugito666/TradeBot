@@ -382,7 +382,7 @@ export function useLiveData() {
           const savedById = new Map(savedSettings.cexes.map((c: any) => [c.id, c]))
           const mergedCexes = DEFAULT_TRADING_SETTINGS.cexes.map((def) => ({
             ...def,
-            ...savedById.get(def.id),
+            ...(savedById.get(def.id) ?? {}),
           }))
           for (const c of savedSettings.cexes) {
             if (c.id === "all") continue
@@ -788,7 +788,7 @@ export function useLiveData() {
   const saveBacktestResult = useCallback((result: BacktestResult) => {
     setBacktests((prev) => {
       // Prevent saving the exact same run twice if the user replays it
-      if (prev.some(b => b.timestamp === result.timestamp && b.trades === result.trades)) return prev;
+      if (prev.some(b => b.ranAt === result.ranAt && b.trades === result.trades)) return prev;
       const next = [result, ...prev].slice(0, 20)
       localStore.saveBacktests(next)
       return next

@@ -101,12 +101,15 @@ export function buildPerformance(history: EnginePosition[], balance: number): Pe
 
   const baseline = Math.max(1, balance - realizedPnl)
   let eq = baseline
+  const now = Date.now()
   const curve = realized.map((r, i) => {
     eq += r
-    return { t: `T${i + 1}`, equity: Number(eq.toFixed(2)) }
+    const parsed = new Date(trades[i]?.time ?? "").getTime()
+    const t = Number.isFinite(parsed) ? parsed : now - (realized.length - i) * 60000
+    return { t, equity: Number(eq.toFixed(2)) }
   })
   // anchor the curve with its starting equity
-  curve.unshift({ t: "T0", equity: Number(baseline.toFixed(2)) })
+  curve.unshift({ t: (curve[0]?.t ?? now) - 60000, equity: Number(baseline.toFixed(2)) })
 
   return {
     curve,

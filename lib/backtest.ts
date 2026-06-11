@@ -126,6 +126,7 @@ export interface PairCandles {
   highs: number[]
   lows: number[]
   closes: number[]
+  volumes?: number[]
 }
 
 const STYLE_MIN_CONFIDENCE: Record<TradingStyle, number> = { scalp: 0.45, intraday: 0.35, swing: 0.3 }

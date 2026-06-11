@@ -26,7 +26,7 @@ export function QuantPanel({ symbol }: { symbol?: string }) {
   // Derive quant-like metrics from available data
   const price = active?.lastPrice || 0;
   const volume24h = active?.volume24h || 0;
-  const priceChange = active?.priceChangePct || 0;
+  const priceChange = active?.pct24h || 0;
 
   // Simulated quant metrics derived from available data
   const volatility = Math.abs(priceChange) * 2.5;
