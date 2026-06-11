@@ -53,6 +53,7 @@ export interface Position {
   tp: number
   sl: number
   margin: number // USD margin allocated
+  leverage?: number
   pnlPct: number // ROE %
   pnlUsd: number // unrealized USD
   status: string

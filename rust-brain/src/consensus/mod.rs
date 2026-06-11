@@ -10,28 +10,16 @@ use crate::agents::{AgentVote, Direction};
 use crate::evolution::EvolutionEngine;
 use crate::shm::{MarketSnapshot, SignalOutput, AGENT_COUNT};
 use chrono::Utc;
+use std::collections::HashMap;
 use std::sync::Mutex;
 
-const WEIGHTS: [(&str, f64); 13] = [
-    ("mathematician", 0.25),
-    ("physicist",     0.20),
-    ("cryptographer", 0.15),
-    ("linguist",      0.10),
-    ("liquidator",    0.10),
-    ("absurdist",     0.10),
-    ("game_theorist", 0.15),
-    ("economist",     0.15),
-    ("data_engineer", 0.0), // gatekeeper, no weight
-    ("data_scientist",0.15),
-    ("statistician",  0.15),
-    ("psychologist",  0.10),
-    ("astrophysicist",0.15),
-];
 
-const ABSURDIST_DAMP: f64 = 0.30;
-const LINGUIST_DAMP:  f64 = 0.50;
+
+
+
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 struct StyleConfig {
     style_name:     String,
     min_confidence: f64,
@@ -43,7 +31,15 @@ struct StyleConfig {
 }
 
 fn read_trading_style() -> String {
-    for filename in &["bot_runtime.conf", ".env"] {
+    let mut search_paths: Vec<String> = Vec::new();
+    // Check BOT_BASE_DIR first (D:\database\engine)
+    if let Ok(base) = std::env::var("BOT_BASE_DIR") {
+        search_paths.push(format!("{}/bot_runtime.conf", base));
+    }
+    search_paths.push("bot_runtime.conf".to_string());
+    search_paths.push(".env".to_string());
+
+    for filename in &search_paths {
         if let Ok(content) = std::fs::read_to_string(filename) {
             for line in content.lines() {
                 let line = line.trim();
@@ -132,237 +128,312 @@ fn ema_alignment(snap: &MarketSnapshot) -> (f64, f64, f64, bool, bool) {
 enum QuantVetoResult {
     Clear,
     Hard(String),
+    #[allow(dead_code)]
     Soft(f64),
 }
 
 #[derive(Debug, Clone)]
-struct ActiveTrade {
-    entry_price: f64,
-    tp: f64,
-    sl: f64,
-    direction: Direction,
-    agent_votes: Vec<(String, Direction, f64)>, // (agent_name, vote, conviction)
-    status: String, // "PENDING" or "OPEN"
+pub struct ShadowTrade {
+    pub db_id: i64,
+    pub entry_price: f64,
+    pub tp: f64,
+    pub sl: f64,
+    pub direction: Direction,
+    pub agent_votes: Vec<(String, Direction, f64)>,
+    pub status: String,
 }
 
 pub struct ConsensusEngine {
-    active_trade: Mutex<Option<ActiveTrade>>,
-    // Framework self-evaluation terpusat. Memegang scorecard + tunable adaptif
-    // (weight / conviction_scale / activation_gate) untuk SEMUA agent, plus
-    // konservatisme level-team. Lihat src/evolution/mod.rs.
+    shadow_trades: Mutex<HashMap<String, Vec<ShadowTrade>>>,
     evolution: EvolutionEngine,
+    db_client: std::sync::Arc<crate::db::DbClient>,
+    is_live: bool,
 }
 
 impl ConsensusEngine {
-    pub fn new() -> Self {
-        // WEIGHTS = daftar agent + bobot awal. EvolutionEngine otomatis bikin
-        // scorecard/tunable untuk tiap nama di sini (atau load dari file kalau ada).
-        // Tambah agent baru? Cukup tambahkan entri di WEIGHTS — tidak ada
-        // perubahan arsitektur lain yang diperlukan.
-        let evolution = EvolutionEngine::new(&WEIGHTS);
+    pub fn new(db_client: std::sync::Arc<crate::db::DbClient>, is_live: bool) -> Self {
+        let evolution = EvolutionEngine::new(&[], db_client.clone());
         Self {
-            active_trade: Mutex::new(None),
+            shadow_trades: Mutex::new(HashMap::new()),
             evolution,
+            db_client,
+            is_live,
         }
     }
 
-    pub fn evaluate(&self, votes: &[AgentVote], snap: &MarketSnapshot) -> SignalOutput {
-        // Cek trade yang sedang berjalan untuk feedback RL (Self-Learning)
+    pub fn get_positions(&self) -> HashMap<String, Vec<ShadowTrade>> {
+        self.shadow_trades.lock().unwrap().clone()
+    }
+
+    pub fn process_shadow_trades(&self, snap: &MarketSnapshot, global_veto: bool) {
         let price = snap.price;
-        let mut trade_finished = false;
-        let mut is_win = false;
+        let sym = std::str::from_utf8(&snap.symbol).unwrap_or("UNK").trim_end_matches('\0').to_string();
         
-        {
-            let mut trade_lock = self.active_trade.lock().unwrap();
-            if let Some(trade) = trade_lock.as_mut() {
-                if trade.status == "PENDING" {
-                    if (trade.direction == Direction::Buy && price <= trade.entry_price) ||
-                       (trade.direction == Direction::Sell && price >= trade.entry_price) {
-                        trade.status = "OPEN".to_string();
-                        log::info!("[RL-Brain] Limit Order Kejemput! Status PENDING -> OPEN @ {}", trade.entry_price);
+        let mut all_shadows = self.shadow_trades.lock().unwrap();
+        if let Some(shadow_lock) = all_shadows.get_mut(&sym) {
+            let mut i = 0;
+            while i < shadow_lock.len() {
+                let mut trade_finished = false;
+                let mut is_win = false;
+                
+                // If global_veto is triggered, forcefully kill all PENDING and OPEN trades to mitigate risk.
+                if global_veto {
+                    shadow_lock[i].status = "VETO_KILLED".to_string();
+                    log::warn!("[Room_Shadow] VETO DITEKAN! Membunuh secara paksa posisi {:?} limit @ {}", shadow_lock[i].direction, shadow_lock[i].entry_price);
+                    trade_finished = true;
+                    is_win = false; // Force loss or break-even logically
+                } else if shadow_lock[i].status == "PENDING" {
+                    if (shadow_lock[i].direction == Direction::Buy && price <= shadow_lock[i].entry_price) ||
+                       (shadow_lock[i].direction == Direction::Sell && price >= shadow_lock[i].entry_price) {
+                        shadow_lock[i].status = "OPEN".to_string();
+                        log::info!("[Room_Shadow] Limit Order Kejemput! Status PENDING -> OPEN @ {}", shadow_lock[i].entry_price);
                     }
-                } else if trade.status == "OPEN" {
-                    if trade.direction == Direction::Buy {
-                        if price >= trade.tp { trade_finished = true; is_win = true; }
-                        else if price <= trade.sl { trade_finished = true; is_win = false; }
-                    } else if trade.direction == Direction::Sell {
-                        if price <= trade.tp { trade_finished = true; is_win = true; }
-                        else if price >= trade.sl { trade_finished = true; is_win = false; }
+                } else if shadow_lock[i].status == "OPEN" {
+                    if shadow_lock[i].direction == Direction::Buy {
+                        if price >= shadow_lock[i].tp { trade_finished = true; is_win = true; }
+                        else if price <= shadow_lock[i].sl { trade_finished = true; is_win = false; }
+                    } else if shadow_lock[i].direction == Direction::Sell {
+                        if price <= shadow_lock[i].tp { trade_finished = true; is_win = true; }
+                        else if price >= shadow_lock[i].sl { trade_finished = true; is_win = false; }
                     }
                 }
-                
+
                 if trade_finished {
-                    log::info!("[Evolusi] Trade kelar. Win={}. Memicu evaluasi mandiri tiap agent + team!", is_win);
-                    let t = trade.clone();
-                    drop(trade_lock); // release lock sebelum evaluasi
-
-                    // Risk-reward realisasi sebagai proxy magnitude reward/punish.
-                    let sl_dist = (t.entry_price - t.sl).abs().max(1e-8);
-                    let tp_dist = (t.tp - t.entry_price).abs();
-                    let rr = tp_dist / sl_dist;
+                    let t = &shadow_lock[i];
                     let now_ms = Utc::now().timestamp_millis();
-
-                    let reports = self.evolution.on_trade_closed(
-                        &t.agent_votes, t.direction, is_win, rr, now_ms,
-                    );
-                    for r in &reports {
-                        let adj = if r.adjustments.is_empty() {
-                            "no-change".to_string()
-                        } else {
-                            r.adjustments.join(", ")
-                        };
-                        log::info!("[Evolusi:{}] {} | {}", r.agent, r.verdict, adj);
+                    if self.is_live {
+                        self.db_client.update_shadow_trade(t.db_id, now_ms, price, is_win);
                     }
+                    if t.status == "VETO_KILLED" {
+                        log::info!("[Room_Shadow] Shadow Trade (id={}) Dibatalkan oleh VETO Sistem.", t.db_id);
+                    } else {
+                        log::info!("[Room_Shadow] Shadow Trade Selesai (id={}). Win={}. Memicu evaluasi mandiri agen!", t.db_id, is_win);
+                        
+                        let sl_dist = (t.entry_price - t.sl).abs().max(1e-8);
+                        let tp_dist = (t.tp - t.entry_price).abs();
+                        let rr = tp_dist / sl_dist;
+                        
+                        let sym = std::str::from_utf8(&snap.symbol).unwrap_or("UNK").trim_end_matches('\0');
+                        // FIX: Save the shadow trade result to the database as Paper Trade!
+                        self.db_client.insert_trade_result(
+                            t.db_id % 10000000000, // heuristic open_ts
+                            now_ms,
+                            sym,
+                            if t.direction == Direction::Buy { "BUY" } else { "SELL" },
+                            t.entry_price,
+                            t.tp,
+                            t.sl,
+                            price,
+                            is_win,
+                            rr,
+                            false, // is_real_money = false
+                            true // is_shadow = true
+                        );
 
-                    let mut lock2 = self.active_trade.lock().unwrap();
-                    *lock2 = None;
+                        let reports = self.evolution.on_trade_closed(
+                            &t.agent_votes, t.direction, is_win, rr, now_ms,
+                        );
+                        for r in &reports {
+                            let adj = if r.adjustments.is_empty() {
+                                "no-change".to_string()
+                            } else {
+                                r.adjustments.join(", ")
+                            };
+                            log::info!("[Evolusi:{}] {} | {}", r.agent, r.verdict, adj);
+                        }
+                    }
+                    shadow_lock.remove(i);
+                } else {
+                    i += 1;
                 }
             }
         }
-        
-        let ts_ms = Utc::now().timestamp_millis();
+    }
 
+
+    pub fn evaluate(&self, votes: &[AgentVote], snap: &MarketSnapshot, is_real_money: bool, tab_id: &str) -> SignalOutput {
+        let ts_ms = Utc::now().timestamp_millis();
+        let sym = std::str::from_utf8(&snap.symbol).unwrap_or("UNK").trim_end_matches(' ').to_string();
         let style_name = read_trading_style();
         let cfg = make_style_config(&style_name);
 
-        // Tunable adaptif (weight/conviction_scale/activation_gate) hasil self-eval.
-        let tun = self.evolution.tunables_snapshot();
-
-        // Konservatisme team: saat agregasi lagi loss-streak/drawdown, min_confidence
-        // dinaikkan otomatis supaya bot lebih selektif.
-        let min_conf = (cfg.min_confidence + self.evolution.conservatism_bias()).min(0.95);
-
-        log::debug!("[Consensus] style={} min_conf={:.3} (base {:.3} + bias {:.3}) noise_veto={} min_rr={}",
-            cfg.style_name, min_conf, cfg.min_confidence, self.evolution.conservatism_bias(), cfg.noise_veto, cfg.min_rr);
+        log::info!("[Consensus] SNIPER MODE: style={} min_agree={} min_rr={}", cfg.style_name, cfg.min_agree, cfg.min_rr);
 
         let (ema9, ema21, ema50, ema_bear, ema_bull) = ema_alignment(snap);
+        let performances = self.evolution.performance_snapshot();
 
-        if let Some(reason) = self.check_veto(votes, &cfg) {
-            log::warn!("[Otak-AI] BATAL: {reason}");
-            return self.make_wait(votes, reason, ts_ms);
-        }
-
-        let effective_weights = self.calc_effective_weights(votes, snap, ema_bear, ema_bull);
-
-        let mut score      = 0.0_f64;
-        let mut active_w   = 0.0_f64;
-        let mut buy_count  = 0_usize;
+        let mut buy_count = 0_usize;
         let mut sell_count = 0_usize;
+        let mut is_vetoed = false;
+        let mut final_veto_reason = String::new();
+        let mut vote_details = Vec::new();
+        let mut kicked_agents: Vec<String> = Vec::new();
 
         for vote in votes {
-            if vote.direction == Direction::Wait { continue; }
+            let perf = performances.get(vote.agent);
+            let wr = perf.map(|p| p.win_rate).unwrap_or(50.0);
+            let trades = perf.map(|p| p.total_trades).unwrap_or(0);
+            let w_streak = perf.map(|p| p.win_streak).unwrap_or(0);
+            let l_streak = perf.map(|p| p.loss_streak).unwrap_or(0);
 
-            let w = effective_weights.iter()
-                .find(|(n, _)| *n == vote.agent)
-                .map(|(_, w)| *w)
-                .unwrap_or(0.05);
-
-            // Tunable adaptif per-agent dari framework self-evaluation.
-            let scale = tun.get(vote.agent).map(|t| t.conviction_scale).unwrap_or(1.0);
-            let gate  = tun.get(vote.agent).map(|t| t.activation_gate).unwrap_or(0.0);
-            let eff_conv = (vote.conviction * scale).min(1.0);
-
-            // Activation gate: agent yang lagi "diragukan" (gate naik karena sering
-            // salah) suaranya hanya dihitung kalau keyakinannya cukup tinggi.
-            if eff_conv < gate { continue; }
-
-            let sign = match vote.direction {
-                Direction::Buy  => { buy_count  += 1;  1.0 },
-                Direction::Sell => { sell_count += 1; -1.0 },
-                Direction::Wait => 0.0,
-            };
-
-            score += w * eff_conv * sign;
-            active_w += w;
-        }
-
-        if active_w > 0.05 {
-            score /= active_w;
-        } else {
-            return self.make_wait(votes, "Tim agen lagi buntu / Pada diem nunggu momen".to_string(), ts_ms);
-        }
-
-        let gbm_bias = extract_gbm_bias(votes);
-        if gbm_bias > 0.6 && score > 0.0 {
-            score *= 1.0 + (gbm_bias - 0.5) * 0.2;
-        } else if gbm_bias < 0.4 && score < 0.0 {
-            score *= 1.0 + (0.5 - gbm_bias) * 0.2;
-        }
-
-        let mut confidence = score.abs().min(1.0);
-
-        let tentative_action = if confidence >= min_conf {
-            if score > 0.0 && buy_count  >= cfg.min_agree { Direction::Buy  }
-            else if score < 0.0 && sell_count >= cfg.min_agree { Direction::Sell }
-            else { Direction::Wait }
-        } else {
-            Direction::Wait
-        };
-
-        let strong_consensus = (tentative_action == Direction::Buy  && buy_count  >= 4)
-                            || (tentative_action == Direction::Sell && sell_count >= 4);
-
-        let quant_veto = self.check_quant_veto(
-            tentative_action, snap,
-        );
-
-        let action = match quant_veto {
-            QuantVetoResult::Hard(ref reason) => {
-                log::warn!("[Consensus] QUANT VETO: {reason}");
-                return self.make_wait(votes, reason.clone(), ts_ms);
+            // ═══ TATAR MILITER: KICK agent tolol ═══
+            // Agent dengan WR<50% (min 10 trades) ATAU loss_streak>=3 → DITENDANG
+            // Vote-nya TIDAK DIHITUNG sama sekali. Harus latihan dulu.
+            if (trades >= 10 && wr < 50.0) || l_streak >= 3 {
+                log::warn!(
+                    "[TATAR] KICKED! {} WR={:.1}% trades={} loss_streak={} → Vote DIABAIKAN, kirim ke pelatihan!",
+                    vote.agent, wr, trades, l_streak
+                );
+                kicked_agents.push(vote.agent.to_string());
+                continue; // SKIP — agent ini tidak boleh vote
             }
-            QuantVetoResult::Soft(multiplier) => {
-                if strong_consensus {
-                    log::info!("[Otak-AI] Sinyal kuat dari agen, tembus aja Quant filter!");
-                    tentative_action
-                } else {
-                    confidence *= multiplier;
-                    if confidence >= min_conf {
-                        tentative_action
+
+            // ═══ VETO: hanya untuk agent WR>50% ATAU win_streak>=2 ═══
+            let can_veto = (trades >= 10 && wr > 50.0) || w_streak >= 2;
+
+            match vote.direction {
+                Direction::Buy => {
+                    vote_details.push((vote.agent.to_string(), Direction::Buy, vote.conviction));
+                    buy_count += 1;
+                }
+                Direction::Sell => {
+                    vote_details.push((vote.agent.to_string(), Direction::Sell, vote.conviction));
+                    sell_count += 1;
+                }
+                // SEMUA vote non-directional (Veto/Wait/Hold):
+                // Hanya agent berkualitas yang boleh VETO.
+                // Agent lain DIPAKSA pilih LONG/SHORT berdasarkan EMA.
+                _ => {
+                    if can_veto {
+                        is_vetoed = true;
+                        final_veto_reason = format!("{} sah VETO (WR={:.1}% streak={}): {}", vote.agent, wr, w_streak, vote.reasoning);
+                        log::warn!("[VETO SAH] {}", final_veto_reason);
                     } else {
-                        return self.make_wait(
-                            votes,
-                            format!("Kurang yakin bos, ngeri ngelawan trend EMA (Yakin: {:.3} < Minimal: {:.3})", confidence, min_conf),
-                            ts_ms,
+                        // PAKSA pilih LONG/SHORT berdasarkan EMA trend
+                        let forced_dir = if ema_bull {
+                            Direction::Buy
+                        } else if ema_bear {
+                            Direction::Sell
+                        } else if snap.price > ema50 {
+                            Direction::Buy
+                        } else {
+                            Direction::Sell
+                        };
+                        log::warn!(
+                            "[PAKSA VOTE] {} mencoba {:?} tapi WR={:.1}%. DIPAKSA {:?}!",
+                            vote.agent, vote.direction, wr, forced_dir
                         );
+                        vote_details.push((vote.agent.to_string(), forced_dir.clone(), 0.3));
+                        if forced_dir == Direction::Buy {
+                            buy_count += 1;
+                        } else {
+                            sell_count += 1;
+                        }
                     }
                 }
             }
-            QuantVetoResult::Clear => tentative_action,
+        }
+
+        if !kicked_agents.is_empty() {
+            log::info!("[TATAR] {} agent ditendang dari voting: {:?}", kicked_agents.len(), kicked_agents);
+        }
+
+        let bypass_limits = tab_id == "Signal_API";
+        let req_agree = if bypass_limits { 1 } else { cfg.min_agree };
+
+        // Simple majority — NO weight system. Equal vote per active agent.
+        let mut tentative_action = if is_vetoed {
+            Direction::Veto
+        } else if buy_count > sell_count && buy_count >= req_agree {
+            Direction::Buy
+        } else if sell_count > buy_count && sell_count >= req_agree {
+            Direction::Sell
+        } else if buy_count == sell_count && buy_count >= req_agree {
+            // Tie-break: follow EMA trend
+            if ema_bull { Direction::Buy } else { Direction::Sell }
+        } else {
+            is_vetoed = true;
+            final_veto_reason = format!(
+                "Tim agen buntu (BUY={} vs SELL={})",
+                buy_count, sell_count
+            );
+            Direction::Veto
         };
+
+        let strong_consensus = (tentative_action == Direction::Buy && buy_count >= 4)
+                            || (tentative_action == Direction::Sell && sell_count >= 4);
+
+        log::info!(
+            "[Consensus] MAJORITY: BUY={} SELL={} kicked={} | Decision={:?} strong={}",
+            buy_count, sell_count, kicked_agents.len(), tentative_action, strong_consensus
+        );
 
         let raw_atr = snap.atr_14;
         let min_atr = snap.price * 0.002;
         let atr     = raw_atr.max(min_atr);
         let price   = snap.price;
 
-        let (entry, tp, sl) = match action {
-            Direction::Buy => {
-                let e = price - atr * 0.3; // Nunggu pullback 0.3 ATR (Support)
-                let s = e - atr * cfg.sl_atr_mult;
-                let t = liq_tp_above(snap, e, atr, cfg.tp_atr_mult * 1.5)
-                    .unwrap_or(e + atr * cfg.tp_atr_mult);
-                (e, t.max(e + atr * cfg.tp_atr_mult), s)
+        let calc_targets = |dir: Direction| -> (f64, f64, f64) {
+            match dir {
+                Direction::Buy => {
+                    let e = price - atr * 0.3;
+                    let s = e - atr * cfg.sl_atr_mult;
+                    let t = liq_tp_above(snap, e, atr, cfg.tp_atr_mult * 1.5).unwrap_or(e + atr * cfg.tp_atr_mult);
+                    (e, t.max(e + atr * cfg.tp_atr_mult), s)
+                }
+                Direction::Sell => {
+                    let e = price + atr * 0.3;
+                    let s = e + atr * cfg.sl_atr_mult;
+                    let t = liq_tp_below(snap, e, atr, cfg.tp_atr_mult * 1.5).unwrap_or(e - atr * cfg.tp_atr_mult);
+                    (e, t.min(e - atr * cfg.tp_atr_mult), s)
+                }
+                Direction::Veto => (price, price, price),
             }
-            Direction::Sell => {
-                let e = price + atr * 0.3; // Nunggu pullback 0.3 ATR (Resistance)
-                let s = e + atr * cfg.sl_atr_mult;
-                let t = liq_tp_below(snap, e, atr, cfg.tp_atr_mult * 1.5)
-                    .unwrap_or(e - atr * cfg.tp_atr_mult);
-                (e, t.min(e - atr * cfg.tp_atr_mult), s)
-            }
-            Direction::Wait => (price, price, price),
         };
+
+        let (entry, tp, sl) = calc_targets(tentative_action);
+
+        if tentative_action != Direction::Veto && !bypass_limits {
+            let quant_veto = self.check_quant_veto(tentative_action, snap);
+            match quant_veto {
+                QuantVetoResult::Hard(ref reason) => {
+                    is_vetoed = true;
+                    final_veto_reason = reason.clone();
+                    tentative_action = Direction::Veto;
+                }
+                _ => {}
+            }
+        }
 
         let sl_dist = (entry - sl).abs().max(1e-8);
         let tp_dist = (tp - entry).abs();
-        let rr      = tp_dist / sl_dist;
+        let rr = tp_dist / sl_dist;
 
-        if matches!(action, Direction::Buy | Direction::Sell) && rr < cfg.min_rr {
-            let reason = format!("Untungnya kekecilan, mending gausah (RR={:.2} < minimal {:.2})", rr, cfg.min_rr);
-            log::warn!("[Otak-AI] {reason}");
-            return self.make_wait(votes, reason, ts_ms);
+        if tentative_action != Direction::Veto && !bypass_limits && rr < cfg.min_rr {
+            is_vetoed = true;
+            final_veto_reason = format!("Untungnya kekecilan, mending gausah (RR={:.2} < minimal {:.2})", rr, cfg.min_rr);
+            tentative_action = Direction::Veto;
         }
+
+        if tentative_action != Direction::Veto {
+            let reason = if is_vetoed { final_veto_reason.clone() } else { "ACCEPTED".to_string() };
+            let shadow_id = self.db_client.insert_shadow_trade(ts_ms, &sym, if tentative_action == Direction::Buy { "BUY" } else { "SELL" }, entry, tp, sl, &reason, is_real_money);
+            if shadow_id > 0 {
+                let st = ShadowTrade { 
+                    db_id: shadow_id, entry_price: entry, tp, sl, direction: tentative_action, 
+                    agent_votes: vote_details.clone(), status: "PENDING".to_string() 
+                };
+                self.shadow_trades.lock().unwrap().entry(sym.clone()).or_default().push(st);
+            }
+        }
+
+        let confidence = if is_vetoed { 0.0 } else { 1.0 }; // Pure Sniper, no confidence scale anymore!
+
+        if tentative_action == Direction::Veto {
+            return self.make_wait(votes, final_veto_reason, ts_ms);
+        }
+        
+        let action = tentative_action;
 
         let mut agent_dirs        = [0u8; AGENT_COUNT];
         let mut agent_convictions = [0.0f64; AGENT_COUNT];
@@ -371,38 +442,23 @@ impl ConsensusEngine {
             agent_convictions[i] = vote.conviction;
         }
 
+        let treasury = crate::agents::treasury_manager::TreasuryManager;
+        let allocation_pct = if !is_vetoed {
+            treasury.calculate_allocation(snap, confidence, rr, strong_consensus, &cfg.style_name)
+        } else {
+            0.0
+        };
+
         log::info!(
-            "[Otak-AI] Hasil Rapat: {:?} yakin={:.3} BUY={buy_count} SELL={sell_count} score={score:.3} RR={rr:.2} style={} EMA=({:.2},{:.2},{:.2}) bear={ema_bear} bull={ema_bull}",
-            action, confidence, cfg.style_name, ema9, ema21, ema50
+            "[Otak-AI-Sniper] {:?} BUY={} SELL={} RR={:.2} Alloc={:.1}% style={} EMA=({:.2},{:.2},{:.2}) bear={} bull={}",
+            action, buy_count, sell_count, rr, allocation_pct * 100.0, cfg.style_name, ema9, ema21, ema50, ema_bear, ema_bull
         );
 
-        let sig = SignalOutput {
-            action,
-            confidence,
-            entry,
-            take_profit: tp,
-            stop_loss: sl,
-            risk_reward: rr,
-            veto: false,
-            veto_reason: String::new(),
-            agent_dirs,
-            agent_convictions,
-            ts_ms,
-        };
-        
-        // Daftarkan trade baru ke tracker RL jika bukan wait
-        if action != Direction::Wait {
-            let mut agent_votes = Vec::new();
-            for v in votes {
-                agent_votes.push((v.agent.to_string(), v.direction, v.conviction));
-            }
-            let trade = ActiveTrade {
-                entry_price: entry, tp, sl, direction: action, agent_votes, status: "PENDING".to_string()
-            };
-            *self.active_trade.lock().unwrap() = Some(trade);
+        SignalOutput {
+            action, confidence, entry, take_profit: tp, stop_loss: sl, risk_reward: rr,
+            allocation_pct, veto: is_vetoed, veto_reason: final_veto_reason,
+            agent_dirs, agent_convictions, ts_ms,
         }
-        
-        sig
     }
 
     fn check_quant_veto(&self, action: Direction, snap: &MarketSnapshot) -> QuantVetoResult {
@@ -421,61 +477,11 @@ impl ConsensusEngine {
                     QuantVetoResult::Hard(format!("VETO SELL: Funding Rate negatif ekstrim ({:.4}). Cost of carry mahal!", snap.funding_rate))
                 } else { QuantVetoResult::Clear }
             }
-            Direction::Wait => QuantVetoResult::Clear,
+            Direction::Veto => QuantVetoResult::Clear,
         }
     }
 
-    fn calc_effective_weights(
-        &self, votes: &[AgentVote], snap: &MarketSnapshot, ema_bear: bool, ema_bull: bool,
-    ) -> Vec<(&'static str, f64)> {
-        // Bobot dasar tiap agent diambil dari framework self-evaluation
-        // (sudah beradaptasi terhadap track-record). Fallback 0.1 untuk agent baru.
-        let tun = self.evolution.tunables_snapshot();
-        let mut ew: Vec<(&'static str, f64)> = votes.iter()
-            .map(|v| (v.agent, tun.get(v.agent).map(|t| t.weight).unwrap_or(0.1)))
-            .collect();
-            
-        for (name, weight) in ew.iter_mut() {
-            match *name {
-                "absurdist" => {
-                    if let Some(vote) = votes.iter().find(|v| v.agent == "absurdist") {
-                        let conflicts = (ema_bear && vote.direction == Direction::Buy)
-                                     || (ema_bull && vote.direction == Direction::Sell);
-                        if conflicts { *weight *= ABSURDIST_DAMP; }
-                    }
-                }
-                "linguist" => {
-                    if snap.news_count < 3 { *weight *= LINGUIST_DAMP; }
-                }
-                _ => {}
-            }
-        }
-        ew
-    }
 
-    fn check_veto(&self, votes: &[AgentVote], cfg: &StyleConfig) -> Option<String> {
-        if let Some(v) = votes.iter().find(|v| v.agent == "data_engineer") {
-            if v.reasoning.contains("Blocking execution") {
-                return Some(v.reasoning.clone());
-            }
-        }
-        if let Some(v) = votes.iter().find(|v| v.agent == "physicist") {
-            if v.reasoning.contains("VOLATILITY CRISIS") {
-                return Some(v.reasoning.clone());
-            }
-        }
-        if let Some(v) = votes.iter().find(|v| v.agent == "mathematician") {
-            if let Some(noise) = parse_f64_field(&v.reasoning, "noise=") {
-                if noise > cfg.noise_veto {
-                    return Some(format!("Market lagi choppy/berisik banget nih ({noise:.3} > bates {:.2})", cfg.noise_veto));
-                }
-            }
-            if v.reasoning.contains("anomaly=true") {
-                return Some("Ada pergerakan aneh ga ngotak nih (|Z| > 4σ), hold dulu!".into());
-            }
-        }
-        None
-    }
 
     fn make_wait(&self, votes: &[AgentVote], reason: String, ts_ms: i64) -> SignalOutput {
         let mut agent_dirs        = [0u8; AGENT_COUNT];
@@ -485,9 +491,10 @@ impl ConsensusEngine {
             agent_convictions[i] = v.conviction;
         }
         SignalOutput {
-            action: Direction::Wait,
+            action: Direction::Veto,
             confidence: 0.0,
             entry: 0.0, take_profit: 0.0, stop_loss: 0.0, risk_reward: 0.0,
+            allocation_pct: 0.0,
             veto: true,
             veto_reason: reason,
             agent_dirs,
@@ -497,6 +504,7 @@ impl ConsensusEngine {
     }
 }
 
+#[allow(dead_code)]
 fn extract_gbm_bias(votes: &[AgentVote]) -> f64 {
     votes.iter()
         .find(|v| v.agent == "physicist")
@@ -504,6 +512,7 @@ fn extract_gbm_bias(votes: &[AgentVote]) -> f64 {
         .unwrap_or(0.5)
 }
 
+#[allow(dead_code)]
 fn parse_f64_field(s: &str, field: &str) -> Option<f64> {
     let pos = s.find(field)?;
     let rest = &s[pos + field.len()..];
@@ -524,7 +533,7 @@ fn liq_tp_above(snap: &MarketSnapshot, price: f64, atr: f64, look_mult: f64) -> 
         }
     }
     if candidates.is_empty() { return None; }
-    candidates.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
+    candidates.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     Some(candidates[candidates.len() / 4])
 }
 
@@ -541,6 +550,6 @@ fn liq_tp_below(snap: &MarketSnapshot, price: f64, atr: f64, look_mult: f64) -> 
         }
     }
     if candidates.is_empty() { return None; }
-    candidates.sort_unstable_by(|a, b| b.partial_cmp(a).unwrap());
+    candidates.sort_unstable_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
     Some(candidates[candidates.len() / 4])
 }

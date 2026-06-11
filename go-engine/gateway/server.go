@@ -41,11 +41,14 @@ import (
 
 const (
 	Port              = 8765
+	MaxLogLines       = 500
+)
+
+var (
 	LogFile           = "bot.log"
 	InsightFile       = "bot_insight.json"
 	EnvFile           = ".env"
 	RuntimeConfigFile = "bot_runtime.conf"
-	MaxLogLines       = 500
 )
 
 // [FIX-S2] HANYA key-key ini yang ditulis ke file .env di disk.
@@ -58,6 +61,7 @@ var apiKeyNames = map[string]bool{
 	"BYBIT_DEMO_API_SECRET": true,
 	"MEXC_API_KEY":          true,
 	"MEXC_API_SECRET":       true,
+	"BOT_DB_PATH":           true,
 }
 
 type InsightData struct {
@@ -106,8 +110,8 @@ type Server struct {
 	stop       chan struct{}
 	baseDir    string
 
-	activePos *Position
-	history   []Position
+	activePosList []Position
+	history       []Position
 
 	symbolCh      chan string
 	BacktestReqCh chan BacktestReq
@@ -117,6 +121,10 @@ type Server struct {
 	// Virtual Balance for Dry Run
 	virtualBalMux sync.RWMutex
 	virtualBal    float64
+	lastInitBal   float64 // Used to detect manual balance edits for hard reset
+
+	uiSettings []byte
+	styleMgr   *StyleAgentManager
 
 	forceExec     atomic.Bool
 	isBacktesting atomic.Bool
@@ -136,16 +144,32 @@ type BacktestReq struct {
 }
 
 func New(baseDir string) *Server {
+	if customLog := os.Getenv("BOT_LOG_PATH"); customLog != "" {
+		LogFile = customLog
+	}
+
 	s := &Server{
 		stop:          make(chan struct{}),
 		baseDir:       baseDir,
 		insight:       InsightData{SignalStatus: "WAIT", TrendState: "RANGING"},
 		history:       make([]Position, 0),
-		symbolCh:      make(chan string, 4),
-		BacktestReqCh: make(chan BacktestReq, 4),
+		symbolCh:      make(chan string, 100),
+		BacktestReqCh: make(chan BacktestReq, 10),
 		activeCfg:     make(map[string]string),
 	}
 	s.botRunning.Store(false)
+
+	// Load uiSettings from bin file if exists
+	dbDir := ""
+	if p := os.Getenv("BOT_DB_PATH"); p != "" {
+		dbDir = filepath.Dir(p)
+	}
+	if dbDir != "" {
+		uiSettingsPath := filepath.Join(dbDir, "config", "ui_settings.bin")
+		if b, err := os.ReadFile(uiSettingsPath); err == nil {
+			s.uiSettings = b
+		}
+	}
 
 	if b, err := os.ReadFile(filepath.Join(baseDir, "virtual_balance.txt")); err == nil {
 		if val, err := strconv.ParseFloat(string(b), 64); err == nil {
@@ -168,14 +192,6 @@ func New(baseDir string) *Server {
 	s.sanitizeEnvFile(filepath.Join(baseDir, EnvFile))
 
 	// [FIX-S4] Seed activeCfg dari .env — hanya non-API-key fields
-	// (setelah sanitize, .env sudah tidak punya non-key settings)
-	existing := parseEnvFile(filepath.Join(baseDir, EnvFile))
-	for k, v := range existing {
-		if !apiKeyNames[k] && v != "" {
-			s.activeCfg[k] = v
-		}
-	}
-
 	// Seed dari bot_runtime.conf jika ada (override .env seeds)
 	runtime := parseEnvFile(filepath.Join(baseDir, RuntimeConfigFile))
 	for k, v := range runtime {
@@ -185,6 +201,7 @@ func New(baseDir string) *Server {
 	}
 
 	s.writeRuntimeConfigLocked()
+	s.styleMgr = NewStyleAgentManager(s)
 	return s
 }
 
@@ -278,6 +295,30 @@ func (s *Server) GetSymbolCh() <-chan string {
 	return s.symbolCh
 }
 
+// SeedDefaults pushes initial config defaults into activeCfg so bot_runtime.conf
+// is populated on first start. Only sets values not already present.
+func (s *Server) SeedDefaults(symbol, mode, style string, leverage int, dryrun bool) {
+	s.cfgMux.Lock()
+	defer s.cfgMux.Unlock()
+	defaults := map[string]string{
+		"SYMBOL":        symbol,
+		"EXCHANGE_MODE": mode,
+		"TRADING_STYLE": style,
+		"LEVERAGE":      fmt.Sprintf("%d", leverage),
+		"DRY_RUN":       fmt.Sprintf("%t", dryrun),
+	}
+	changed := false
+	for k, v := range defaults {
+		if _, exists := s.activeCfg[k]; !exists {
+			s.activeCfg[k] = v
+			changed = true
+		}
+	}
+	if changed {
+		s.writeRuntimeConfigLocked()
+	}
+}
+
 func (s *Server) GetActiveSymbol() string {
 	s.cfgMux.RLock()
 	defer s.cfgMux.RUnlock()
@@ -312,33 +353,32 @@ func (s *Server) SetVirtualBalance(b float64) {
 	os.WriteFile(filepath.Join(s.baseDir, "virtual_balance.txt"), []byte(fmt.Sprintf("%f", b)), 0o644)
 }
 
-func (s *Server) UpdatePositions(active *Position, hist []Position) {
+func (s *Server) UpdatePositions(active []Position, hist []Position) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if active != nil {
-		p := *active
-		s.activePos = &p
-	} else {
-		s.activePos = nil
-	}
+	s.activePosList = make([]Position, len(active))
+	copy(s.activePosList, active)
 	s.history = make([]Position, len(hist))
 	copy(s.history, hist)
 }
 
 func (s *Server) RefundActiveMargin() {
 	s.mu.Lock()
-	active := s.activePos
+	actives := s.activePosList
 	s.mu.Unlock()
 	
-	if active != nil && s.IsDryRun() {
-		profitUSD := active.Margin * (active.PnL / 100.0)
-		marginReturned := active.Margin + profitUSD
-		newBal := s.GetVirtualBalance() + marginReturned
+	if len(actives) > 0 && s.IsDryRun() {
+		totalRefund := 0.0
+		for _, active := range actives {
+			profitUSD := active.Margin * (active.PnL / 100.0)
+			totalRefund += active.Margin + profitUSD
+		}
+		newBal := s.GetVirtualBalance() + totalRefund
 		s.SetVirtualBalance(newBal)
-		log.Printf("[Server] Refunded %.2f margin+PnL to Virtual Balance during shutdown.", marginReturned)
+		log.Printf("[Server] Refunded %.2f margin+PnL to Virtual Balance during shutdown.", totalRefund)
 		
 		s.mu.Lock()
-		s.activePos = nil
+		s.activePosList = []Position{}
 		s.mu.Unlock()
 	}
 }
@@ -377,7 +417,11 @@ func (s *Server) Start() {
 	mux.HandleFunc("/api/stop", s.handleStop)
 	mux.HandleFunc("/api/clear-logs", s.handleClearLogs)
 	mux.HandleFunc("/api/proxy/tickers", s.handleTickers)
+	mux.HandleFunc("/api/proxy/fetch", s.handleProxyFetch)
+	mux.HandleFunc("/api/proxy/evaluate", s.handleProxyEvaluate)
 	mux.HandleFunc("/api/ai_history", s.handleAIHistory)
+	mux.HandleFunc("/api/ui-settings", s.handleUISettings)
+	mux.HandleFunc("/api/style-agents", s.handleStyleAgents)
 
 	addr := fmt.Sprintf(":%d", Port)
 	log.Printf("[Gateway] Dashboard: http://localhost%s", addr)
@@ -451,12 +495,8 @@ func (s *Server) handleInsight(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handlePositions(w http.ResponseWriter, r *http.Request) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	activeArr := []Position{}
-	if s.activePos != nil {
-		activeArr = append(activeArr, *s.activePos)
-	}
 	s.jsonOK(w, map[string]interface{}{
-		"active":  activeArr,
+		"active":  s.activePosList,
 		"history": s.history,
 	})
 }
@@ -513,6 +553,12 @@ func (s *Server) handleGetEnv(w http.ResponseWriter, r *http.Request) {
 // handleSaveEnv — [FIX-S2] HANYA tulis API keys ke .env file.
 // [FIX-SYMBOL-LIVE] Emit symbolCh saat SYMBOL berubah.
 func (s *Server) handleSaveEnv(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	if r.Method == http.MethodOptions {
+		w.Header().Set("Access-Control-Allow-Methods", "POST")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+		return
+	}
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", 405)
 		return
@@ -581,6 +627,88 @@ func (s *Server) handleSaveEnv(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.jsonOK(w, map[string]interface{}{"ok": true, "message": "Config saved"})
+}
+
+func (s *Server) handleUISettings(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	
+	if r.Method == http.MethodOptions {
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+		return
+	}
+
+	if r.Method == http.MethodGet {
+		s.mu.RLock()
+		data := s.uiSettings
+		s.mu.RUnlock()
+		if len(data) == 0 {
+			w.Header().Set("Content-Type", "application/json")
+			w.Write([]byte("{}"))
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.Write(data)
+		return
+	}
+
+	if r.Method == http.MethodPost {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			s.jsonErr(w, err.Error())
+			return
+		}
+		
+		s.mu.Lock()
+		s.uiSettings = body
+		s.mu.Unlock()
+
+		var payload struct {
+			DryRunConfig struct {
+				InitialBalance float64 `json:"initialBalance"`
+			} `json:"dryRunConfig"`
+		}
+		if err := json.Unmarshal(body, &payload); err == nil && payload.DryRunConfig.InitialBalance > 0 {
+			s.virtualBalMux.Lock()
+			if payload.DryRunConfig.InitialBalance != s.lastInitBal {
+				s.lastInitBal = payload.DryRunConfig.InitialBalance
+				s.virtualBal = payload.DryRunConfig.InitialBalance // Hard reset current balance
+				if s.baseDir != "" {
+					os.WriteFile(filepath.Join(s.baseDir, "virtual_balance.txt"), []byte(fmt.Sprintf("%f", s.virtualBal)), 0o644)
+				}
+			}
+			s.virtualBalMux.Unlock()
+		}
+
+		dbDir := ""
+	if p := os.Getenv("BOT_DB_PATH"); p != "" {
+		dbDir = filepath.Dir(p)
+	}
+		if dbDir != "" {
+			configDir := filepath.Join(dbDir, "config")
+			os.MkdirAll(configDir, 0o755)
+			uiSettingsPath := filepath.Join(configDir, "ui_settings.bin")
+			// Zero latency write to binary file structure
+			if err := os.WriteFile(uiSettingsPath, body, 0o644); err != nil {
+				log.Printf("[Gateway] Failed to save ui_settings.bin: %v", err)
+			}
+		}
+
+		s.jsonOK(w, map[string]interface{}{"ok": true})
+		return
+	}
+
+	http.Error(w, "method not allowed", 405)
+}
+
+func (s *Server) handleStyleAgents(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	
+	s.styleMgr.mu.RLock()
+	data := s.styleMgr.agents
+	s.styleMgr.mu.RUnlock()
+
+	s.jsonOK(w, data)
 }
 
 // handleStart — [FIX-S1] + [FIX-S4] + [FIX-START-ALWAYS]
@@ -860,6 +988,72 @@ func (s *Server) handleTickers(w http.ResponseWriter, r *http.Request) {
 	}
 	defer resp.Body.Close()
 	w.Header().Set("Content-Type", "application/json")
+	io.Copy(w, resp.Body)
+}
+
+// Global client to reuse TCP connections
+var proxyClient = &http.Client{
+	Timeout: 15 * time.Second,
+	Transport: &http.Transport{
+		MaxIdleConns:        100,
+		MaxIdleConnsPerHost: 100,
+		IdleConnTimeout:     90 * time.Second,
+	},
+}
+
+// [FIX-ARCH] Node.js delegates all CEX API connections to Golang to avoid TS fetch / child_process overheads
+func (s *Server) handleProxyFetch(w http.ResponseWriter, r *http.Request) {
+	targetUrl := r.URL.Query().Get("url")
+	if targetUrl == "" {
+		http.Error(w, "Missing url parameter", http.StatusBadRequest)
+		return
+	}
+
+	req, err := http.NewRequest("GET", targetUrl, nil)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	// Bypass Cloudflare / WAF just like Chrome does
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+	req.Header.Set("Accept", "application/json")
+
+	resp, err := proxyClient.Do(req)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadGateway)
+		return
+	}
+	defer resp.Body.Close()
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(resp.StatusCode)
+	io.Copy(w, resp.Body)
+}
+
+// Proxy for POST /api/evaluate to Rust Brain
+func (s *Server) handleProxyEvaluate(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	req, err := http.NewRequest("POST", "http://127.0.0.1:8080/api/evaluate", r.Body)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := proxyClient.Do(req)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadGateway)
+		return
+	}
+	defer resp.Body.Close()
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(resp.StatusCode)
 	io.Copy(w, resp.Body)
 }
 

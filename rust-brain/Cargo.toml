@@ -20,9 +20,13 @@ chrono     = { version = "0.4", features = ["serde"] }
 serde      = { version = "1", features = ["derive"] }
 serde_json = "1"
 anyhow     = "1"
+tiny_http  = "0.12"
+parquet = "58.3.0"
+arrow = "58.3.0"
+polars = "0.54.4"
 
 [profile.release]
 opt-level     = 3
 lto           = "fat"
 codegen-units = 1
-panic         = "abort"
+# panic         = "abort"

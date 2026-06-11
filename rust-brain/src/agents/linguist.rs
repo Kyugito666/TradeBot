@@ -20,7 +20,7 @@ impl Agent for LinguistAgent {
         let count = snap.news_count;
 
         if count == 0 {
-            return AgentVote::wait("linguist", "no news data in SHM cache yet");
+            return AgentVote::forced_choice("linguist", 0.1, 0.1, "no news data in SHM cache yet");
         }
 
         // Confidence grows with article count, capped at 1.0
@@ -37,7 +37,7 @@ impl Agent for LinguistAgent {
         } else if score < -0.1 {
             ("BEARISH",      Direction::Sell, base_conf * 0.75)
         } else {
-            ("NEUTRAL",      Direction::Wait, base_conf * 0.3)
+            ("NEUTRAL",      Direction::Veto, base_conf * 0.3)
         };
 
         AgentVote {

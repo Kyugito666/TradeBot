@@ -29,11 +29,10 @@
 use crate::agents::Direction;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::fs;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
+use crate::db::DbClient;
 
-pub const EVOLUTION_FILE: &str = "agent_evolution.json";
-pub const LEGACY_WEIGHTS_FILE: &str = "agent_rl_weights.json";
+pub mod gatekeeper;
 
 const MAX_RECENT: usize = 20; // rolling window untuk recent-accuracy
 const MAX_REPORTS: usize = 60; // ring-buffer laporan evaluasi
@@ -71,16 +70,18 @@ impl Default for AgentTunables {
 
 // ── Track-record kuantitatif per-agent ───────────────────────────────────────
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct AgentScorecard {
-    pub trades: u64,
-    pub correct: u64,
-    pub incorrect: u64,
-    pub accuracy: f64,
-    pub recent_accuracy: f64,
-    pub pnl_contrib: f64, // proxy kontribusi R: +rr kalau ikut menang, -1 kalau ikut kalah
-    pub wrong_streak: u32,
+pub struct AgentPerformance {
+    #[serde(rename = "totalTrades")]
+    pub total_trades: u64,
+    #[serde(rename = "winRate")]
+    pub win_rate: f64,
+    #[serde(rename = "winStreak")]
+    pub win_streak: u32,
+    #[serde(rename = "lossStreak")]
+    pub loss_streak: u32,
+    pub pnl_contrib: f64,
     #[serde(default)]
-    pub recent: Vec<bool>, // true = benar, false = salah (window MAX_RECENT)
+    pub recent: Vec<bool>,
 }
 
 // ── Laporan evaluasi (format SAMA untuk semua agent) ─────────────────────────
@@ -123,7 +124,7 @@ pub struct TeamScorecard {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AgentRecord {
     pub tunables: AgentTunables,
-    pub scorecard: AgentScorecard,
+    pub performance: AgentPerformance,
     #[serde(default)]
     pub last_report: Option<EvaluationReport>,
 }
@@ -140,14 +141,15 @@ pub struct EvolutionState {
 
 pub struct EvolutionEngine {
     state: Mutex<EvolutionState>,
+    db_client: Arc<DbClient>,
 }
 
 impl EvolutionEngine {
     /// `defaults` = daftar (nama_agent, bobot_awal). Menambah agent baru cukup
     /// menambahkan entri di sini (atau di WEIGHTS consensus) — framework otomatis
     /// menyiapkan scorecard + tunable-nya.
-    pub fn new(defaults: &[(&str, f64)]) -> Self {
-        let mut state = Self::load_state().unwrap_or_default();
+    pub fn new(defaults: &[(&str, f64)], db_client: Arc<DbClient>) -> Self {
+        let mut state = Self::load_state(&db_client).unwrap_or_default();
         state.version = 1;
 
         let legacy = Self::load_legacy_weights();
@@ -176,24 +178,23 @@ impl EvolutionEngine {
 
         Self {
             state: Mutex::new(state),
+            db_client,
         }
     }
 
-    fn load_state() -> Option<EvolutionState> {
-        let data = fs::read_to_string(EVOLUTION_FILE).ok()?;
+    fn load_state(db: &DbClient) -> Option<EvolutionState> {
+        let data = db.load_evolution_state()?;
         serde_json::from_str(&data).ok()
     }
 
     fn load_legacy_weights() -> HashMap<String, f64> {
-        fs::read_to_string(LEGACY_WEIGHTS_FILE)
-            .ok()
-            .and_then(|d| serde_json::from_str::<HashMap<String, f64>>(&d).ok())
-            .unwrap_or_default()
+        HashMap::new() // No longer load from JSON
     }
 
     /// Snapshot tunable semua agent — dipanggil consensus sekali per evaluasi
     /// supaya tidak lock berulang dalam loop.
-    pub fn tunables_snapshot(&self) -> HashMap<String, AgentTunables> {
+    #[allow(dead_code)]
+pub fn tunables_snapshot(&self) -> HashMap<String, AgentTunables> {
         let s = self.state.lock().unwrap();
         s.agents
             .iter()
@@ -202,8 +203,15 @@ impl EvolutionEngine {
     }
 
     /// Bias konservatisme team — ditambahkan ke min_confidence consensus.
-    pub fn conservatism_bias(&self) -> f64 {
+    #[allow(dead_code)]
+pub fn conservatism_bias(&self) -> f64 {
         self.state.lock().unwrap().team.conservatism_bias
+    }
+
+    pub fn performance_snapshot(&self) -> HashMap<String, AgentPerformance> {
+        self.state.lock().unwrap().agents.iter()
+            .map(|(k, v)| (k.clone(), v.performance.clone()))
+            .collect()
     }
 
     /// Dipanggil consensus saat sebuah trade ditutup (TP/SL).
@@ -284,7 +292,7 @@ impl EvolutionEngine {
 
         // ── 2) Evaluasi mandiri tiap agent yang ikut bersuara ────────────────
         for (agent, vote_dir, conv) in votes {
-            if *vote_dir == Direction::Wait {
+            if *vote_dir == Direction::Veto {
                 continue;
             }
             let rec = state
@@ -300,18 +308,17 @@ impl EvolutionEngine {
             let agreed = *vote_dir == trade_direction;
             let was_correct = agreed == is_win;
 
-            rec.scorecard.trades += 1;
+            rec.performance.total_trades += 1;
             if was_correct {
-                rec.scorecard.correct += 1;
-                rec.scorecard.wrong_streak = 0;
+                rec.performance.win_streak += 1;
+                rec.performance.loss_streak = 0;
             } else {
-                rec.scorecard.incorrect += 1;
-                rec.scorecard.wrong_streak += 1;
+                rec.performance.loss_streak += 1;
+                rec.performance.win_streak = 0;
             }
-            push_capped(&mut rec.scorecard.recent, was_correct);
-            rec.scorecard.accuracy = rec.scorecard.correct as f64 / rec.scorecard.trades.max(1) as f64;
-            rec.scorecard.recent_accuracy = recent_rate(&rec.scorecard.recent);
-            rec.scorecard.pnl_contrib += if agreed {
+            push_capped(&mut rec.performance.recent, was_correct);
+            rec.performance.win_rate = recent_rate(&rec.performance.recent) * 100.0;
+            rec.performance.pnl_contrib += if agreed {
                 if is_win {
                     rr.max(0.1)
                 } else {
@@ -346,7 +353,7 @@ impl EvolutionEngine {
             // Self-evaluation: kalau agent SALAH di trade ini -> dia mengetatkan
             // dirinya sendiri (turunkan keberanian, naikkan ambang aktivasi).
             if !was_correct {
-                if rec.scorecard.recent_accuracy < 0.45 {
+                if rec.performance.win_rate < 45.0 {
                     rec.tunables.activation_gate =
                         (rec.tunables.activation_gate + 0.05).min(GATE_MAX);
                     rec.tunables.conviction_scale =
@@ -367,7 +374,7 @@ impl EvolutionEngine {
                         rec.tunables.conviction_scale
                     ));
                 }
-            } else if rec.scorecard.recent_accuracy > 0.60 {
+            } else if rec.performance.win_rate > 60.0 {
                 // Track-record bagus -> pulihkan keberanian & buka gate pelan-pelan.
                 let cs = (rec.tunables.conviction_scale + 0.02).min(CONV_SCALE_MAX);
                 let ag = (rec.tunables.activation_gate - 0.02).max(0.0);
@@ -381,7 +388,7 @@ impl EvolutionEngine {
                 }
             }
 
-            let verdict = build_verdict(agent, agreed, is_win, was_correct, &rec.scorecard);
+            let verdict = build_verdict(agent, agreed, is_win, was_correct, &rec.performance);
             let report = EvaluationReport {
                 agent: agent.clone(),
                 ts_ms,
@@ -401,8 +408,8 @@ impl EvolutionEngine {
                 conviction_scale_after: rec.tunables.conviction_scale,
                 activation_gate_before: before_ag,
                 activation_gate_after: rec.tunables.activation_gate,
-                accuracy: rec.scorecard.accuracy,
-                recent_accuracy: rec.scorecard.recent_accuracy,
+                accuracy: rec.performance.win_rate / 100.0,
+                recent_accuracy: rec.performance.win_rate / 100.0,
             };
             rec.last_report = Some(report.clone());
 
@@ -422,22 +429,24 @@ impl EvolutionEngine {
         }
         state.updated_ms = ts_ms;
 
-        Self::persist(&state);
+        Self::persist(&state, &self.db_client);
         emitted
     }
 
-    fn persist(state: &EvolutionState) {
-        if let Ok(json) = serde_json::to_string_pretty(state) {
-            let _ = fs::write(EVOLUTION_FILE, json);
+    fn persist(state: &EvolutionState, db: &DbClient) {
+        if let Ok(json) = serde_json::to_string(state) {
+            // [Fase 4] Simpan Permanen di SQLite
+            db.save_evolution_state(&json);
         }
-        // Kompatibilitas mundur: tulis peta bobot datar.
+        
+        // Simpan peta bobot ke DB agent_weights.db (ditambahkan nanti di db_client)
         let weights: HashMap<String, f64> = state
             .agents
             .iter()
             .map(|(k, v)| (k.clone(), v.tunables.weight))
             .collect();
-        if let Ok(json) = serde_json::to_string_pretty(&weights) {
-            let _ = fs::write(LEGACY_WEIGHTS_FILE, json);
+        if let Ok(weights_json) = serde_json::to_string(&weights) {
+            db.save_agent_weights(&weights_json);
         }
     }
 }
@@ -456,7 +465,7 @@ fn dir_str(d: Direction) -> String {
     match d {
         Direction::Buy => "BUY".to_string(),
         Direction::Sell => "SELL".to_string(),
-        Direction::Wait => "WAIT".to_string(),
+        Direction::Veto => "WAIT".to_string(),
     }
 }
 
@@ -480,7 +489,7 @@ fn build_verdict(
     agreed: bool,
     is_win: bool,
     was_correct: bool,
-    sc: &AgentScorecard,
+    perf: &AgentPerformance,
 ) -> String {
     let outcome = if is_win { "WIN" } else { "LOSS" };
     let role = match (agreed, is_win) {
@@ -490,14 +499,13 @@ fn build_verdict(
         (false, false) => "nolak trade yang kalah (bantu nyelametin)",
     };
     format!(
-        "Trade {outcome}: {agent} {role}. Self-eval -> {}. acc={:.0}% recent={:.0}% wrong_streak={}",
+        "Trade {outcome}: {agent} {role}. Self-eval -> {}. win_rate={:.0}% loss_streak={}",
         if was_correct {
             "perkuat sinyal"
         } else {
             "ketatkan threshold"
         },
-        sc.accuracy * 100.0,
-        sc.recent_accuracy * 100.0,
-        sc.wrong_streak
+        perf.win_rate,
+        perf.loss_streak
     )
 }

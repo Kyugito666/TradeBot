@@ -1,5 +1,7 @@
 "use client"
 
+import { useState } from "react"
+
 import {
   Crosshair,
   History,
@@ -30,6 +32,8 @@ function priceFmt(n: number) {
 // Unrealized ROE for an open paper trade at the current mark.
 function liveRoe(trade: PaperTrade, mark: number | undefined): number {
   if (mark === undefined || trade.entry <= 0) return 0
+  // PENDING limit orders show PnL = 0 until filled
+  if (trade.status === "PENDING" || !trade.status) return 0
   const dir = trade.side === "LONG" ? 1 : -1
   return ((mark - trade.entry) / trade.entry) * dir * trade.leverage * 100
 }
@@ -40,6 +44,8 @@ export function SignalPanel({
   tradingSettings,
   agentAnalysis,
   pairStats = {},
+  paperBalance,
+  signalEngine,
 }: {
   market: MarketRow[]
   marketOnline: boolean
@@ -47,10 +53,15 @@ export function SignalPanel({
   agentAnalysis?: AgentAnalysisResponse | null
   /** Per-pair backtest stats shared from the Backtest tab (same pairs/strategy). */
   pairStats?: Record<string, PairStat>
+  paperBalance: number
+  signalEngine: ReturnType<typeof useSignalTrades>
 }) {
   const activeCex = tradingSettings.cexes.find((c) => c.id === tradingSettings.activeCex)
   const risk = tradingSettings.riskModel
   const style = tradingSettings.tradingStyle
+  const [showAllSignals, setShowAllSignals] = useState(false)
+  const [showAllOpen, setShowAllOpen] = useState(false)
+  const [showAllHistory, setShowAllHistory] = useState(false)
 
   const {
     candidates,
@@ -63,15 +74,9 @@ export function SignalPanel({
     toggleAutoTpSl,
     openTrade,
     closeTrade,
+    closeAllTrades,
     clearHistory,
-  } = useSignalTrades({
-    market,
-    marketOnline,
-    style,
-    risk,
-    activeCex,
-    agentAnalysis,
-  })
+  } = signalEngine
 
   const markBySymbol = new Map(market.map((m) => [m.symbol, m.lastPrice]))
   const openSymbols = new Set(open.map((t) => t.symbol))
@@ -185,7 +190,7 @@ export function SignalPanel({
             </tr>
           </thead>
           <tbody>
-            {candidates.map(({ row, levels }) => {
+            {(showAllSignals ? candidates : candidates.slice(0, 5)).map(({ row, levels }) => {
               const isLong = levels.side === "LONG"
               const alreadyOpen = openSymbols.has(row.symbol)
               return (
@@ -241,6 +246,32 @@ export function SignalPanel({
                 </tr>
               )
             })}
+            
+            {candidates.length > 5 && !showAllSignals && (
+              <tr>
+                <td colSpan={10} className="p-0">
+                  <button
+                    onClick={() => setShowAllSignals(true)}
+                    className="w-full border-t border-border/60 py-3 text-[11px] font-semibold text-muted-foreground transition-colors hover:bg-muted/30 hover:text-foreground"
+                  >
+                    View {candidates.length - 5} more signals...
+                  </button>
+                </td>
+              </tr>
+            )}
+            
+            {candidates.length > 5 && showAllSignals && (
+              <tr>
+                <td colSpan={10} className="p-0">
+                  <button
+                    onClick={() => setShowAllSignals(false)}
+                    className="w-full border-t border-border/60 py-3 text-[11px] font-semibold text-muted-foreground transition-colors hover:bg-muted/30 hover:text-foreground"
+                  >
+                    Show less
+                  </button>
+                </td>
+              </tr>
+            )}
             {candidates.length === 0 && (
               <tr>
                 <td colSpan={10} className="p-0">
@@ -263,7 +294,20 @@ export function SignalPanel({
       {/* ── Open paper positions ── */}
       <Panel
         title="Open Paper Positions"
-        right={<Tag tone={open.length ? "primary" : "muted"}>{open.length} open</Tag>}
+        right={
+          <div className="flex items-center gap-3">
+            <Tag tone={open.length ? "primary" : "muted"}>{open.length} open</Tag>
+            {open.length > 0 && (
+              <button
+                onClick={closeAllTrades}
+                className="flex items-center gap-1.5 rounded border border-border px-2 py-1 text-[10px] font-semibold uppercase tracking-wider text-muted-foreground transition-colors hover:border-negative/40 hover:text-negative"
+              >
+                <Trash2 className="h-3 w-3" />
+                Close All
+              </button>
+            )}
+          </div>
+        }
         bodyClassName="overflow-auto scroll-thin"
       >
         <table className="w-full border-collapse text-xs">
@@ -271,6 +315,7 @@ export function SignalPanel({
             <tr className="text-[10px] uppercase tracking-wider text-muted-foreground">
               <th className="px-3 py-2 text-left font-medium">Symbol</th>
               <th className="px-2 py-2 text-center font-medium">Side</th>
+              <th className="px-2 py-2 text-center font-medium">Status</th>
               <th className="px-2 py-2 text-right font-medium">Entry</th>
               <th className="px-2 py-2 text-right font-medium">Mark</th>
               <th className="px-2 py-2 text-right font-medium">TP</th>
@@ -280,7 +325,7 @@ export function SignalPanel({
             </tr>
           </thead>
           <tbody>
-            {open.map((t) => {
+            {(showAllOpen ? open : open.slice(0, 5)).map((t) => {
               const mark = markBySymbol.get(t.symbol)
               const roe = liveRoe(t, mark)
               return (
@@ -291,6 +336,11 @@ export function SignalPanel({
                   </td>
                   <td className="px-2 py-2 text-center">
                     <Tag tone={t.side === "LONG" ? "positive" : "negative"}>{t.side}</Tag>
+                  </td>
+                  <td className="px-2 py-2 text-center">
+                    <Tag tone={t.status === "FILLED" ? "positive" : "muted"}>
+                      {t.status === "FILLED" ? "FILLED" : "PENDING"}
+                    </Tag>
                   </td>
                   <td className="px-2 py-2 text-right font-mono tabular text-foreground">{priceFmt(t.entry)}</td>
                   <td className="px-2 py-2 text-right font-mono tabular text-muted-foreground">
@@ -304,7 +354,7 @@ export function SignalPanel({
                       roe >= 0 ? "text-positive" : "text-negative",
                     )}
                   >
-                    {pct(roe)}
+                    {t.status === "FILLED" ? pct(roe) : "0.00%"}
                   </td>
                   <td className="px-3 py-2 text-right">
                     <button
@@ -312,15 +362,42 @@ export function SignalPanel({
                       className="inline-flex items-center gap-1 rounded border border-border px-2 py-1 text-[10px] font-semibold uppercase tracking-wider text-muted-foreground transition-colors hover:border-negative/40 hover:text-negative"
                     >
                       <Crosshair className="h-3 w-3" />
-                      Close
+                      {t.status === "FILLED" ? "Close" : "Cancel"}
                     </button>
                   </td>
                 </tr>
               )
             })}
+            
+            {open.length > 5 && !showAllOpen && (
+              <tr>
+                <td colSpan={9} className="p-0">
+                  <button
+                    onClick={() => setShowAllOpen(true)}
+                    className="w-full border-t border-border/60 py-3 text-[11px] font-semibold text-muted-foreground transition-colors hover:bg-muted/30 hover:text-foreground"
+                  >
+                    View {open.length - 5} more open positions...
+                  </button>
+                </td>
+              </tr>
+            )}
+            
+            {open.length > 5 && showAllOpen && (
+              <tr>
+                <td colSpan={9} className="p-0">
+                  <button
+                    onClick={() => setShowAllOpen(false)}
+                    className="w-full border-t border-border/60 py-3 text-[11px] font-semibold text-muted-foreground transition-colors hover:bg-muted/30 hover:text-foreground"
+                  >
+                    Show less
+                  </button>
+                </td>
+              </tr>
+            )}
+
             {open.length === 0 && (
               <tr>
-                <td colSpan={8} className="p-0">
+                <td colSpan={9} className="p-0">
                   <EmptyState
                     icon={Inbox}
                     title="No open paper positions"
@@ -367,7 +444,7 @@ export function SignalPanel({
             </tr>
           </thead>
           <tbody>
-            {history.map((t) => {
+            {(showAllHistory ? history : history.slice(0, 5)).map((t) => {
               const win = (t.pnlR ?? 0) > 0
               return (
                 <tr key={t.id} className="border-t border-border/60">
@@ -404,6 +481,33 @@ export function SignalPanel({
                 </tr>
               )
             })}
+            
+            {history.length > 5 && !showAllHistory && (
+              <tr>
+                <td colSpan={7} className="p-0">
+                  <button
+                    onClick={() => setShowAllHistory(true)}
+                    className="w-full border-t border-border/60 py-3 text-[11px] font-semibold text-muted-foreground transition-colors hover:bg-muted/30 hover:text-foreground"
+                  >
+                    View {history.length - 5} more closed trades...
+                  </button>
+                </td>
+              </tr>
+            )}
+            
+            {history.length > 5 && showAllHistory && (
+              <tr>
+                <td colSpan={7} className="p-0">
+                  <button
+                    onClick={() => setShowAllHistory(false)}
+                    className="w-full border-t border-border/60 py-3 text-[11px] font-semibold text-muted-foreground transition-colors hover:bg-muted/30 hover:text-foreground"
+                  >
+                    Show less
+                  </button>
+                </td>
+              </tr>
+            )}
+
             {history.length === 0 && (
               <tr>
                 <td colSpan={7} className="p-0">

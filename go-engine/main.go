@@ -27,7 +27,10 @@
 package main
 
 import (
+	"bytes"
+
 	"context"
+	"encoding/gob"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -80,7 +83,7 @@ func loadConfig() Config {
 	c := Config{
 		Exchange:     envStr("EXCHANGE", "bybit"),
 		ExchangeMode: envStr("EXCHANGE_MODE", "demo"),
-		Symbol:       envStr("SYMBOL", "SOLUSDT"),
+		Symbol:       envStr("SYMBOL", "BTCUSDT"),
 		OHLCVTF:      "5",
 		OHLCVLimit:   1000,
 		RiskPct:      envFloat("RISK_PCT", 0.03),
@@ -96,7 +99,11 @@ func loadConfig() Config {
 		MexcAPISecret:   envStr("MEXC_API_SECRET", ""),
 	}
 
-	if pwd, err := os.Getwd(); err == nil {
+	// BaseDir: where bot_runtime.conf, virtual_balance.txt, etc. are stored.
+	// Prioritize BOT_BASE_DIR env var (set by start_bot.sh → D:\database\engine)
+	if envBase := os.Getenv("BOT_BASE_DIR"); envBase != "" {
+		c.BaseDir = envBase
+	} else if pwd, err := os.Getwd(); err == nil {
 		if filepath.Base(pwd) == "go-engine" {
 			c.BaseDir = filepath.Dir(pwd)
 		} else {
@@ -184,6 +191,8 @@ func main() {
 
 	// ── Gateway server ────────────────────────────────────────────────────────
 	srv := gateway.New(cfg.BaseDir)
+	// Seed default config into bot_runtime.conf so settings persist across restarts
+	srv.SeedDefaults(cfg.Symbol, cfg.ExchangeMode, cfg.TradingStyle, cfg.Leverage, cfg.DryRun)
 	go srv.Start()
 
 	// ── Initial balance fetch ─────────────────────────────────────────────────
@@ -222,10 +231,20 @@ func main() {
 		OpenedAt map[string]time.Time         `json:"opened_at"`
 	}
 
-	stateFile := filepath.Join(cfg.BaseDir, "paper_trades.json")
-	if b, err := os.ReadFile(stateFile); err == nil {
+	dbDir := os.Getenv("BOT_DB_DIR")
+	if dbDir == "" {
+		dbDir = "/mnt/d/database"
+	}
+	engineDir := filepath.Join(dbDir, "engine")
+	os.MkdirAll(engineDir, 0755)
+	
+	stateFile := filepath.Join(engineDir, "paper_trades.bin")
+	if _, err := os.Stat(stateFile); os.IsNotExist(err) {
+		os.WriteFile(stateFile, []byte{}, 0644)
+	}
+	if f, err := os.Open(stateFile); err == nil {
 		var state PaperTradesState
-		if err := json.Unmarshal(b, &state); err == nil {
+		if err := gob.NewDecoder(f).Decode(&state); err == nil {
 			if state.Active != nil {
 				activePaperTrades = state.Active
 			}
@@ -234,14 +253,13 @@ func main() {
 				paperTradeOpenedAts = state.OpenedAt
 			}
 			log.Printf("[Paper] Hydrated persistent state: actives=%d history_len=%d", len(activePaperTrades), len(paperHistory))
-			// Just send the first active one for dashboard backward compatibility, or update dashboard to handle multiple
-			var anyActive *gateway.Position
+			var actives []gateway.Position
 			for _, v := range activePaperTrades {
-				anyActive = v
-				break
+				if v != nil { actives = append(actives, *v) }
 			}
-			srv.UpdatePositions(anyActive, paperHistory)
+			srv.UpdatePositions(actives, paperHistory)
 		}
+		f.Close()
 	}
 
 	savePaperState := func() {
@@ -250,8 +268,9 @@ func main() {
 			History:  paperHistory,
 			OpenedAt: paperTradeOpenedAts,
 		}
-		if b, err := json.MarshalIndent(state, "", "  "); err == nil {
-			os.WriteFile(stateFile, b, 0644)
+		if f, err := os.Create(stateFile); err == nil {
+			gob.NewEncoder(f).Encode(state)
+			f.Close()
 		}
 	}
 
@@ -259,7 +278,7 @@ func main() {
 	activeFeeds := make(map[string]*market.Feed)
 	
 	// Default starting feed
-	initialFeed := market.New(cfg.Symbol, cfg.OHLCVTF, cfg.OHLCVLimit)
+	initialFeed := market.New(cfg.Symbol, cfg.OHLCVTF, cfg.OHLCVLimit, nil)
 	activeFeeds[cfg.Symbol] = initialFeed
 	
 	go func() {
@@ -268,14 +287,21 @@ func main() {
 	go nlpEngine.Run(mainCtx, initialFeed)
 
 	go func() {
-		log.Printf("[Screener] Started. Will fetch top volatile pairs every 5 minutes.")
+		log.Printf("[Screener] Started. Will fetch top volatile pairs every 5 minutes (first scan in 10s).")
+		// Trigger first scan quickly so we don't stay locked on single symbol
+		time.Sleep(10 * time.Second)
 		ticker := time.NewTicker(5 * time.Minute)
 		defer ticker.Stop()
+		
+		scanNow := make(chan struct{}, 1)
+		scanNow <- struct{}{} // Trigger immediate first scan
 		
 		for {
 			select {
 			case <-mainCtx.Done():
 				return
+			case <-scanNow:
+				if srv.IsBacktesting() { continue }
 			case <-ticker.C:
 				if srv.IsBacktesting() { continue }
 				
@@ -314,40 +340,37 @@ func main() {
 					
 					vol, _ := strconv.ParseFloat(p.Turnover24h, 64)
 					pcnt, _ := strconv.ParseFloat(p.Price24hPcnt, 64)
-					if vol > 5000000 { // minimum 5M daily turnover
-						validPairs = append(validPairs, PairData{Symbol: p.Symbol, Vol: vol, Pcnt: math.Abs(pcnt)})
-					}
+					validPairs = append(validPairs, PairData{Symbol: p.Symbol, Vol: vol, Pcnt: math.Abs(pcnt)})
 				}
 				
 				sort.Slice(validPairs, func(i, j int) bool {
 					return validPairs[i].Pcnt > validPairs[j].Pcnt // sort by highest volatility
 				})
 				
-				// Determine target pair(s)
-				// For now, let's keep the user's selected pair, and add top 3 volatile pairs (total 4)
-				// The dashboard handles Multi/Single mode via `srv`.
-				
-				// If we have single pair mode, we can auto-switch to the top 1 if user enables auto-filter
-				// But to keep it safe, let's just make sure activeFeeds has up to 4 feeds in multi-pair mode.
-				// Since we don't have a strict multi-pair flag in backend yet, we'll maintain the top 4.
+				// ── [Fase 8B] BigData Multi-Symbol Pipeline ──────────────────────
+				// Cap at top 50 most volatile USDT pairs to prevent goroutine flood
+				const maxBigDataFeeds = 50
 				
 				targetFeeds := make(map[string]bool)
-				targetFeeds[cfg.Symbol] = true // Always keep the primary symbol
+				
+				activeUiSym := srv.GetActiveSymbol()
+				if activeUiSym == "" { activeUiSym = cfg.Symbol }
+				targetFeeds[activeUiSym] = true // Always keep primary symbol
 				
 				added := 0
 				for _, vp := range validPairs {
-					if added >= 3 { break }
-					if vp.Symbol != cfg.Symbol {
+					if added >= maxBigDataFeeds - 1 { break } // -1 for primary
+					if vp.Symbol != activeUiSym && vp.Vol > 1_000_000 { // Min $1M turnover
 						targetFeeds[vp.Symbol] = true
 						added++
 					}
 				}
 				
-				// Reconcile activeFeeds
+				log.Printf("[Screener] BigData tracking %d symbols (top volatile, >$1M vol)", len(targetFeeds))
+				
+				// Reconcile activeFeeds — remove dead, add new
 				for sym := range activeFeeds {
 					if !targetFeeds[sym] {
-						// We should stop this feed, but for now we just remove it from map
-						// (Proper feed cancellation requires context per feed)
 						log.Printf("[Screener] Removing feed for %s", sym)
 						delete(activeFeeds, sym)
 					}
@@ -355,20 +378,38 @@ func main() {
 				
 				for sym := range targetFeeds {
 					if _, ok := activeFeeds[sym]; !ok {
-						log.Printf("[Screener] Adding new feed for %s", sym)
-						newFeed := market.New(sym, cfg.OHLCVTF, cfg.OHLCVLimit)
+						newFeed := market.New(sym, cfg.OHLCVTF, cfg.OHLCVLimit, nil)
 						activeFeeds[sym] = newFeed
 						go newFeed.Run(mainCtx)
 					}
 				}
+				
+				log.Printf("[Screener] Active feeds: %d", len(activeFeeds))
 			}
 		}
 	}()
 
-	// ── Main signal loop ──────────────────────────────────────────────────────
+	// ── [Fase 8B] BigData Tick Stats Logger ──────────────────────────────────
 	go func() {
-		log.Printf("[main] Signal poll loop started")
+		ticker := time.NewTicker(60 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-mainCtx.Done():
+				return
+			case <-ticker.C:
+				log.Printf("[BigData] Active feeds: %d symbols streaming", len(activeFeeds))
+			}
+		}
+	}()
+
+	// ── Main signal loop (Round-Robin Multi-Symbol) ──────────────────────────
+	go func() {
+		log.Printf("[main] Signal poll loop started (round-robin multi-symbol)")
 		log.Printf("[main] ⚠ Bot STOPPED — menunggu START dari dashboard")
+
+		// [Fase 8B] Round-robin index for fair SHM scheduling
+		rrIndex := 0
 
 		for {
 			select {
@@ -382,10 +423,45 @@ func main() {
 				continue
 			}
 
+			activeUiSym := srv.GetActiveSymbol()
+			if activeUiSym == "" { activeUiSym = cfg.Symbol }
+
 			isDryRun := srv.IsDryRun()
 			botRunning := srv.IsBotRunning()
 
-			for currentSym, feed := range activeFeeds {
+			// [Fase 8B] Build ordered symbol list for round-robin
+			symList := make([]string, 0, len(activeFeeds))
+			// Primary symbol ALWAYS first
+			if _, ok := activeFeeds[activeUiSym]; ok {
+				symList = append(symList, activeUiSym)
+			}
+			for sym := range activeFeeds {
+				if sym != activeUiSym {
+					symList = append(symList, sym)
+				}
+			}
+
+			if len(symList) == 0 {
+				time.Sleep(500 * time.Millisecond)
+				continue
+			}
+
+			// [Fase 8B] Process primary symbol EVERY cycle + one secondary via round-robin
+			processSyms := []string{}
+			if len(symList) > 0 {
+				processSyms = append(processSyms, symList[0]) // primary always
+			}
+			if len(symList) > 1 {
+				rrIndex = ((rrIndex) % (len(symList) - 1)) + 1 // rotate through secondary symbols
+				if rrIndex < len(symList) {
+					processSyms = append(processSyms, symList[rrIndex])
+				}
+				rrIndex++
+			}
+
+			for _, currentSym := range processSyms {
+				feed := activeFeeds[currentSym]
+				if feed == nil { continue }
 				md := feed.GetMarketData(currentSym)
 				if md == nil || md.Price <= 0 || len(md.Candles) == 0 {
 					continue
@@ -404,7 +480,12 @@ func main() {
 							activePaperTrade.Status = "OPEN"
 							activePaperTrade.EntryPrice = activePaperTrade.LimitPrice
 							log.Printf("[Paper] 📈 LIMIT Order KEJEMPUT! Status PENDING -> OPEN @ %.4f", activePaperTrade.EntryPrice)
-							srv.UpdatePositions(activePaperTrade, paperHistory)
+							
+							var actives []gateway.Position
+							for _, v := range activePaperTrades {
+								if v != nil { actives = append(actives, *v) }
+							}
+							srv.UpdatePositions(actives, paperHistory)
 							savePaperState()
 						} else if time.Since(paperTradeOpenedAt) > 30 * time.Minute {
 							activePaperTrade.Status = "CLOSED_TIMEOUT"
@@ -424,7 +505,13 @@ func main() {
 						feeImpactPct := float64(cfg.Leverage) * 0.11 
 						activePaperTrade.PnL = (unrealizedPct * float64(cfg.Leverage)) - feeImpactPct
 
-						if (activePaperTrade.Side == "BUY" && md.Price >= activePaperTrade.TakeProfit) ||
+						// Cap PnL at -100% (Liquidation)
+						if activePaperTrade.PnL <= -100.0 {
+							activePaperTrade.PnL = -100.0
+							activePaperTrade.Status = "LIQUIDATED"
+							isClosed    = true
+							closeReason = fmt.Sprintf("LIQUIDATED @ %.4f", md.Price)
+						} else if (activePaperTrade.Side == "BUY" && md.Price >= activePaperTrade.TakeProfit) ||
 							(activePaperTrade.Side == "SELL" && md.Price <= activePaperTrade.TakeProfit) {
 							activePaperTrade.Status = "CLOSED_TP"
 							isClosed    = true
@@ -450,12 +537,37 @@ func main() {
 							virtualBal := srv.GetVirtualBalance()
 							profitUSD := activePaperTrade.Margin * (activePaperTrade.PnL / 100.0)
 							marginReturned := activePaperTrade.Margin + profitUSD
-							srv.SetVirtualBalance(virtualBal + marginReturned)
+							newBal := virtualBal + marginReturned
+							if newBal < 0 {
+								newBal = 0 // Margin Call / Anti-minus safeguard
+							}
+							srv.SetVirtualBalance(newBal)
 						}
 
+						go func(t gateway.Position, closedPrice float64, isWin bool, ts int64) {
+							payload := map[string]interface{}{
+								"open_ts": ts,
+								"close_ts": time.Now().UnixMilli(),
+								"symbol": t.Symbol,
+								"direction": t.Side,
+								"entry": t.EntryPrice,
+								"tp": t.TakeProfit,
+								"sl": t.StopLoss,
+								"close_price": closedPrice,
+								"is_win": isWin,
+								"rr": t.PnL,
+								"is_real_money": !isDryRun,
+								"is_shadow": false,
+							}
+							if b, err := json.Marshal(payload); err == nil {
+								http.Post("http://127.0.0.1:8080/api/save_trade", "application/json", bytes.NewBuffer(b))
+							}
+						}(*activePaperTrade, md.Price, activePaperTrade.Status == "CLOSED_TP", paperTradeOpenedAt.UnixMilli())
+
+
 						paperHistory = append([]gateway.Position{*activePaperTrade}, paperHistory...)
-						if len(paperHistory) > 50 {
-							paperHistory = paperHistory[:50]
+						if len(paperHistory) > 5000 {
+							paperHistory = paperHistory[:5000]
 						}
 						delete(activePaperTrades, currentSym)
 						delete(paperTradeOpenedAts, currentSym)
@@ -463,7 +575,11 @@ func main() {
 						savePaperState()
 					}
 
-					srv.UpdatePositions(activePaperTrade, paperHistory)
+					var actives []gateway.Position
+					for _, v := range activePaperTrades {
+						if v != nil { actives = append(actives, *v) }
+					}
+					srv.UpdatePositions(actives, paperHistory)
 				}
 
 				bridge.WriteMarket(md)
@@ -486,7 +602,7 @@ func main() {
 				}
 				
 				if !botRunning {
-					if currentSym == cfg.Symbol {
+					if currentSym == activeUiSym {
 						lsr := md.LSR
 						if lsr < 1e-9 { lsr = 1.0 }
 						pct24h := md.USDTDeltaPct
@@ -545,7 +661,7 @@ func main() {
 					
 				}
 
-				if currentSym == cfg.Symbol {
+				if currentSym == activeUiSym {
 					// We need to bypass updateInsight since it takes 'feed', which we removed bridge from.
 					// We can just inline UpdateInsight here for dashboard
 					lsr := md.LSR
@@ -575,7 +691,25 @@ func main() {
 
 				if isDryRun {
 					virtualBal := srv.GetVirtualBalance()
-					estimatedMargin := virtualBal * cfg.RiskPct
+					
+					// 1. Ambil jatah Margin Usage dari settingan UI (contoh 100% -> cfg.RiskPct = 1.0)
+					poolSize := virtualBal * cfg.RiskPct
+					
+					// 2. Ambil persenan compounding dinamis dari AI Treasury Manager
+					allocPct := sig.AllocationPct
+					if allocPct <= 0 || allocPct > 1.0 { 
+						allocPct = 0.05 // fallback aman 5%
+					}
+
+					// 3. Pecah Margin dari jatah pool sesuai saran AI
+					estimatedMargin := poolSize * allocPct
+					estimatedMargin = math.Round(estimatedMargin*100) / 100 // Round to 2 decimal places to avoid 0.0
+					
+					// Jika hasil perhitungan terlalu kecil, tetapkan batas bawah aman (misal $0.1) agar tidak nyangkut static atau ter-skip
+					if estimatedMargin > 0 && estimatedMargin < 0.1 {
+						estimatedMargin = 0.1
+					}
+
 					if virtualBal < estimatedMargin || estimatedMargin <= 0 {
 						continue
 					}
@@ -596,10 +730,14 @@ func main() {
 					activePaperTrades[currentSym] = newTrade
 					paperTradeOpenedAts[currentSym] = time.Now()
 
-					log.Printf("[Paper][%s] ✓ LIMIT Order placed: %s @ %.4f TP=%.4f SL=%.4f",
-						currentSym, dirStr, md.Price, sig.TakeProfit, sig.StopLoss)
+					log.Printf("[Paper][%s] ✓ LIMIT Order placed: %s @ %.4f TP=%.4f SL=%.4f Margin=$%.2f (Alloc: %.1f%%)",
+						currentSym, dirStr, md.Price, sig.TakeProfit, sig.StopLoss, estimatedMargin, allocPct*100)
 
-					srv.UpdatePositions(newTrade, paperHistory)
+					var actives []gateway.Position
+					for _, v := range activePaperTrades {
+						if v != nil { actives = append(actives, *v) }
+					}
+					srv.UpdatePositions(actives, paperHistory)
 					savePaperState()
 				}
 			} 

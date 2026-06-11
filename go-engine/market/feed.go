@@ -50,7 +50,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/gorilla/websocket"
 	"tradebot/go-engine/shm"
 )
 
@@ -65,9 +64,10 @@ type State struct {
 	mu sync.RWMutex
 
 	// From WebSocket
-	Price float64
-	Bid   float64
-	Ask   float64
+	Price    float64
+	Bid      float64
+	Ask      float64
+	RawTicks []shm.RawTick
 
 	// From REST OHLCV
 	Candles []shm.Candle
@@ -113,6 +113,39 @@ type Feed struct {
 	symChangeRestCh chan struct{}
 
 	isBacktesting atomic.Bool
+
+	// Exchange Driver (Fallback mechanism)
+	driverMu sync.RWMutex
+	driver   ExchangeDriver
+}
+
+func (f *Feed) getDriver() ExchangeDriver {
+	f.driverMu.RLock()
+	defer f.driverMu.RUnlock()
+	return f.driver
+}
+
+func (f *Feed) SwitchDriver(newDriver ExchangeDriver) {
+	f.driverMu.Lock()
+	oldName := ""
+	if f.driver != nil {
+		oldName = f.driver.Name()
+	}
+	f.driver = newDriver
+	f.driverMu.Unlock()
+
+	if oldName != newDriver.Name() {
+		log.Printf("[Feed][%s] Switched CEX Driver: %s -> %s", f.getSymbol(), oldName, newDriver.Name())
+		// Trigger reconnect on driver change
+		select {
+		case f.symChangeCh <- struct{}{}:
+		default:
+		}
+		select {
+		case f.symChangeRestCh <- struct{}{}:
+		default:
+		}
+	}
 }
 
 func (f *Feed) SetBacktesting(v bool) {
@@ -124,13 +157,17 @@ func (f *Feed) IsBacktesting() bool {
 }
 
 // New membuat Feed baru. Symbol awal dari parameter, bisa diganti via UpdateSymbol().
-func New(symbol, ohlcvTF string, limit int) *Feed {
+func New(symbol, ohlcvTF string, limit int, initDriver ExchangeDriver) *Feed {
+	if initDriver == nil {
+		initDriver = &BybitDriver{}
+	}
 	f := &Feed{
 		client:          &http.Client{Timeout: 10 * time.Second},
 		ohlcvTF:         ohlcvTF,
 		limit:           limit,
 		symChangeCh:     make(chan struct{}, 1),
 		symChangeRestCh: make(chan struct{}, 1),
+		driver:          initDriver,
 	}
 	// [FIX-F1] Init atomic symbol
 	f.atomicSymbol.Store(symbol)
@@ -166,6 +203,7 @@ func (f *Feed) UpdateSymbol(newSymbol string) {
 	f.state.Price   = 0
 	f.state.OI      = 0
 	f.state.LSR     = 0
+	f.state.RawTicks = nil
 	f.state.mu.Unlock()
 
 	// [FIX-F1] Update atomic symbol (tidak perlu lock, atomic.Value thread-safe)
@@ -284,11 +322,9 @@ func (f *Feed) wsTickerLoop(ctx context.Context) {
 	backoff := time.Second
 	for {
 		select {
-		case <-ctx.Done():
-			return
+		case <-ctx.Done(): return
 		default:
 		}
-		// Drain channel sebelum connect supaya tidak ada sinyal nyangkut yang langsung menutup koneksi baru
 		for {
 			select {
 			case <-f.symChangeCh:
@@ -298,260 +334,122 @@ func (f *Feed) wsTickerLoop(ctx context.Context) {
 		}
 	drainedWS:
 
-		// [FIX-F1] Baca symbol terbaru setiap reconnect
 		sym := f.getSymbol()
-		if err := f.wsConnect(ctx, sym); err != nil {
-			// [FIX-F2] Jika error karena symbol change, reconnect langsung (backoff=0)
-			if sym != f.getSymbol() {
-				// Symbol berubah saat WS connect — reconnect segera
-				log.Printf("[Feed] WS reconnecting for new symbol %s", f.getSymbol())
-				backoff = time.Second // reset backoff untuk symbol change
-				continue
+		driver := f.getDriver()
+		
+		updateChan := make(chan WSMsg, 100)
+		errChan := make(chan error, 1)
+		
+		wsCtx, wsCancel := context.WithCancel(ctx)
+		go driver.WSConnect(wsCtx, sym, updateChan, errChan)
+		
+		// Goroutine watcher for symbol change
+		go func() {
+			select {
+			case <-wsCtx.Done(): return
+			case <-f.symChangeCh:
+				log.Printf("[Feed] Symbol change detected — closing WS for %s", sym)
+				wsCancel()
 			}
-			log.Printf("[Feed] WS error: %v — reconnect in %s", err, backoff)
-		}
-		select {
-		case <-ctx.Done():
-			return
-		case <-time.After(backoff):
-		}
-		if backoff < 60*time.Second {
-			backoff *= 2
-		}
-	}
-}
+		}()
 
-func (f *Feed) wsConnect(ctx context.Context, symbol string) error {
-	conn, _, err := websocket.DefaultDialer.DialContext(ctx, bybitWSMain, nil)
-	if err != nil {
-		return err
-	}
-	defer conn.Close()
-
-	sub := map[string]interface{}{
-		"op":   "subscribe",
-		"args": []string{fmt.Sprintf("tickers.%s", symbol)},
-	}
-	if err := conn.WriteJSON(sub); err != nil {
-		return err
-	}
-	log.Printf("[Feed] WS connected — subscribed to tickers.%s", symbol)
-
-	pingCtx, pingCancel := context.WithCancel(ctx)
-	defer pingCancel()
-	go func() {
-		tick := time.NewTicker(pingInterval)
-		defer tick.Stop()
+		var wsErr error
+	wsListen:
 		for {
 			select {
-			case <-pingCtx.Done():
-				return
-			case <-tick.C:
-				_ = conn.WriteJSON(map[string]string{"op": "ping"})
+			case <-wsCtx.Done():
+				break wsListen
+			case err := <-errChan:
+				wsErr = err
+				wsCancel()
+				break wsListen
+			case msg := <-updateChan:
+				f.state.mu.Lock()
+				if msg.Type == "ticker" {
+					f.state.Price = msg.Price
+					if msg.Bid > 0 { f.state.Bid = msg.Bid }
+					if msg.Ask > 0 { f.state.Ask = msg.Ask }
+				} else if msg.Type == "trade" {
+					f.state.RawTicks = append(f.state.RawTicks, msg.Trade...)
+					if len(f.state.RawTicks) > 1000 {
+						f.state.RawTicks = f.state.RawTicks[len(f.state.RawTicks)-1000:]
+					}
+				}
+				f.state.mu.Unlock()
 			}
 		}
-	}()
 
-	// [FIX-F2] Goroutine watcher: jika symbol berubah saat WS aktif,
-	// tutup koneksi agar wsTickerLoop reconnect dengan symbol baru
-	go func() {
+		if wsErr != nil {
+			if sym != f.getSymbol() {
+				backoff = time.Second
+				continue
+			}
+			log.Printf("[Feed][%s] WS error: %v — reconnect in %s", sym, wsErr, backoff)
+			
+			// Simple dynamic CEX rotation logic
+			if f.getDriver().Name() == "Bybit" {
+				log.Printf("[Feed][%s] Fallback to Binance...", sym)
+				f.SwitchDriver(&BinanceDriver{})
+			} else if f.getDriver().Name() == "Binance" {
+				log.Printf("[Feed][%s] Fallback to OKX...", sym)
+				f.SwitchDriver(&OKXDriver{})
+			} else if f.getDriver().Name() == "OKX" {
+				log.Printf("[Feed][%s] Fallback to MEXC...", sym)
+				f.SwitchDriver(&MEXCDriver{})
+			} else {
+				log.Printf("[Feed][%s] Fallback to Bybit...", sym)
+				f.SwitchDriver(&BybitDriver{})
+			}
+		}
+
 		select {
-		case <-pingCtx.Done():
-			return
-		case <-f.symChangeCh:
-			log.Printf("[Feed] Symbol change detected — closing WS for %s", symbol)
-			conn.Close() // trigger ReadMessage error → wsConnect return
+		case <-ctx.Done(): return
+		case <-time.After(backoff):
 		}
-	}()
-
-	for {
-		_, msg, err := conn.ReadMessage()
-		if err != nil {
-			return err
-		}
-
-		var raw map[string]json.RawMessage
-		if err := json.Unmarshal(msg, &raw); err != nil {
-			continue
-		}
-		topic, _ := strconv.Unquote(string(raw["topic"]))
-		if topic != fmt.Sprintf("tickers.%s", symbol) {
-			continue
-		}
-		var data struct {
-			LastPrice string `json:"lastPrice"`
-			Bid1Price string `json:"bid1Price"`
-			Ask1Price string `json:"ask1Price"`
-		}
-		if err := json.Unmarshal(raw["data"], &data); err != nil {
-			continue
-		}
-
-		price, _ := strconv.ParseFloat(data.LastPrice, 64)
-		bid, _ := strconv.ParseFloat(data.Bid1Price, 64)
-		ask, _ := strconv.ParseFloat(data.Ask1Price, 64)
-
-		if price <= 0 {
-			continue
-		}
-
-		f.state.mu.Lock()
-		f.state.Price = price
-		if bid > 0 {
-			f.state.Bid = bid
-		}
-		if ask > 0 {
-			f.state.Ask = ask
-		}
-		f.state.mu.Unlock()
-
+		if backoff < 60*time.Second { backoff *= 2 }
 	}
 }
 
 // ── REST helpers ──────────────────────────────────────────────────────────────
 
 func (f *Feed) fetchOHLCV(symbol string) error {
-	url := fmt.Sprintf(
-		"%s/v5/market/kline?category=linear&symbol=%s&interval=%s&limit=%d",
-		bybitRESTMain, symbol, f.ohlcvTF, f.limit,
-	)
-	resp, err := f.client.Get(url)
+	driver := f.getDriver()
+	candles, err := driver.FetchOHLCV(f.client, symbol, f.ohlcvTF, f.limit)
 	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-
-	var payload struct {
-		RetCode int `json:"retCode"`
-		Result  struct {
-			List [][]string `json:"list"`
-		} `json:"result"`
-	}
-	body, _ := io.ReadAll(resp.Body)
-	if err := json.Unmarshal(body, &payload); err != nil {
-		return err
-	}
-	if payload.RetCode != 0 {
-		return fmt.Errorf("bybit retCode %d", payload.RetCode)
-	}
-
-	rows := payload.Result.List
-	candles := make([]shm.Candle, 0, len(rows))
-	for i := len(rows) - 1; i >= 0; i-- {
-		r := rows[i]
-		if len(r) < 6 {
-			continue
+		if err.Error() == "rate_limit" {
+			log.Printf("[Feed][%s] Rate limit detected on %s for OHLCV", symbol, driver.Name())
+			// Trigger fallback logic
+			if driver.Name() == "Bybit" { f.SwitchDriver(&BinanceDriver{}) }
 		}
-		ts, _ := strconv.ParseInt(r[0], 10, 64)
-		open, _ := strconv.ParseFloat(r[1], 64)
-		high, _ := strconv.ParseFloat(r[2], 64)
-		low, _ := strconv.ParseFloat(r[3], 64)
-		cls, _ := strconv.ParseFloat(r[4], 64)
-		vol, _ := strconv.ParseFloat(r[5], 64)
-		candles = append(candles, shm.Candle{
-			Open: open, High: high, Low: low, Close: cls, Volume: vol, TsMs: ts,
-		})
+		return err
 	}
 
 	atr := wilderATR(candles, 14)
 
-	// [FIX-F3] Hanya update jika symbol masih sama (cegah race condition)
-	// jika symbol sudah berubah lagi saat fetch berlangsung, drop data ini
-	if f.getSymbol() != symbol {
-		log.Printf("[Feed] OHLCV for %s dropped — symbol changed to %s", symbol, f.getSymbol())
-		return nil
-	}
+	if f.getSymbol() != symbol { return nil }
 
 	f.state.mu.Lock()
 	f.state.Candles = candles
 	f.state.ATR14 = atr
 	f.state.mu.Unlock()
 
-	log.Printf("[Feed] OHLCV refreshed: %s %d candles ATR14=%.4f", symbol, len(candles), atr)
+	log.Printf("[Feed] OHLCV refreshed: %s %d candles ATR14=%.4f (Driver: %s)", symbol, len(candles), atr, driver.Name())
 	return nil
 }
 
 func (f *Feed) fetchAux(symbol string) error {
-	oiURL := fmt.Sprintf("%s/v5/market/open-interest?category=linear&symbol=%s&intervalTime=5min&limit=1",
-		bybitRESTMain, symbol)
-	if oi, err := fetchSpecificFloat(f.client, oiURL, "openInterest"); err == nil && oi > 0 && oi < 1e10 {
-		if f.getSymbol() == symbol {
-			f.state.mu.Lock()
-			f.state.OI = oi
-			f.state.mu.Unlock()
-			log.Printf("[OI] %s oi=%.2f (Bybit)", symbol, oi)
-		}
-	} else {
-		// Fallback to Binance
-		binanceOIURL := fmt.Sprintf("https://fapi.binance.com/fapi/v1/openInterest?symbol=%s", symbol)
-		resp, bErr := f.client.Get(binanceOIURL)
-		if bErr == nil {
-			defer resp.Body.Close()
-			var bData struct {
-				OpenInterest float64 `json:"openInterest,string"`
-			}
-			if json.NewDecoder(resp.Body).Decode(&bData) == nil && bData.OpenInterest > 0 {
-				if f.getSymbol() == symbol {
-					f.state.mu.Lock()
-					f.state.OI = bData.OpenInterest
-					f.state.mu.Unlock()
-					log.Printf("[OI] %s oi=%.2f (Binance Fallback)", symbol, bData.OpenInterest)
-				}
-			}
-		}
-	}
-
-	lsrURL := fmt.Sprintf("%s/v5/market/account-ratio?category=linear&symbol=%s&period=5min&limit=1",
-		bybitRESTMain, symbol)
-	if buy, sell, err := fetchLSR(f.client, lsrURL); err == nil && sell > 0 {
-		lsr := buy / sell
-		if f.getSymbol() == symbol {
-			f.state.mu.Lock()
-			f.state.LSR = lsr
-			f.state.mu.Unlock()
-			log.Printf("[WHALE] %s LSR=%.4f bias=%s (Bybit)", symbol, lsr, lsrBiasLabel(lsr))
-		}
-	} else {
-		// Fallback to Binance LSR
-		binanceLSRURL := fmt.Sprintf("https://fapi.binance.com/futures/data/globalLongShortAccountRatio?symbol=%s&period=5m&limit=1", symbol)
-		resp, bErr := f.client.Get(binanceLSRURL)
-		if bErr == nil {
-			defer resp.Body.Close()
-			var bData []struct {
-				LongShortRatio float64 `json:"longShortRatio,string"`
-			}
-			if json.NewDecoder(resp.Body).Decode(&bData) == nil && len(bData) > 0 {
-				if f.getSymbol() == symbol {
-					f.state.mu.Lock()
-					f.state.LSR = bData[0].LongShortRatio
-					f.state.mu.Unlock()
-					log.Printf("[WHALE] %s LSR=%.4f bias=%s (Binance Fallback)", symbol, bData[0].LongShortRatio, lsrBiasLabel(bData[0].LongShortRatio))
-				}
-			}
-		}
-	}
-
-	frURL := fmt.Sprintf("%s/v5/market/funding/history?category=linear&symbol=%s&limit=1",
-		bybitRESTMain, symbol)
-	if fr, err := fetchSpecificFloat(f.client, frURL, "fundingRate"); err == nil {
-		if f.getSymbol() != symbol {
-			return nil
-		}
+	driver := f.getDriver()
+	oi, lsr, funding, pct24h, err := driver.FetchAux(f.client, symbol)
+	if err != nil { return err }
+	
+	if f.getSymbol() == symbol {
 		f.state.mu.Lock()
-		f.state.FundingRate = fr
+		if oi > 0 { f.state.OI = oi }
+		if lsr > 0 { f.state.LSR = lsr }
+		if funding != 0 { f.state.FundingRate = funding }
+		if pct24h != 0 { f.state.Pct24h = pct24h }
 		f.state.mu.Unlock()
 	}
-
-	tickURL := fmt.Sprintf("%s/v5/market/tickers?category=linear&symbol=%s", bybitRESTMain, symbol)
-	if pct, err := fetchSpecificFloat(f.client, tickURL, "price24hPcnt"); err == nil {
-		if f.getSymbol() != symbol {
-			return nil
-		}
-		f.state.mu.Lock()
-		f.state.Pct24h = pct * 100.0 // bybit returns 0.01 for 1%
-		f.state.mu.Unlock()
-	}
-
 	return nil
 }
 
@@ -582,9 +480,11 @@ func lsrBiasLabel(lsr float64) string {
 var flushSeq uint64
 
 func (f *Feed) GetMarketData(symbol string) *shm.MarketData {
-	f.state.mu.RLock()
+	f.state.mu.Lock()
 	s := f.state
-	f.state.mu.RUnlock()
+	// Clear the raw ticks so we don't send duplicates next cycle
+	f.state.RawTicks = nil
+	f.state.mu.Unlock()
 
 	if s.Price <= 0 || len(s.Candles) == 0 {
 		return nil
@@ -596,6 +496,7 @@ func (f *Feed) GetMarketData(symbol string) *shm.MarketData {
 	md := &shm.MarketData{
 		Symbol:         sym,
 		Candles:        s.Candles,
+		RawTicks:       s.RawTicks,
 		Price:          s.Price,
 		Bid:            s.Bid,
 		Ask:            s.Ask,

@@ -1,19 +1,21 @@
 "use client"
 
+import { useState } from "react"
+
 import { ScrollText } from "lucide-react"
 import type { LogEvent } from "@/lib/types"
 import { Panel, EmptyState } from "./ui-kit"
 import { cn } from "@/lib/utils"
 
 const levelBg: Record<LogEvent["level"], string> = {
-  INFO: "bg-muted text-muted-foreground",
-  SIGNAL: "bg-primary/15 text-primary",
-  EXEC: "bg-positive/15 text-positive",
-  RISK: "bg-warning/15 text-warning",
-  VETO: "bg-negative/15 text-negative",
-  WARNING: "bg-warning/15 text-warning",
-  ERROR: "bg-negative/15 text-negative",
-  DEBUG: "bg-muted text-muted-foreground",
+  INFO: "text-muted-foreground",
+  SIGNAL: "text-blue-400",
+  EXEC: "text-positive",
+  RISK: "text-warning",
+  VETO: "text-negative",
+  WARNING: "text-warning",
+  ERROR: "text-negative",
+  DEBUG: "text-muted-foreground",
 }
 
 export function EventLog({
@@ -25,44 +27,69 @@ export function EventLog({
   engineOnline: boolean
   className?: string
 }) {
+  const [filter, setFilter] = useState<"ALL" | "SIGNAL" | "EXEC" | "RISK" | "ERROR">("ALL")
+  
+  const filteredLog = log.filter(e => {
+    if (filter === "ALL") return true
+    if (filter === "ERROR" && (e.level === "ERROR" || e.level === "VETO")) return true
+    return e.level === filter
+  })
+
   return (
     <Panel
-      title="Event Stream"
-      right={<span className="text-[10px] text-muted-foreground">{log.length} events</span>}
-      className={className}
-      bodyClassName="overflow-auto scroll-thin"
-    >
-      {log.length === 0 ? (
-        <EmptyState
-          icon={ScrollText}
-          title={engineOnline ? "No events yet" : "Engine offline"}
-          hint={
-            engineOnline
-              ? "Signals, executions and risk events will stream here as they happen."
-              : "Logs stream from your local TradeBot engine once it's connected."
-          }
-          className="h-full min-h-32"
-        />
-      ) : (
-        <ul className="flex flex-col">
-          {log.map((e) => (
-            <li key={e.id} className="flex items-start gap-2 border-b border-border/50 px-3 py-1.5 text-xs last:border-0">
-              <span className="mt-0.5 w-14 shrink-0 font-mono text-[10px] tabular text-muted-foreground">{e.time}</span>
-              <span
+      title="Terminal Console"
+      right={
+        <div className="flex items-center gap-2">
+          <div className="flex items-center bg-muted/20 p-0.5 rounded border border-border/50">
+            {(["ALL", "SIGNAL", "EXEC", "RISK", "ERROR"] as const).map(f => (
+              <button
+                key={f}
+                onClick={() => setFilter(f)}
                 className={cn(
-                  "mt-0.5 shrink-0 rounded px-1 py-0 font-mono text-[9px] font-bold uppercase tracking-wider",
-                  levelBg[e.level],
+                  "px-2 py-0.5 text-[9px] font-mono font-bold rounded-sm transition-all", 
+                  filter === f ? "bg-panel text-foreground shadow-sm border border-border/40" : "text-muted-foreground hover:text-foreground"
                 )}
               >
+                {f}
+              </button>
+            ))}
+          </div>
+          <span className="text-[10px] font-mono text-muted-foreground">{filteredLog.length} / {log.length}</span>
+        </div>
+      }
+      className={cn("bg-[#0a0a0a] border-border/40 shadow-inner", className)}
+      bodyClassName="overflow-auto scroll-thin flex-1"
+    >
+      {filteredLog.length === 0 ? (
+        <EmptyState
+          icon={ScrollText}
+          title={engineOnline ? (filter === "ALL" ? "System idle" : `No ${filter} events`) : "Connection severed"}
+          hint={
+            engineOnline
+              ? "Awaiting execution matrix inputs..."
+              : "Start the local engine to establish uplink."
+          }
+          className="h-full min-h-32 opacity-50"
+        />
+      ) : (
+        <div className="flex flex-col p-2 space-y-1 font-mono text-[11px] leading-tight selection:bg-primary/30">
+          {filteredLog.map((e) => (
+            <div key={e.id} className="flex items-start gap-2 group hover:bg-muted/10 px-1 py-0.5 rounded transition-colors">
+              <span className="shrink-0 opacity-40 group-hover:opacity-70 transition-opacity">[{e.time}]</span>
+              <span className={cn("shrink-0 font-bold tracking-widest uppercase w-[60px]", levelBg[e.level])}>
                 {e.level}
               </span>
-              <span className="min-w-0 flex-1 leading-snug">
-                {e.name && <span className="mr-1 font-mono font-semibold text-foreground/70">{e.name}</span>}
-                <span className="text-foreground/80">{e.message}</span>
+              <span className="min-w-0 flex-1 text-foreground/80 break-words">
+                {e.name && <span className="text-foreground/50 mr-2">{"<"}{e.name}{">"}</span>}
+                {e.message}
               </span>
-            </li>
+            </div>
           ))}
-        </ul>
+          <div className="flex items-center gap-2 px-1 py-1 mt-2 opacity-50">
+            <span className="text-primary font-bold">{">"}</span>
+            <span className="w-2 h-3 bg-primary animate-pulse"></span>
+          </div>
+        </div>
       )}
     </Panel>
   )

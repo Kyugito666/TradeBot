@@ -33,14 +33,11 @@ interface AgentState {
     convictionScale: number
     activationGate: number
   }
-  scorecard: {
-    trades: number
-    correct: number
-    incorrect: number
-    accuracy: number
-    recentAccuracy: number
-    pnlContrib: number
-    wrongStreak: number
+  performance: {
+    totalTrades: number
+    winRate: number
+    winStreak: number
+    lossStreak: number
   }
 }
 
@@ -104,7 +101,7 @@ export function AgentVotesPanel({
 }) {
   const [expanded, setExpanded] = useState<string | null>(null)
   
-  // Sort by confidence
+  // Show actual votes — no more WAIT→VETO mapping
   const sortedOutputs = [...outputs].sort((a, b) => b.confidence - a.confidence)
   
   // Count votes
@@ -278,44 +275,41 @@ export function AgentVotesPanel({
                   {agentState && (
                     <div className="border-t border-border pt-2 mt-2">
                       <h5 className="text-[9px] uppercase tracking-wider text-muted-foreground mb-2">
-                        Self-Evaluation Stats
+                        Military Tatar Stats
                       </h5>
                       <div className="grid grid-cols-4 gap-2 text-center">
                         <div>
                           <div className="font-mono text-xs font-bold">
-                            {agentState.scorecard.trades}
+                            {agentState.performance.totalTrades}
                           </div>
                           <div className="text-[9px] text-muted-foreground">Trades</div>
                         </div>
                         <div>
                           <div className={cn(
                             "font-mono text-xs font-bold",
-                            agentState.scorecard.accuracy >= 0.5 ? "text-positive" : "text-negative"
+                            agentState.performance.winRate >= 60 ? "text-positive" : "text-negative"
                           )}>
-                            {(agentState.scorecard.accuracy * 100).toFixed(0)}%
+                            {agentState.performance.winRate.toFixed(0)}%
                           </div>
-                          <div className="text-[9px] text-muted-foreground">Accuracy</div>
+                          <div className="text-[9px] text-muted-foreground">WinRate</div>
                         </div>
                         <div>
-                          <div className={cn(
-                            "font-mono text-xs font-bold",
-                            agentState.scorecard.recentAccuracy >= 0.5 ? "text-positive" : "text-negative"
-                          )}>
-                            {(agentState.scorecard.recentAccuracy * 100).toFixed(0)}%
+                          <div className="font-mono text-xs font-bold text-positive">
+                            {agentState.performance.winStreak}
                           </div>
-                          <div className="text-[9px] text-muted-foreground">Recent</div>
+                          <div className="text-[9px] text-muted-foreground">W-Streak</div>
                         </div>
                         <div>
-                          <div className="font-mono text-xs font-bold">
-                            {agentState.tunables.weight.toFixed(2)}x
+                          <div className="font-mono text-xs font-bold text-negative">
+                            {agentState.performance.lossStreak}
                           </div>
-                          <div className="text-[9px] text-muted-foreground">Weight</div>
+                          <div className="text-[9px] text-muted-foreground">L-Streak</div>
                         </div>
                       </div>
-                      {agentState.scorecard.wrongStreak >= 2 && (
+                      {agentState.performance.lossStreak >= 3 && (
                         <div className="mt-2 flex items-center gap-1.5 text-[10px] text-warning">
                           <AlertTriangle className="h-3 w-3" />
-                          <span>Wrong streak: {agentState.scorecard.wrongStreak}</span>
+                          <span>Demotion Risk: {agentState.performance.lossStreak} losses</span>
                         </div>
                       )}
                     </div>

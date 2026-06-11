@@ -13,7 +13,7 @@ impl Agent for Psychologist {
         let news_volume = snap.news_count as f64;
 
         if news_volume == 0.0 || sentiment.abs() < 0.1 {
-            return AgentVote::wait(self.name(), "Neutral or no sentiment data");
+            return AgentVote::forced_choice(self.name(), 0.1, 0.1, "Neutral or no sentiment data");
         }
 
         let mut conviction = (sentiment.abs() as f64).clamp(0.0, 1.0);

@@ -27,10 +27,21 @@ function baseOf(symbol: string): string {
 // to 0 so those data-dependent agents WAIT gracefully instead of failing.
 async function buildAgentInput(symbol: string, cexId: string): Promise<AgentInput | null> {
   const base = baseOf(symbol)
-  const ex = getExchange(cexId)
+  let ex = getExchange(cexId)
 
   // Resolve the exchange-native instrument id for this canonical symbol.
-  const tickers = await ex.fetchTickers()
+  let tickers = await ex.fetchTickers()
+  
+  // MULTI-API FALLBACK: If active CEX fails, seamlessly hop to OKX or Bybit
+  if (tickers.length === 0) {
+    ex = getExchange("okx")
+    tickers = await ex.fetchTickers()
+    if (tickers.length === 0) {
+      ex = getExchange("bybit")
+      tickers = await ex.fetchTickers()
+    }
+  }
+
   const ticker = tickers.find((t) => t.symbol.toUpperCase() === symbol.toUpperCase() || t.base === base)
   const native = ticker?.native ?? symbol
 
@@ -114,7 +125,7 @@ export async function GET(request: Request) {
         ok: false,
         error: "Market data unavailable",
         progress: { stage: "error", currentStep: 0, totalSteps: 6, message: "Market data unavailable" },
-      })
+      }, { status: 502 })
     }
 
     let latestProgress: PipelineProgress | null = null
@@ -157,7 +168,7 @@ export async function GET(request: Request) {
       error: err instanceof Error ? err.message : "Unknown error",
       expectedAgents: EXPECTED_AGENT_COUNT,
       progress: { stage: "error", currentStep: 0, totalSteps: 6, message: "Pipeline failed" },
-    })
+    }, { status: 500 })
   }
 }
 

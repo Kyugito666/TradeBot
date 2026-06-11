@@ -9,28 +9,33 @@ import { cn } from "@/lib/utils"
 export function PositionsTable({
   positions,
   engineOnline,
+  className,
 }: {
   positions: Position[]
   engineOnline: boolean
+  className?: string
 }) {
+  const priceFmt = (n: number) => num(n, n < 1 ? 5 : 2)
+
   const totalMargin = positions.reduce((a, p) => a + p.margin, 0)
   const totalUpnl = positions.reduce((a, p) => a + p.pnlUsd, 0)
 
   return (
     <Panel
+      className={className}
       title="Open Positions"
       right={
         <div className="flex items-center gap-3 text-[10px]">
           <span className="text-muted-foreground">
-            Margin <span className="font-mono text-foreground">{usd(totalMargin)}</span>
+            Margin <span className="font-mono text-foreground">{usd(totalMargin, 2)}</span>
           </span>
           <span className="text-muted-foreground">
             uPnL{" "}
-            <span className={cn("font-mono", totalUpnl >= 0 ? "text-positive" : "text-negative")}>{usd(totalUpnl)}</span>
+            <span className={cn("font-mono", totalUpnl >= 0 ? "text-positive" : "text-negative")}>{usd(totalUpnl, 2)}</span>
           </span>
         </div>
       }
-      bodyClassName="overflow-auto scroll-thin"
+      bodyClassName="overflow-auto scroll-thin flex-1"
     >
       <table className="w-full border-collapse text-xs">
         <thead className="sticky top-0 z-10 bg-panel">
@@ -48,25 +53,32 @@ export function PositionsTable({
         </thead>
         <tbody>
           {positions.map((p) => {
-            const win = p.pnlUsd >= 0
+            const isPending = p.status === "PENDING" || p.status === "pending"
+            const win = !isPending && p.pnlUsd >= 0
+            const displayPnl = isPending ? 0 : p.pnlUsd
+            const displayRoe = isPending ? 0 : p.pnlPct
+            const statusLabel = isPending ? "LIMIT" : "FILLED"
+            const statusColor = isPending ? "text-amber-400" : "text-cyan-400"
             return (
               <tr key={p.id} className="border-t border-border/60 transition-colors hover:bg-muted/40">
                 <td className="px-3 py-2">
                   <div className="flex flex-col leading-tight">
                     <span className="font-mono font-semibold text-foreground">{p.symbol.replace("USDT", "")}</span>
-                    <span className="font-mono text-[9px] text-muted-foreground">{p.status} · {p.openedAt}</span>
+                    <span className={cn("font-mono text-[9px]", statusColor)}>{statusLabel} · {p.openedAt}</span>
                   </div>
                 </td>
                 <td className="px-2 py-2 text-center">
                   <Tag tone={p.side === "LONG" ? "positive" : "negative"}>{p.side}</Tag>
                 </td>
-                <td className="px-2 py-2 text-right font-mono tabular text-muted-foreground">{num(p.entry, 2)}</td>
-                <td className="px-2 py-2 text-right font-mono tabular text-foreground">{num(p.mark, 2)}</td>
-                <td className="px-2 py-2 text-right font-mono tabular text-positive">{p.tp ? num(p.tp, 2) : "—"}</td>
-                <td className="px-2 py-2 text-right font-mono tabular text-negative">{p.sl ? num(p.sl, 2) : "—"}</td>
-                <td className="px-2 py-2 text-right font-mono tabular text-muted-foreground">{usd(p.margin, 2)}</td>
-                <td className={cn("px-2 py-2 text-right font-mono tabular font-semibold", win ? "text-positive" : "text-negative")}>{usd(p.pnlUsd, 2)}</td>
-                <td className={cn("px-3 py-2 text-right font-mono tabular", win ? "text-positive" : "text-negative")}>{pct(p.pnlPct)}</td>
+                <td className="px-2 py-2 text-right font-mono tabular text-muted-foreground">{priceFmt(p.entry)}</td>
+                <td className="px-2 py-2 text-right font-mono tabular text-foreground">{priceFmt(p.mark)}</td>
+                <td className="px-2 py-2 text-right font-mono tabular text-positive">{p.tp ? priceFmt(p.tp) : "—"}</td>
+                <td className="px-2 py-2 text-right font-mono tabular text-negative">{p.sl ? priceFmt(p.sl) : "—"}</td>
+                <td className="px-2 py-2 text-right font-mono tabular text-muted-foreground">
+                  {usd(p.margin, 2)} <span className="text-[9px] opacity-70 ml-1">x{p.leverage || 1}</span>
+                </td>
+                <td className={cn("px-2 py-2 text-right font-mono tabular font-semibold", isPending ? "text-muted-foreground" : win ? "text-positive" : "text-negative")}>{isPending ? "—" : usd(displayPnl, 2)}</td>
+                <td className={cn("px-3 py-2 text-right font-mono tabular", isPending ? "text-muted-foreground" : win ? "text-positive" : "text-negative")}>{isPending ? "—" : pct(displayRoe)}</td>
               </tr>
             )
           })}

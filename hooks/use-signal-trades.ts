@@ -13,8 +13,7 @@ import {
 } from "@/lib/signal-engine"
 import type { AgentAnalysisResponse, CexConfig, RiskModel, TradingStyle } from "@/hooks/use-live-data"
 
-// Cap concurrent auto-opened paper positions so the forward-test stays readable.
-const MAX_OPEN = 6
+
 
 interface Params {
   market: MarketRow[]
@@ -23,6 +22,7 @@ interface Params {
   risk: RiskModel
   activeCex: CexConfig | undefined
   agentAnalysis?: AgentAnalysisResponse | null
+  paperBalance: number
 }
 
 // Send TP/SL outcome back to the agent self-evaluation framework so the team can
@@ -42,7 +42,7 @@ function reportTradeForLearning(trade: PaperTrade) {
   }).catch(() => {})
 }
 
-export function useSignalTrades({ market, marketOnline, style, risk, activeCex, agentAnalysis }: Params) {
+export function useSignalTrades({ market, marketOnline, style, risk, activeCex, agentAnalysis, paperBalance }: Params) {
   const [state, setState] = useState<SignalForwardState>({
     autoEntry: false,
     autoTpSl: true,
@@ -51,16 +51,31 @@ export function useSignalTrades({ market, marketOnline, style, risk, activeCex, 
   })
   const [hydrated, setHydrated] = useState(false)
 
-  // Hydrate from localStorage after mount (avoids SSR mismatch).
+  // Hydrate open trades from localStorage after mount.
+  // History is fetched from the persistent SQLite database.
   useEffect(() => {
-    setState(localStore.loadSignalState())
+    const local = localStore.loadSignalState()
+    setState((prev) => ({ ...prev, open: local.open, autoEntry: local.autoEntry, autoTpSl: local.autoTpSl }))
     setHydrated(true)
+
+    fetch("/api/history/paper")
+      .then((res) => res.json())
+      .then((data) => {
+        if (Array.isArray(data)) {
+          setState((prev) => ({ ...prev, history: data }))
+        }
+      })
+      .catch((err) => console.error("Failed to load paper history from DB", err))
   }, [])
 
-  // Persist whenever state changes post-hydration.
+  // Persist open trades whenever state changes post-hydration.
   useEffect(() => {
-    if (hydrated) localStore.saveSignalState(state)
-  }, [hydrated, state])
+    if (hydrated) {
+      // We only save open trades and settings to local storage. 
+      // History is persisted to DB immediately when closed.
+      localStore.saveSignalState({ ...state, history: [] })
+    }
+  }, [hydrated, state.open, state.autoEntry, state.autoTpSl])
 
   // Always-on filtered candidate list derived from the live market scan + Settings.
   const candidates: SignalCandidate[] = buildCandidates(market, style, risk, activeCex)
@@ -82,26 +97,98 @@ export function useSignalTrades({ market, marketOnline, style, risk, activeCex, 
       const stillOpen: PaperTrade[] = []
       const newlyClosed: PaperTrade[] = []
 
-      // 1) Evaluate open trades for TP/SL hits (only when auto TP/SL is on).
+      // 1) Process open trades: check PENDING fills, then evaluate TP/SL for FILLED trades.
       for (const trade of prev.open) {
         const mark = priceBySymbol.get(trade.symbol)
-        if (prev.autoTpSl && mark !== undefined) {
+        if (mark === undefined || mark <= 0) {
+          stillOpen.push(trade)
+          continue
+        }
+
+        // Update live price on all trades (for UI display)
+        const withLivePrice = { ...trade, livePrice: mark }
+
+        // Check PENDING → FILLED transition (limit order fill)
+        if (trade.status === "PENDING" || !trade.status) {
+          const isFilled =
+            trade.side === "LONG"
+              ? mark <= trade.entry  // Long limit: price drops to entry
+              : mark >= trade.entry  // Short limit: price rises to entry
+
+          if (isFilled) {
+            // Limit order filled!
+            withLivePrice.status = "FILLED"
+            changed = true
+            stillOpen.push(withLivePrice)
+          } else {
+            // Still pending — PnL stays 0, just track live price
+            withLivePrice.status = "PENDING"
+            stillOpen.push(withLivePrice)
+            // Mark changed so livePrice updates in UI
+            if (trade.livePrice !== mark) changed = true
+          }
+          continue
+        }
+
+        // FILLED trades: evaluate TP/SL hits
+        if (prev.autoTpSl && trade.status === "FILLED") {
           const closed = evaluateTrade(trade, mark)
           if (closed) {
-            newlyClosed.push(closed)
+            newlyClosed.push({ ...closed, status: "CLOSED" })
             changed = true
             continue
           }
         }
-        stillOpen.push(trade)
+
+        // Still open — update live price
+        if (trade.livePrice !== mark) changed = true
+        stillOpen.push(withLivePrice)
       }
 
-      // 2) Auto-entry: open paper trades for qualifying signals not already open.
-      if (prev.autoEntry && stillOpen.length < MAX_OPEN) {
+      // 2) Auto-entry: open paper trades for qualifying signals not already open, constrained by margin.
+      if (prev.autoEntry) {
+        // Calculate true live equity based on historical PnL
+        let totalRealizedPnl = 0
+        for (const t of prev.history) {
+          totalRealizedPnl += (t.margin || 0) * ((t.pnlPct || 0) / 100)
+        }
+        for (const t of newlyClosed) {
+          totalRealizedPnl += (t.margin || 0) * ((t.pnlPct || 0) / 100)
+        }
+        const liveEquity = Math.max(1, paperBalance + totalRealizedPnl)
+
+        const marginLimitPct = activeCex?.marginUsagePct ?? 10
+        const maxMarginUsd = liveEquity * (marginLimitPct / 100)
+        let currentMarginUsd = 0
+        
+        // Calculate absolute margin already used by open trades.
+        for (const t of stillOpen) {
+          const slPct = Math.abs(t.entry - t.sl) / t.entry
+          const riskUsd = liveEquity * (risk.maxPnlPct / 100)
+          const positionSize = riskUsd / slPct
+          const marginUsed = t.margin || Math.max(0.1, positionSize / t.leverage)
+          currentMarginUsd += marginUsed
+        }
+
         const openSymbols = new Set(stillOpen.map((t) => t.symbol))
         for (const c of candidatesRef.current) {
-          if (stillOpen.length >= MAX_OPEN) break
           if (openSymbols.has(c.row.symbol)) continue
+          
+          // Extra safety net: Auto-Entry is exclusively for highly confident setups (>= 0.7)
+          if (c.row.confidence < 0.7) continue
+          
+          const slPct = Math.abs(c.levels.entry - c.levels.sl) / c.levels.entry
+          const riskUsd = liveEquity * (risk.maxPnlPct / 100)
+          const positionSize = riskUsd / slPct
+          const requiredMarginUsd = Math.max(0.1, positionSize / c.levels.leverage)
+          
+          if (currentMarginUsd + requiredMarginUsd > maxMarginUsd) {
+            // Margin limit reached, cannot open more trades automatically
+            break
+          }
+          
+          currentMarginUsd += requiredMarginUsd // DEDUCT MARGIN
+          
           const votes =
             agentRef.current?.symbol === c.row.symbol
               ? agentRef.current.agentOutputs?.map((o) => ({
@@ -110,6 +197,11 @@ export function useSignalTrades({ market, marketOnline, style, risk, activeCex, 
                   confidence: o.confidence,
                 }))
               : undefined
+
+          if (votes?.some(v => v.vote === "VETO" || v.vote === "WAIT")) {
+            continue // Veto functionality: Block auto-entry!
+          }
+
           stillOpen.push({
             id: `${c.row.symbol}-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
             symbol: c.row.symbol,
@@ -119,8 +211,10 @@ export function useSignalTrades({ market, marketOnline, style, risk, activeCex, 
             sl: c.levels.sl,
             leverage: c.levels.leverage,
             confidence: c.row.confidence,
+            margin: requiredMarginUsd,
             openedAt: Date.now(),
-            reason: `${c.levels.side} setup · conf ${(c.row.confidence * 100).toFixed(0)}% · RR 1:${c.levels.riskReward}`,
+            status: "PENDING",
+            reason: `LIMIT ${c.levels.side} · conf ${(c.row.confidence * 100).toFixed(0)}% · RR 1:${c.levels.riskReward}`,
             agentVotes: votes,
           })
           openSymbols.add(c.row.symbol)
@@ -130,8 +224,15 @@ export function useSignalTrades({ market, marketOnline, style, risk, activeCex, 
 
       if (!changed) return prev
 
-      // Feed closed trades back to the agents for self-improvement.
-      for (const t of newlyClosed) reportTradeForLearning(t)
+      // Feed closed trades back to the agents for self-improvement AND persist to DB.
+      for (const t of newlyClosed) {
+        reportTradeForLearning(t)
+        fetch("/api/history/paper", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify(t),
+        }).catch(() => {})
+      }
 
       return {
         ...prev,
@@ -172,8 +273,10 @@ export function useSignalTrades({ market, marketOnline, style, risk, activeCex, 
           sl: candidate.levels.sl,
           leverage: candidate.levels.leverage,
           confidence: candidate.row.confidence,
+          margin: Math.max(1, (paperBalance * (risk.maxPnlPct / 100)) / (Math.abs(candidate.levels.entry - candidate.levels.sl) / candidate.levels.entry) / candidate.levels.leverage),
           openedAt: Date.now(),
-          reason: `Manual ${candidate.levels.side} · conf ${(candidate.row.confidence * 100).toFixed(0)}%`,
+          status: "PENDING",
+          reason: `LIMIT ${candidate.levels.side} · conf ${(candidate.row.confidence * 100).toFixed(0)}%`,
           agentVotes: votes,
         }
         return { ...prev, open: [...prev.open, trade] }
@@ -182,28 +285,62 @@ export function useSignalTrades({ market, marketOnline, style, risk, activeCex, 
     [],
   )
 
-  // Manually close an open trade at the latest mark price.
-  const closeTrade = useCallback(
-    (id: string) => {
-      const mark = market.find((m) => state.open.some((t) => t.id === id && t.symbol === m.symbol))?.lastPrice
-      setState((prev) => {
-        const trade = prev.open.find((t) => t.id === id)
-        if (!trade) return prev
-        const px = mark ?? trade.entry
-        const closed = closeTradeManual(trade, px)
+  const closeTrade = useCallback((id: string) => {
+    setState((prev) => {
+      const t = prev.open.find((x) => x.id === id)
+      if (!t) return prev
+      const mark = candidatesRef.current.find((c) => c.row.symbol === t.symbol)?.row.lastPrice || t.entry
+      
+      const closed = { ...t, exitPrice: mark, outcome: "MANUAL" as const, closedAt: Date.now() }
+      const pnlPct = ((mark - t.entry) / t.entry) * (t.side === "LONG" ? 1 : -1) * t.leverage * 100
+      closed.pnlPct = pnlPct
+      closed.pnlR = pnlPct / t.leverage // Approximate R
+      
+      // Save to DB immediately
+      fetch("/api/history/paper", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(closed),
+      }).catch(() => {})
+      reportTradeForLearning(closed)
+
+      return {
+        ...prev,
+        open: prev.open.filter((x) => x.id !== id),
+        history: [closed, ...prev.history],
+      }
+    })
+  }, [])
+
+  const closeAllTrades = useCallback(() => {
+    setState((prev) => {
+      const closedTrades = prev.open.map((t) => {
+        const mark = candidatesRef.current.find((c) => c.row.symbol === t.symbol)?.row.lastPrice || t.entry
+        const closed = { ...t, exitPrice: mark, outcome: "MANUAL" as const, closedAt: Date.now() }
+        const pnlPct = ((mark - t.entry) / t.entry) * (t.side === "LONG" ? 1 : -1) * t.leverage * 100
+        closed.pnlPct = pnlPct
+        closed.pnlR = pnlPct / t.leverage
+        
+        fetch("/api/history/paper", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify(closed),
+        }).catch(() => {})
         reportTradeForLearning(closed)
-        return {
-          ...prev,
-          open: prev.open.filter((t) => t.id !== id),
-          history: [closed, ...prev.history].slice(0, 100),
-        }
+        return closed
       })
-    },
-    [market, state.open],
-  )
+      
+      return {
+        ...prev,
+        open: [],
+        history: [...closedTrades, ...prev.history],
+      }
+    })
+  }, [])
 
   const clearHistory = useCallback(() => {
     setState((prev) => ({ ...prev, history: [] }))
+    // Does not delete from DB, just clears the UI! (Persistent History)
   }, [])
 
   const stats = computeStats(state.history)
@@ -220,6 +357,7 @@ export function useSignalTrades({ market, marketOnline, style, risk, activeCex, 
     toggleAutoTpSl,
     openTrade,
     closeTrade,
+    closeAllTrades,
     clearHistory,
   }
 }

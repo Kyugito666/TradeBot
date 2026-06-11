@@ -16,7 +16,7 @@
 // │  Each sub-signal scores -1..+1. Weighted mean → vote.   │
 // └─────────────────────────────────────────────────────────┘
 
-use super::{Agent, AgentVote, Direction};
+use super::{Agent, AgentVote};
 use crate::shm::MarketSnapshot;
 
 pub struct AbsurdistAgent;
@@ -104,22 +104,17 @@ impl Agent for AbsurdistAgent {
             .map(|(n, s, _)| format!("{n}={s:+.2}"))
             .collect();
 
-        let (dir, conviction) = if weighted_score > 0.15 {
-            (Direction::Buy,  weighted_score.min(1.0))
-        } else if weighted_score < -0.15 {
-            (Direction::Sell, weighted_score.abs().min(1.0))
-        } else {
-            (Direction::Wait, 0.0)
-        };
+        let prob_long = if weighted_score > 0.0 { weighted_score.min(1.0) } else { 0.0 };
+        let prob_short = if weighted_score < 0.0 { weighted_score.abs().min(1.0) } else { 0.0 };
 
-        AgentVote {
-            agent:      "absurdist",
-            direction:  dir,
-            conviction,
-            reasoning:  format!(
+        AgentVote::forced_choice(
+            "absurdist",
+            prob_long,
+            prob_short,
+            &format!(
                 "score={weighted_score:+.3} | active=[{}] | liq={liq_score:+.2} teth={tether_score:+.2} sqz={squeeze_score:+.2} whale={whale_score:+.2} kimchi={kimchi_score:+.2}",
                 active.join(", ")
             ),
-        }
+        )
     }
 }

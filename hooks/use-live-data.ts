@@ -106,6 +106,7 @@ export interface DryRunConfig {
   enabled: boolean
   initialBalance: number
   riskPerTrade: number // As decimal (0.02 = 2%)
+  compounding: boolean
 }
 
 // Options passed when the user runs a backtest from the Backtest tab. They scope
@@ -117,6 +118,8 @@ export interface BacktestRunOptions {
   periodDays?: number
   /** Pair to focus the replay chart on (defaults to the app's selected pair). */
   focusSymbol?: string
+  /** If true, only backtest the focusSymbol instead of the entire market. */
+  singlePairOnly?: boolean
 }
 
 // Re-export so UI components can type their timeframe state without reaching
@@ -127,13 +130,13 @@ export type { Timeframe }
 
 // Supported centralized exchanges.
 export type CexId = "mexc" | "binance" | "bybit" | "bitget" | "gateio" | "okx"
-export type TradingStyle = "scalp" | "intraday" | "swing"
+export type TradingStyle = "scalp" | "intraday" | "swing" | "momentum_burst" | "mean_reversion" | "trend_following"
 export type MarginMode = "isolated" | "cross"
 
 // ---- Flexible (preset-based) risk model ---------------------------------
 // No free-form numeric input: every metric is chosen from a controlled set of
 // safe options, so the user can flex the risk profile without breaking config.
-export type RiskPreset = "conservative" | "balanced" | "aggressive"
+export type RiskPreset = "conservative" | "balanced" | "aggressive" | "custom_detailed" | "custom_auto"
 
 export interface RiskModel {
   /** High-level baseline. Selecting it snaps every metric to a safe combo. */
@@ -150,16 +153,18 @@ export interface RiskModel {
 
 // Controlled option sets — the only values a user can pick from.
 export const RISK_OPTIONS = {
-  atrMultiplier: [1, 1.5, 2, 2.5, 3],
-  riskReward: [1.5, 2, 2.5, 3],
-  targetRoiPct: [5, 10, 20, 50],
-  maxPnlPct: [0.5, 1, 2, 3, 5],
+  atrMultiplier: [1, 1.2, 1.5, 1.8, 2, 2.5, 3, 3.5],
+  riskReward: [1.2, 1.5, 2, 2.5, 3, 4, 5],
+  targetRoiPct: [3, 5, 8, 10, 15, 20, 50, 100],
+  maxPnlPct: [0.1, 0.5, 1, 2, 3, 5, 8, 10],
 } as const
 
 export const RISK_PRESETS: Record<RiskPreset, RiskModel> = {
   conservative: { preset: "conservative", atrMultiplier: 2.5, riskReward: 3, targetRoiPct: 5, maxPnlPct: 0.5 },
   balanced: { preset: "balanced", atrMultiplier: 2, riskReward: 2, targetRoiPct: 10, maxPnlPct: 1 },
   aggressive: { preset: "aggressive", atrMultiplier: 1.5, riskReward: 1.5, targetRoiPct: 20, maxPnlPct: 3 },
+  custom_detailed: { preset: "custom_detailed", atrMultiplier: 2, riskReward: 2, targetRoiPct: 10, maxPnlPct: 1 },
+  custom_auto: { preset: "custom_auto", atrMultiplier: 1.8, riskReward: 2.5, targetRoiPct: 15, maxPnlPct: 2 },
 }
 
 export interface PairLeverage {
@@ -189,11 +194,13 @@ export interface TradingSettings {
   tradingStyle: TradingStyle
   riskModel: RiskModel
   cexes: CexConfig[]
+  selectedSymbol: string
 }
 
 const DEFAULT_TRADING_SETTINGS: TradingSettings = {
   activeCex: "mexc",
   tradingStyle: "intraday",
+  selectedSymbol: "BTCUSDT",
   riskModel: RISK_PRESETS.balanced,
   cexes: [
     {
@@ -275,20 +282,16 @@ const EMPTY_RISK = buildRisk(null, [], EMPTY_PERF)
 
 async function marketFetcher(cex: string): Promise<MarketResponse> {
   const res = await fetch(`/api/market?cex=${encodeURIComponent(cex)}`, { cache: "no-store" })
-  if (!res.ok) return { ok: false, ts: Date.now(), market: [], consensus: null }
+  if (!res.ok) throw new Error(`Market fetch failed: ${res.status}`)
   return (await res.json()) as MarketResponse
 }
 
 async function agentAnalysisFetcher(symbol: string, cex: string): Promise<AgentAnalysisResponse | null> {
-  try {
-    const res = await fetch(`/api/agents/analyze?symbol=${encodeURIComponent(symbol)}&cex=${encodeURIComponent(cex)}`, {
-      cache: "no-store",
-    })
-    if (!res.ok) return null
-    return (await res.json()) as AgentAnalysisResponse
-  } catch {
-    return null
-  }
+  const res = await fetch(`/api/agents/analyze?symbol=${encodeURIComponent(symbol)}&cex=${encodeURIComponent(cex)}`, {
+    cache: "no-store",
+  })
+  if (!res.ok) throw new Error(`Agent fetch failed: ${res.status}`)
+  return (await res.json()) as AgentAnalysisResponse
 }
 
 // A live forecast the agents are watching. When price crosses TP or SL we grade it
@@ -325,9 +328,10 @@ async function postTradeResult(body: {
 export function useLiveData() {
   // Dry-run mode state
   const [dryRunConfig, setDryRunConfig] = useState<DryRunConfig>({
-    enabled: true, // Default to dry-run for safety
-    initialBalance: 10000,
-    riskPerTrade: 0.02
+    enabled: true,
+    initialBalance: 10,
+    riskPerTrade: 0.02,
+    compounding: true,
   })
   
   // Track analysis state
@@ -341,7 +345,18 @@ export function useLiveData() {
   const resolvingRef = useRef(false)
 
   // Mode & exchange configuration (mode/settings tab)
-  const [tradingSettings, setTradingSettings] = useState<TradingSettings>(DEFAULT_TRADING_SETTINGS)
+  const [realSettings, setRealSettings] = useState<TradingSettings>(DEFAULT_TRADING_SETTINGS)
+  const [drySettings, setDrySettings] = useState<TradingSettings>(DEFAULT_TRADING_SETTINGS)
+
+  const tradingSettings = dryRunConfig.enabled ? drySettings : realSettings
+
+  const setTradingSettings = useCallback((patch: TradingSettings | ((prev: TradingSettings) => TradingSettings)) => {
+    if (dryRunConfig.enabled) {
+      setDrySettings(patch as any)
+    } else {
+      setRealSettings(patch as any)
+    }
+  }, [dryRunConfig.enabled])
 
   // Per-user (per-browser) local persistence + manual backtest results.
   const [hydrated, setHydrated] = useState(false)
@@ -351,61 +366,133 @@ export function useLiveData() {
   // Signals and Consensus tabs so all three views analyse the same data.
   const [pairStats, setPairStats] = useState<Record<string, PairStat>>({})
 
-  // Load persisted state AFTER mount so server/client first render match
-  // (avoids hydration mismatches). Defaults render first, then we swap in
-  // whatever this browser previously saved.
+  // Load persisted state from Backend DB AFTER mount
   useEffect(() => {
-    const savedSettings = localStore.loadTradingSettings()
-    if (savedSettings) {
-      // Merge in any default CEXes the saved config predates (keeps the user's
-      // per-exchange tweaks while still exposing newly-added exchanges).
-      const savedById = new Map(savedSettings.cexes.map((c) => [c.id, c]))
-      const mergedCexes = DEFAULT_TRADING_SETTINGS.cexes.map((def) => ({
-        ...def,
-        ...savedById.get(def.id),
-      }))
-      // Preserve any saved CEX that is no longer in defaults, just in case.
-      for (const c of savedSettings.cexes) {
-        if (!mergedCexes.some((m) => m.id === c.id)) mergedCexes.push(c)
-      }
-      // Backfill the flexible risk model for configs saved before it existed.
-      setTradingSettings({
-        ...savedSettings,
-        cexes: mergedCexes,
-        riskModel: savedSettings.riskModel ?? RISK_PRESETS.balanced,
+    fetch("http://127.0.0.1:8765/api/ui-settings")
+      .then((res) => res.json())
+      .then((data) => {
+        if (data.realSettings) {
+          setRealSettings(data.realSettings)
+        }
+        if (data.drySettings) {
+          setDrySettings(data.drySettings)
+        } else if (data.tradingSettings) {
+          // Fallback legacy migration
+          const savedSettings = data.tradingSettings
+          const savedById = new Map(savedSettings.cexes.map((c: any) => [c.id, c]))
+          const mergedCexes = DEFAULT_TRADING_SETTINGS.cexes.map((def) => ({
+            ...def,
+            ...savedById.get(def.id),
+          }))
+          for (const c of savedSettings.cexes) {
+            if (c.id === "all") continue
+            if (!mergedCexes.some((m) => m.id === c.id)) mergedCexes.push(c)
+          }
+          const legacy = {
+            ...savedSettings,
+            cexes: mergedCexes,
+            riskModel: savedSettings.riskModel ?? RISK_PRESETS.balanced,
+          }
+          setRealSettings(legacy)
+          setDrySettings(legacy)
+        } else {
+          // Fallback to localStore migration
+          const legacy = localStore.loadTradingSettings()
+          if (legacy) {
+            setRealSettings(legacy)
+            setDrySettings(legacy)
+          }
+        }
+        
+        if (data.dryRunConfig) {
+          setDryRunConfig(data.dryRunConfig)
+        } else {
+          const legacy = localStore.loadDryRun()
+          if (legacy) setDryRunConfig(legacy)
+        }
+        
+        const savedBacktests = localStore.loadBacktests()
+        setBacktests(savedBacktests)
+        if (savedBacktests[0]?.pairStats) {
+          setPairStats(Object.fromEntries(savedBacktests[0].pairStats.map((p) => [p.symbol, p])))
+        }
+        setHydrated(true)
       })
-    }
-    const savedDryRun = localStore.loadDryRun()
-    if (savedDryRun) setDryRunConfig(savedDryRun)
-    const savedBacktests = localStore.loadBacktests()
-    setBacktests(savedBacktests)
-    if (savedBacktests[0]?.pairStats) {
-      setPairStats(Object.fromEntries(savedBacktests[0].pairStats.map((p) => [p.symbol, p])))
-    }
-    setHydrated(true)
+      .catch((e) => {
+        // Fallback to localStore on error
+        const legacy = localStore.loadTradingSettings()
+        if (legacy) {
+          setRealSettings(legacy)
+          setDrySettings(legacy)
+        }
+        const legacyDry = localStore.loadDryRun()
+        if (legacyDry) setDryRunConfig(legacyDry)
+        setHydrated(true)
+      })
   }, [])
 
-  // Persist settings + mode whenever they change (only after initial hydration).
+  // Persist settings + mode to Backend DB whenever they change (only after initial hydration).
   useEffect(() => {
-    if (hydrated) localStore.saveTradingSettings(tradingSettings)
-  }, [hydrated, tradingSettings])
+    if (hydrated) {
+      fetch("http://127.0.0.1:8765/api/ui-settings", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ realSettings, drySettings, dryRunConfig }),
+      }).catch(() => {})
+    }
+  }, [hydrated, realSettings, drySettings, dryRunConfig])
 
+  // Style Agent Loop - Polls background style agent DB
+  const [styleAgentData, setStyleAgentData] = useState<Record<string, any>>({})
   useEffect(() => {
-    if (hydrated) localStore.saveDryRun(dryRunConfig)
-  }, [hydrated, dryRunConfig])
+    if (!hydrated) return
+    const interval = setInterval(() => {
+      fetch("http://127.0.0.1:8765/api/style-agents")
+        .then((res) => res.json())
+        .then((data) => {
+          setStyleAgentData(data)
+          
+          // Apply Auto-Adjustments if custom_auto risk is enabled OR if the style is adaptive
+          const styleName = tradingSettings.tradingStyle
+          const agent = data[styleName]
+          if (agent && tradingSettings.riskModel.preset === "custom_auto") {
+            setTradingSettings(prev => {
+              const newRisk = { ...prev.riskModel }
+              // Dynamically adjust risk based on agent's optimal finding
+              newRisk.maxPnlPct = agent.optimalRisk || newRisk.maxPnlPct
+              
+              const newCexes = [...prev.cexes]
+              const activeIdx = newCexes.findIndex(c => c.id === prev.activeCex)
+              if (activeIdx > -1) {
+                // Apply agent's leverage findings
+                newCexes[activeIdx].defaultLeverage = agent.optimalLeverage?.["BTCUSDT"] || newCexes[activeIdx].defaultLeverage
+              }
+              
+              // Only trigger state update if there's an actual change to prevent infinite loops
+              if (newRisk.maxPnlPct !== prev.riskModel.maxPnlPct || newCexes[activeIdx]?.defaultLeverage !== prev.cexes[activeIdx]?.defaultLeverage) {
+                return { ...prev, riskModel: newRisk, cexes: newCexes }
+              }
+              return prev
+            })
+          }
+        })
+        .catch(() => {})
+    }, 5000)
+    return () => clearInterval(interval)
+  }, [hydrated, tradingSettings.tradingStyle, tradingSettings.riskModel.preset])
   
   // Real public market data + server-computed analytics (works on localhost + Vercel).
   // Keyed on the ACTIVE exchange so switching CEX in Settings re-pulls that
   // exchange's real, dynamic pair universe.
   const activeCexId = tradingSettings.activeCex
   const market = useSWR(["market", activeCexId], () => marketFetcher(activeCexId), {
-    refreshInterval: 30000,
+    refreshInterval: 3000,
     keepPreviousData: true,
   })
 
   // Real engine state via the local/remote Go gateway (live trading account).
   const engine = useSWR<EngineSnapshot>("engine", pollEngine, {
-    refreshInterval: 3000,
+    refreshInterval: 5000,
     keepPreviousData: true,
   })
   
@@ -425,7 +512,7 @@ export function useLiveData() {
     [`agent-analysis`, analysisSymbol, activeCexId],
     () => agentAnalysisFetcher(analysisSymbol, activeCexId),
     {
-      refreshInterval: 30000, // Refresh every 30s
+      refreshInterval: 5000, // Refresh every 5s for real-time feel
       keepPreviousData: true,
       onSuccess: () => setIsAnalyzing(false),
       onError: () => setIsAnalyzing(false),
@@ -483,6 +570,7 @@ export function useLiveData() {
       latencyMs: 0,
       marketOnline,
       market: marketRows,
+      styleAgentData,
       consensus,
       positions,
       risk,
@@ -553,11 +641,30 @@ export function useLiveData() {
 
   const start = useCallback(async () => {
     try {
-      await startEngine()
+      // Compile UI settings into environment-compatible map for the Go Engine
+      const engineCfg: Record<string, string> = {
+        DRY_RUN: dryRunConfig.enabled ? "true" : "false",
+        TRADING_STYLE: tradingSettings.tradingStyle,
+        RISK_PCT: (tradingSettings.riskModel.maxPnlPct / 100).toString(),
+        LEVERAGE: tradingSettings.cexes.find(c => c.id === tradingSettings.activeCex)?.defaultLeverage.toString() || "10",
+        SYMBOL: tradingSettings.selectedSymbol || "BTCUSDT",
+        COMPOUNDING: dryRunConfig.compounding ? "true" : "false",
+      }
+      
+      // Inject API keys based on active CEX if Real Mode
+      if (!dryRunConfig.enabled) {
+        const activeCex = tradingSettings.cexes.find(c => c.id === tradingSettings.activeCex)
+        if (activeCex && activeCex.id === "bybit") {
+          // If we had a mechanism to fetch API keys from memory, we'd add them here.
+          // For now, the backend already has them in .env, so we just enforce execution mode.
+        }
+      }
+
+      await startEngine(engineCfg)
     } finally {
       engine.mutate()
     }
-  }, [engine])
+  }, [engine, dryRunConfig.enabled, tradingSettings])
 
   const stop = useCallback(async () => {
     try {
@@ -650,7 +757,7 @@ export function useLiveData() {
           marginUsagePct: cex?.marginUsagePct,
           defaultLeverage: cex?.defaultLeverage,
           pairLeverage,
-          symbols: snapshot.market.map((m) => m.symbol),
+          symbols: opts?.singlePairOnly && focusSymbol ? [focusSymbol] : snapshot.market.map((m) => m.symbol),
           timeframe: opts?.timeframe ?? "1h",
           periodDays: opts?.periodDays ?? 12,
           focusSymbol,
@@ -660,11 +767,7 @@ export function useLiveData() {
       if (!json?.ok || !json.result) throw new Error(json?.error || "Backtest failed")
       const result = json.result as BacktestResult
 
-      setBacktests((prev) => {
-        const next = [result, ...prev].slice(0, 20) // keep last 20 per user
-        localStore.saveBacktests(next)
-        return next
-      })
+      // We no longer auto-save to history here. It's triggered by the UI when replay finishes.
       setPairStats(Object.fromEntries((result.pairStats ?? []).map((p) => [p.symbol, p])))
       return result
     } finally {
@@ -674,7 +777,22 @@ export function useLiveData() {
 
   const clearBacktests = useCallback(() => {
     setBacktests([])
+    // NOTE: Only clears UI display, NOT the database.
+    // Backtest history is persisted in Rust Brain (backtest_records.bin)
+    // and will be retained for analysis and agent training.
+    // localStorage cache is also cleared so UI starts fresh,
+    // but DB is untouched.
     localStore.clearBacktests()
+  }, [])
+
+  const saveBacktestResult = useCallback((result: BacktestResult) => {
+    setBacktests((prev) => {
+      // Prevent saving the exact same run twice if the user replays it
+      if (prev.some(b => b.timestamp === result.timestamp && b.trades === result.trades)) return prev;
+      const next = [result, ...prev].slice(0, 20)
+      localStore.saveBacktests(next)
+      return next
+    })
   }, [])
 
   return {
@@ -685,36 +803,34 @@ export function useLiveData() {
     loadingMarket: market.isLoading,
     loadingEngine: engine.isLoading,
     
-    // Agent analysis
-    agentAnalysis: agentAnalysis.data,
-    isAnalyzing: isAnalyzing || agentAnalysis.isLoading,
-    analysisSymbol,
-    runAnalysis,
-
-    // Autonomous TP/SL learning loop
-    pendingForecast,
-    lastGrade,
-    
-    // Dry-run mode
+    // Trading Context
+    tradingSettings,
+    updateTradingSettings,
+    updateRiskModel,
+    applyRiskPreset,
+    updateCexConfig,
     dryRunConfig,
     toggleDryRun,
     updateDryRunConfig,
 
-    // Mode & exchange settings
-    tradingSettings,
-    updateTradingSettings,
-    updateCexConfig,
-    updateRiskModel,
-    applyRiskPreset,
+    // Analysis
+    analysisSymbol,
+    runAnalysis,
+    isAnalyzing,
+    agentAnalysis: agentAnalysis.data,
+    
+    // History & Evaluation
+    lastGrade,
+    pendingForecast,
 
-    // Local-first persistence + manual backtest
     hydrated,
+
+    // Backtesting
     backtests,
     isBacktesting,
     runBacktest,
     clearBacktests,
-    // Per-pair backtest stats — shared with the Signals & Consensus tabs so all
-    // three views analyse the exact same pairs/data of the active exchange.
+    saveBacktestResult,
     pairStats,
   }
 }

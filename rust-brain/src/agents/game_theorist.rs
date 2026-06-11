@@ -17,7 +17,7 @@ impl Agent for GameTheorist {
         
         let total_depth = bid_depth + ask_depth;
         if total_depth < 1e-9 {
-            return AgentVote::wait(self.name(), "Zero order book depth");
+            return AgentVote::forced_choice(self.name(), 0.1, 0.1, "Zero order book depth");
         }
         
         // Order Book Imbalance (OBI) = (bid_depth - ask_depth) / (bid_depth + ask_depth)
@@ -36,13 +36,13 @@ impl Agent for GameTheorist {
         } else if bias < -0.15 {
             Direction::Sell
         } else {
-            Direction::Wait
+            Direction::Veto
         };
         
         let reason = format!("OBI: {:.3} (Bid: {:.1}, Ask: {:.1})", obi, bid_depth, ask_depth);
         
-        if direction == Direction::Wait {
-            AgentVote::wait(self.name(), &reason)
+        if direction == Direction::Veto {
+            AgentVote::forced_choice(self.name(), 0.1, 0.1, &reason)
         } else {
             AgentVote {
                 agent: self.name(),

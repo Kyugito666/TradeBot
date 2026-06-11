@@ -13,6 +13,7 @@ pub mod data_scientist;
 pub mod statistician;
 pub mod psychologist;
 pub mod astrophysicist;
+pub mod treasury_manager;
 
 use crate::shm::MarketSnapshot;
 
@@ -28,8 +29,13 @@ pub struct AgentVote {
 }
 
 impl AgentVote {
-    pub fn wait(agent: &'static str, reason: &str) -> Self {
-        Self { agent, direction: Direction::Wait, conviction: 0.0, reasoning: reason.into() }
+    pub fn forced_choice(agent: &'static str, prob_long: f64, prob_short: f64, base_reason: &str) -> Self {
+        let (direction, conviction, reason) = if prob_long >= prob_short {
+            (Direction::Buy, prob_long, format!("{} (Forced Long: {:.1}%)", base_reason, prob_long * 100.0))
+        } else {
+            (Direction::Sell, prob_short, format!("{} (Forced Short: {:.1}%)", base_reason, prob_short * 100.0))
+        };
+        Self { agent, direction, conviction, reasoning: reason }
     }
 }
 

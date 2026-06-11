@@ -14,38 +14,21 @@ import type { AgentsResponse, EvolutionState } from "@/lib/types"
 export const dynamic = "force-dynamic"
 export const revalidate = 0
 
-function candidatePaths(): string[] {
-  const override = process.env.AGENT_EVOLUTION_FILE
-  const root = process.cwd()
-  const paths = [
-    override,
-    path.join(root, "agent_evolution.json"),
-    path.join(root, "..", "agent_evolution.json"),
-  ].filter(Boolean) as string[]
-  return paths
-}
-
 export async function GET() {
   const ts = Date.now()
-  let lastErr = "agent_evolution.json not found"
-
-  for (const p of candidatePaths()) {
-    try {
-      const raw = await readFile(p, "utf8")
-      const state = JSON.parse(raw) as EvolutionState
-      const body: AgentsResponse = { ok: true, ts, state }
-      return NextResponse.json(body)
-    } catch (err) {
-      lastErr = err instanceof Error ? err.message : String(err)
+  try {
+    const res = await fetch("http://127.0.0.1:8080/api/state", { cache: "no-store" })
+    if (!res.ok) throw new Error(`HTTP error! status: ${res.status}`)
+    const state = await res.json() as EvolutionState
+    const body: AgentsResponse = { ok: true, ts, state }
+    return NextResponse.json(body)
+  } catch (err) {
+    const body: AgentsResponse = {
+      ok: false,
+      ts,
+      state: null,
+      error: err instanceof Error ? err.message : String(err),
     }
+    return NextResponse.json(body)
   }
-
-  const body: AgentsResponse = {
-    ok: false,
-    ts,
-    state: null,
-    error: lastErr,
-  }
-  // 200 so the dashboard can render an informative empty state without throwing.
-  return NextResponse.json(body)
 }

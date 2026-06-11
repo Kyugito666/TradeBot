@@ -14,6 +14,8 @@ import type {
   AgentOutput,
 } from "./types"
 import { agentRegistry } from "./registry"
+import fs from "fs"
+import path from "path"
 
 const RECENT_WINDOW = 20 // Track last 20 trades for recent accuracy
 const MIN_WEIGHT = 0.1
@@ -25,7 +27,46 @@ const CONVICTION_ADJUST_RATE = 0.02
 // STATE MANAGEMENT
 // ═══════════════════════════════════════════════════════════════════════════════
 
-let evolutionState: EvolutionState = createInitialState()
+// ═══════════════════════════════════════════════════════════════════════════════
+
+function toCamelCase(obj: any): any {
+  if (Array.isArray(obj)) {
+    return obj.map(v => toCamelCase(v))
+  } else if (obj !== null && obj.constructor === Object) {
+    return Object.keys(obj).reduce((result, key) => {
+      const camelKey = key.replace(/([-_][a-z])/g, group => group.toUpperCase().replace('-', '').replace('_', ''))
+      result[camelKey] = toCamelCase(obj[key])
+      return result
+    }, {} as any)
+  }
+  return obj
+}
+
+export function getEvolutionState(): EvolutionState {
+  try {
+    const dbPath = process.env.BOT_DB_PATH || process.cwd()
+    const p1 = path.join(dbPath, "agent_evolution.json")
+    const p2 = path.join(process.cwd(), "agent_evolution.json")
+    let target = ""
+    if (fs.existsSync(p1)) target = p1
+    else if (fs.existsSync(p2)) target = p2
+    
+    if (target) {
+      const raw = JSON.parse(fs.readFileSync(target, "utf-8"))
+      const camel = toCamelCase(raw)
+      return {
+        version: camel.version || 1,
+        updatedMs: camel.updatedMs || Date.now(),
+        agents: camel.agents || {},
+        team: camel.team || createInitialState().team,
+        reports: camel.reports || []
+      }
+    }
+  } catch (err) {
+    console.error("Failed to load agent_evolution.json", err)
+  }
+  return createInitialState()
+}
 
 function createInitialState(): EvolutionState {
   return {
@@ -70,14 +111,6 @@ function createInitialAgentState(agentId: string): AgentState {
   }
 }
 
-export function getEvolutionState(): EvolutionState {
-  return evolutionState
-}
-
-export function setEvolutionState(state: EvolutionState): void {
-  evolutionState = state
-}
-
 // ═══════════════════════════════════════════════════════════════════════════════
 // TRADE RESULT PROCESSING
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -91,238 +124,9 @@ export interface TradeResult {
 }
 
 export function processTradeResult(result: TradeResult): SelfEvaluationReport[] {
-  const { direction, pnlR, isWin, agentVotes } = result
-  const reports: SelfEvaluationReport[] = []
-  const trigger: AnalysisTrigger = isWin ? "trade_win" : "trade_loss"
-  
-  // Update team scorecard
-  evolutionState.team.trades++
-  evolutionState.team.netPnlR += pnlR
-  evolutionState.team.recentResults.push(isWin)
-  if (evolutionState.team.recentResults.length > RECENT_WINDOW) {
-    evolutionState.team.recentResults.shift()
-  }
-  
-  if (isWin) {
-    evolutionState.team.wins++
-    evolutionState.team.winStreak++
-    evolutionState.team.lossStreak = 0
-    evolutionState.team.peakR = Math.max(evolutionState.team.peakR, evolutionState.team.netPnlR)
-  } else {
-    evolutionState.team.losses++
-    evolutionState.team.lossStreak++
-    evolutionState.team.winStreak = 0
-    evolutionState.team.drawdownR = Math.max(
-      evolutionState.team.drawdownR,
-      evolutionState.team.peakR - evolutionState.team.netPnlR
-    )
-  }
-  
-  // Process each agent's vote
-  for (const vote of agentVotes) {
-    const report = evaluateAgent(vote, direction, isWin, pnlR, trigger)
-    if (report) {
-      reports.push(report)
-      evolutionState.reports.push(report)
-    }
-  }
-  
-  // Trim old reports (keep last 100)
-  if (evolutionState.reports.length > 100) {
-    evolutionState.reports = evolutionState.reports.slice(-100)
-  }
-  
-  evolutionState.updatedMs = Date.now()
-  evolutionState.version++
-  
-  // Check for team-level evaluation
-  if (evolutionState.team.lossStreak >= 3) {
-    triggerTeamEvaluation("team_drawdown")
-  }
-  
-  return reports
+  // We no longer update the in-memory state here, because the Rust backend
+  // handles the actual self-evaluation and writes to agent_evolution.json.
+  // This just returns empty to satisfy the API.
+  return []
 }
 
-function evaluateAgent(
-  vote: AgentOutput,
-  tradeDirection: "LONG" | "SHORT",
-  isWin: boolean,
-  pnlR: number,
-  trigger: AnalysisTrigger
-): SelfEvaluationReport | null {
-  const agentId = vote.agentId
-  
-  // Initialize agent state if needed
-  if (!evolutionState.agents[agentId]) {
-    evolutionState.agents[agentId] = createInitialAgentState(agentId)
-  }
-  
-  const agentState = evolutionState.agents[agentId]
-  const { tunables, scorecard } = agentState
-  
-  // Determine if agent was correct
-  // Agent is correct if:
-  // - Vote matched direction and trade won
-  // - Vote was opposite and trade lost (correctly avoided)
-  // - Vote was WAIT and we should have waited (loss)
-  const votedDirection = vote.vote === "LONG" || vote.vote === "SHORT"
-  const votedCorrectly = 
-    (vote.vote === tradeDirection && isWin) ||
-    (vote.vote === "VETO" && !isWin) ||
-    (vote.vote === "WAIT" && !isWin) ||
-    (votedDirection && vote.vote !== tradeDirection && !isWin)
-  
-  const wasCorrect = votedCorrectly
-  
-  // Update scorecard
-  scorecard.trades++
-  if (wasCorrect) {
-    scorecard.correct++
-    scorecard.wrongStreak = 0
-  } else {
-    scorecard.incorrect++
-    scorecard.wrongStreak++
-  }
-  
-  scorecard.recentResults.push(wasCorrect)
-  if (scorecard.recentResults.length > RECENT_WINDOW) {
-    scorecard.recentResults.shift()
-  }
-  
-  scorecard.accuracy = scorecard.trades > 0 
-    ? scorecard.correct / scorecard.trades 
-    : 0
-  scorecard.recentAccuracy = scorecard.recentResults.length > 0
-    ? scorecard.recentResults.filter(Boolean).length / scorecard.recentResults.length
-    : 0
-  
-  // Attribute P&L contribution
-  if (votedDirection && vote.vote === tradeDirection) {
-    scorecard.pnlContrib += pnlR * vote.confidence
-  }
-  
-  // Store tunables before adjustment
-  const tunablesBefore: AgentTunables = { ...tunables, params: { ...tunables.params } }
-  
-  // Adjust tunables based on performance
-  const adjustments: string[] = []
-  
-  if (wasCorrect) {
-    // Reward correct prediction
-    if (tunables.weight < MAX_WEIGHT) {
-      tunables.weight = Math.min(MAX_WEIGHT, tunables.weight + WEIGHT_ADJUST_RATE)
-      adjustments.push(`Weight +${(WEIGHT_ADJUST_RATE * 100).toFixed(1)}%`)
-    }
-    if (vote.confidence > 0.7) {
-      tunables.convictionScale = Math.min(1.5, tunables.convictionScale + CONVICTION_ADJUST_RATE)
-      adjustments.push(`Conviction scale +${(CONVICTION_ADJUST_RATE * 100).toFixed(1)}%`)
-    }
-  } else {
-    // Penalize wrong prediction
-    if (tunables.weight > MIN_WEIGHT) {
-      const penalty = WEIGHT_ADJUST_RATE * (scorecard.wrongStreak >= 3 ? 2 : 1)
-      tunables.weight = Math.max(MIN_WEIGHT, tunables.weight - penalty)
-      adjustments.push(`Weight -${(penalty * 100).toFixed(1)}%`)
-    }
-    
-    // Reduce conviction if overconfident and wrong
-    if (vote.confidence > 0.6) {
-      tunables.convictionScale = Math.max(0.5, tunables.convictionScale - CONVICTION_ADJUST_RATE * 2)
-      adjustments.push(`Conviction scale -${(CONVICTION_ADJUST_RATE * 2 * 100).toFixed(1)}% (overconfident)`)
-    }
-    
-    // Raise activation gate if too trigger-happy
-    if (scorecard.wrongStreak >= 3) {
-      tunables.activationGate = Math.min(0.5, tunables.activationGate + 0.05)
-      adjustments.push(`Activation gate raised to ${tunables.activationGate.toFixed(2)}`)
-    }
-  }
-  
-  // Build verdict
-  let verdict = wasCorrect ? "CORRECT" : "INCORRECT"
-  if (scorecard.wrongStreak >= 3) {
-    verdict += " - ON WATCH (3+ wrong streak)"
-  }
-  if (scorecard.recentAccuracy < 0.4 && scorecard.recentResults.length >= 10) {
-    verdict += " - UNDERPERFORMING"
-  }
-  
-  const report: SelfEvaluationReport = {
-    agentId,
-    timestamp: Date.now(),
-    trigger,
-    tradeDirection,
-    agentVote: vote.vote,
-    wasCorrect,
-    verdict,
-    adjustments,
-    tunablesBefore,
-    tunablesAfter: { ...tunables, params: { ...tunables.params } },
-    scorecard: { ...scorecard, recentResults: [...scorecard.recentResults] }
-  }
-  
-  agentState.lastReport = report
-  
-  return report
-}
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// TEAM-LEVEL EVALUATION
-// ═══════════════════════════════════════════════════════════════════════════════
-
-export function triggerTeamEvaluation(trigger: AnalysisTrigger): void {
-  console.log(`[Evolution] Team evaluation triggered: ${trigger}`)
-  
-  const team = evolutionState.team
-  const agents = evolutionState.agents
-  
-  // Find underperforming agents
-  for (const [agentId, state] of Object.entries(agents)) {
-    const { scorecard, tunables } = state
-    
-    // Severely penalize consistently wrong agents
-    if (scorecard.recentAccuracy < 0.35 && scorecard.recentResults.length >= 10) {
-      tunables.weight = Math.max(MIN_WEIGHT, tunables.weight * 0.8)
-      tunables.activationGate = Math.min(0.6, tunables.activationGate + 0.1)
-      console.log(`[Evolution] Agent ${agentId} severely penalized: weight=${tunables.weight.toFixed(2)}, gate=${tunables.activationGate.toFixed(2)}`)
-    }
-    
-    // Boost well-performing agents during drawdown
-    if (scorecard.recentAccuracy > 0.65 && scorecard.recentResults.length >= 10) {
-      tunables.weight = Math.min(MAX_WEIGHT, tunables.weight * 1.1)
-      console.log(`[Evolution] Agent ${agentId} boosted during drawdown: weight=${tunables.weight.toFixed(2)}`)
-    }
-  }
-  
-  // Increase team conservatism after losses
-  if (trigger === "team_drawdown") {
-    team.conservatismBias = Math.min(0.5, team.conservatismBias + 0.1)
-    console.log(`[Evolution] Team conservatism increased to ${team.conservatismBias.toFixed(2)}`)
-  }
-  
-  evolutionState.updatedMs = Date.now()
-  evolutionState.version++
-}
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// STATE PERSISTENCE
-// ═══════════════════════════════════════════════════════════════════════════════
-
-export function serializeState(): string {
-  return JSON.stringify(evolutionState, null, 2)
-}
-
-export function loadState(json: string): void {
-  try {
-    const parsed = JSON.parse(json) as EvolutionState
-    evolutionState = parsed
-    console.log(`[Evolution] State loaded: v${parsed.version}, ${Object.keys(parsed.agents).length} agents`)
-  } catch (err) {
-    console.error("[Evolution] Failed to load state:", err)
-  }
-}
-
-export function resetState(): void {
-  evolutionState = createInitialState()
-  console.log("[Evolution] State reset to initial")
-}

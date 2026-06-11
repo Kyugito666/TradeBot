@@ -14,7 +14,7 @@
 // stays a pure function usable anywhere.
 // ────────────────────────────────────────────────────────────────────────────
 
-import { atr, computeSignal } from "./signals"
+import { computeSignal } from "./signals"
 import type { TrendState } from "./types"
 import type { Timeframe } from "./exchanges"
 
@@ -139,6 +139,21 @@ function trendFromWindow(closes: number[]): TrendState {
   return "NEUTRAL"
 }
 
+function atr(highs: number[], lows: number[], closes: number[], period: number = 14): number {
+  if (closes.length < 2) return (highs[highs.length - 1] || 0) * 0.012;
+  let sum = 0;
+  const start = Math.max(1, closes.length - period);
+  let count = 0;
+  for (let i = start; i < closes.length; i++) {
+    const tr1 = highs[i] - lows[i];
+    const tr2 = Math.abs(highs[i] - closes[i - 1]);
+    const tr3 = Math.abs(lows[i] - closes[i - 1]);
+    sum += Math.max(tr1, tr2, tr3);
+    count++;
+  }
+  return count > 0 ? sum / count : (highs[highs.length - 1] || 0) * 0.012;
+}
+
 interface ClosedTrade extends BacktestTrade {
   pnlR: number
   entryBar: number
@@ -230,13 +245,53 @@ export interface ReplayConfig {
   focusSymbol?: string
 }
 
-export function replayBacktest(pairs: PairCandles[], cfg: ReplayConfig): BacktestResult {
+export async function replayBacktest(pairs: PairCandles[], cfg: ReplayConfig): Promise<BacktestResult> {
   const perPair = new Map<string, ClosedTrade[]>()
   const all: ClosedTrade[] = []
   let scannedPairs = 0
 
-  for (const pair of pairs) {
-    const trades = replayPair(pair, cfg.style, cfg.risk)
+  // 1. Coba tanya Rust Brain API secara massal
+  let rustTrades: ClosedTrade[][] = []
+  try {
+      const reqBody = pairs.map(p => ({
+          symbol: p.symbol,
+          leverage: p.leverage,
+          candles: p.closes.map((c, i) => ({
+              open: p.opens?.[i] || c,
+              high: p.highs?.[i] || c,
+              low: p.lows?.[i] || c,
+              close: c,
+              vol: p.volumes?.[i] || 0,
+              ts_ms: Date.now() - (p.closes.length - i) * cfg.intervalMs
+          }))
+      }));
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 10000);
+      const res = await fetch("http://127.0.0.1:8080/api/backtest", {
+          method: "POST",
+          body: JSON.stringify(reqBody),
+          headers: { "Content-Type": "application/json" },
+          signal: controller.signal
+      });
+      clearTimeout(timeoutId);
+      if (res.ok) {
+          rustTrades = await res.json();
+      }
+  } catch (e) {
+      // fallback
+  }
+
+  for (let idx = 0; idx < pairs.length; idx++) {
+    const pair = pairs[idx]
+    let trades: ClosedTrade[] = []
+    
+    if (rustTrades && rustTrades[idx] && rustTrades[idx].length > 0) {
+        trades = rustTrades[idx]
+    } else {
+        // Fallback jika API Rust mati, pakai fungsi lawas
+        trades = replayPair(pair, cfg.style, cfg.risk)
+    }
+
     if (pair.closes.length >= WARMUP + 5) scannedPairs++
     perPair.set(pair.symbol, trades)
     all.push(...trades)

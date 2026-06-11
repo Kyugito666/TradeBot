@@ -1,34 +1,21 @@
 import { NextResponse } from "next/server"
-import { getExchange, mapWithBudget, TIMEFRAME_MS, type Timeframe } from "@/lib/exchanges"
+import { getExchange, mapWithBudget, TIMEFRAME_MS, type Timeframe, type Candles } from "@/lib/exchanges"
 import { replayBacktest, type BacktestRiskModel, type PairCandles, type TradingStyle } from "@/lib/backtest"
+import fs from "fs"
+import path from "path"
+import { execSync } from "child_process"
 
-// POST /api/backtest — run a REAL backtest over historical candles of the active
-// exchange's pairs, using the same signal + TP/SL strategy as Signals/Consensus.
-//
-// Body: {
-//   cex, cexLabel, style, risk, dryRun, initialBalance, riskPerTrade,
-//   marginMode, marginUsagePct, defaultLeverage,
-//   pairLeverage: { pair: leverage }, symbols?: string[]
-// }
 export const dynamic = "force-dynamic"
 export const revalidate = 0
 export const maxDuration = 60
 
-// Hard cap on candles requested per pair so a manual backtest stays responsive
-// regardless of the chosen period/timeframe. Most venues cap their kline feed
-// near this anyway.
-// Most venues cap their kline feed near 1500 candles per request; we request up
-// to that so longer (multi-year) lookback windows pull as much real history as
-// the exchange will give. Daily candles reach furthest back at this cap.
-const MAX_CANDLES = 1500
+const MAX_CANDLES = 500_000
 const MIN_CANDLES = 60
-const SCAN_CONCURRENCY = 12
+const SCAN_CONCURRENCY = 8
 const SCAN_BUDGET_MS = 45_000
-// Cap the universe so a manual backtest stays responsive; the most liquid pairs
-// (which is what the live tabs surface first) are always covered.
-const MAX_PAIRS = 120
+const MAX_PAIRS = 9999
 
-const VALID_TIMEFRAMES: Timeframe[] = ["15m", "1h", "4h", "1d"]
+const VALID_TIMEFRAMES: Timeframe[] = ["5m", "15m", "30m", "1h", "4h", "1d", "1w"]
 
 interface Body {
   cex?: string
@@ -43,11 +30,8 @@ interface Body {
   defaultLeverage?: number
   pairLeverage?: Record<string, number>
   symbols?: string[]
-  /** Candle timeframe selected in the app (15m / 1h / 4h / 1d). */
   timeframe?: Timeframe
-  /** Backtest lookback window, in days. */
   periodDays?: number
-  /** The pair currently selected/analysed in the app — drives the replay chart. */
   focusSymbol?: string
 }
 
@@ -72,15 +56,16 @@ export async function POST(request: Request) {
   const defaultLeverage = body.defaultLeverage ?? 5
   const pairLeverage = body.pairLeverage ?? {}
 
-  // ── Resolve the candle timeframe + lookback period chosen in the UI. ──────────
-  // The number of candles fetched is derived from (period × bars-per-day), so a
-  // longer period or a finer timeframe pulls more historical data into the run.
   const timeframe: Timeframe = VALID_TIMEFRAMES.includes(body.timeframe as Timeframe)
     ? (body.timeframe as Timeframe)
     : "1h"
-  const periodDays = clampNum(body.periodDays ?? 12, 1, 1095)
+  const wanted = body.symbols && body.symbols.length > 0 ? new Set(body.symbols.map((s) => s.toUpperCase())) : null
+  const isSinglePair = wanted !== null && wanted.size === 1
+  const maxAllowedCandles = MAX_CANDLES
+  
+  const periodDays = clampNum(body.periodDays ?? 12, 1, 10000)
   const barsPerDay = 86_400_000 / TIMEFRAME_MS[timeframe]
-  const candleLimit = Math.max(MIN_CANDLES, Math.min(MAX_CANDLES, Math.ceil(periodDays * barsPerDay)))
+  const candleLimit = Math.max(MIN_CANDLES, Math.min(maxAllowedCandles, Math.ceil(periodDays * barsPerDay)))
   const focusSymbol = body.focusSymbol?.toUpperCase()
 
   const tickers = await ex.fetchTickers()
@@ -88,35 +73,64 @@ export async function POST(request: Request) {
     return NextResponse.json({ ok: false, error: `market feed unavailable for ${cexId}` }, { status: 502 })
   }
 
-  // Use the same dynamic universe as the live tabs. If the client passed the
-  // currently-shown symbols, honour that exact set; otherwise rank by liquidity.
-  const wanted = body.symbols && body.symbols.length > 0 ? new Set(body.symbols.map((s) => s.toUpperCase())) : null
-  let universe = wanted ? tickers.filter((t) => wanted.has(t.symbol.toUpperCase())) : [...tickers]
-  universe.sort((a, b) => b.volUsd - a.volUsd)
-  universe = universe.slice(0, MAX_PAIRS)
+  let universe = wanted ? tickers.filter((t) => wanted.has(t.symbol.toUpperCase()) || wanted.has(t.base.toUpperCase())) : [...tickers]
+  
+  // DYNAMIC PAIR SELECTION (Based on history length, NOT top DB pairs)
+  // We sort by volume but DO NOT slice to 120 here.
+  // mapWithBudget will scan them and we will take the top 120 that actually survive the Adaptive History Filter below.
+  if (!wanted || (!isSinglePair && wanted.size > 1)) {
+    universe.sort((a, b) => b.volUsd - a.volUsd)
+  }
 
-  // Guarantee the focused pair (the one the user is looking at) is part of the
-  // run even if it falls outside the top-liquidity slice, so the replay chart
-  // can always show the real candles of the selected pair.
-  if (focusSymbol && !universe.some((t) => t.symbol.toUpperCase() === focusSymbol)) {
-    const focusTicker = tickers.find((t) => t.symbol.toUpperCase() === focusSymbol)
+  if (focusSymbol && !universe.some((t) => t.symbol.toUpperCase() === focusSymbol || t.base.toUpperCase() === focusSymbol)) {
+    const focusTicker = tickers.find((t) => t.symbol.toUpperCase() === focusSymbol || t.base.toUpperCase() === focusSymbol)
     if (focusTicker) universe = [focusTicker, ...universe]
   }
 
   const levOf = (symbol: string) => pairLeverage[symbol] ?? pairLeverage[symbol.toUpperCase()] ?? defaultLeverage
 
-  const { results } = await mapWithBudget(
+    const { results } = await mapWithBudget(
     universe,
     async (t): Promise<PairCandles | null> => {
-      const c = await ex.fetchCandles(t.native, candleLimit, timeframe)
-      if (!c || c.closes.length < 40) return null
-      return {
-        symbol: t.symbol,
-        leverage: levOf(t.symbol),
-        opens: c.opens,
-        highs: c.highs,
-        lows: c.lows,
-        closes: c.closes,
+      // PHASE 1: Route candle history directly through Python ML Parquet engine
+      try {
+        const resp = await fetch("http://127.0.0.1:5000/api/ml/get_history", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            symbol: t.native,
+            exchange: cexId,
+            timeframe: timeframe,
+            period_days: periodDays
+          })
+        });
+        
+        if (!resp.ok) return null;
+        
+        const data = await resp.json();
+        if (!data.ok || !data.closes || data.closes.length < MIN_CANDLES) return null;
+        
+        // FEATURE: ADAPTIVE PAIR FILTERING
+        // Exclude pairs that don't meet at least 90% of the requested period history
+        // so new coins don't skew long-term backtest results
+        if (!isSinglePair) {
+          const requiredCandles = Math.floor(candleLimit * 0.90)
+          if (data.closes.length < requiredCandles) {
+            return null
+          }
+        }
+        
+        return {
+          symbol: t.symbol,
+          leverage: levOf(t.symbol),
+          opens: data.opens,
+          highs: data.highs,
+          lows: data.lows,
+          closes: data.closes,
+        }
+      } catch (e) {
+        console.error(`Failed to fetch history for ${t.symbol} from Python ML Engine:`, e)
+        return null;
       }
     },
     { concurrency: SCAN_CONCURRENCY, budgetMs: SCAN_BUDGET_MS },
@@ -125,14 +139,17 @@ export async function POST(request: Request) {
   const pairs: PairCandles[] = []
   for (const t of universe) {
     const r = results.get(t)
-    if (r) pairs.push(r)
+    if (r) {
+      pairs.push(r)
+      if (pairs.length >= MAX_PAIRS) break
+    }
   }
 
   if (pairs.length === 0) {
     return NextResponse.json({ ok: false, error: "No candle history available to backtest" }, { status: 502 })
   }
 
-  const result = replayBacktest(pairs, {
+  const result = await replayBacktest(pairs, {
     cex: cexId,
     cexLabel: body.cexLabel || cexId.toUpperCase(),
     style,
@@ -147,6 +164,29 @@ export async function POST(request: Request) {
     intervalMs: TIMEFRAME_MS[timeframe],
     focusSymbol,
   })
+
+  // The Rust backend handles storing the DB, so we send the stats over HTTP
+  try {
+    const payload = {
+      timestamp: result.timestamp || Date.now(),
+      cex: result.cex || "",
+      timeframe: result.timeframe || "",
+      periodDays: result.periodDays || 0,
+      profitFactor: result.profitFactor || 0,
+      netPnlPct: result.netPnlPct || 0,
+      trades: result.trades || 0,
+      winRate: result.winRate || 0,
+      scannedPairs: result.scannedPairs || 0,
+      pairStats: result.pairStats || []
+    }
+    await fetch("http://127.0.0.1:8080/api/save_backtest", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload)
+    })
+  } catch (err) {
+    console.error("Failed to send backtest result to Rust DB API", err)
+  }
 
   return NextResponse.json({ ok: true, ts: Date.now(), result })
 }

@@ -22,7 +22,7 @@ import type { BacktestResult, ReplayChart, ReplayMarker } from "@/lib/backtest"
 import type { BacktestRunOptions, TradingSettings, Timeframe } from "@/hooks/use-live-data"
 
 // How many candles the replay cursor advances per tick.
-const STEP_OPTIONS = [1, 2, 5, 10, 25] as const
+const STEP_OPTIONS = [1, 2, 5, 10, 25, 50, 100] as const
 // Playback speed multipliers — higher = faster bar-to-bar stepping.
 const SPEED_OPTIONS = [0.5, 1, 2, 4, 8] as const
 // Base tick delay (ms) at 1× before the speed multiplier is applied.
@@ -32,10 +32,13 @@ const VISIBLE_BARS = 90
 
 // Candle timeframes the user can backtest on (mapped to real exchange intervals).
 const TIMEFRAME_OPTIONS: { value: Timeframe; label: string }[] = [
+  { value: "5m", label: "5m" },
   { value: "15m", label: "15m" },
+  { value: "30m", label: "30m" },
   { value: "1h", label: "1H" },
   { value: "4h", label: "4H" },
   { value: "1d", label: "1D" },
+  { value: "1w", label: "1W" },
 ]
 
 // Lookback windows (in days) that scope how much history feeds the backtest.
@@ -43,6 +46,7 @@ const TIMEFRAME_OPTIONS: { value: Timeframe; label: string }[] = [
 // kline feed allows — finer timeframes saturate sooner, daily candles reach
 // furthest back.
 const PERIOD_OPTIONS: { value: number; label: string }[] = [
+  { value: 1, label: "1D" },
   { value: 3, label: "3D" },
   { value: 7, label: "7D" },
   { value: 14, label: "14D" },
@@ -52,6 +56,9 @@ const PERIOD_OPTIONS: { value: number; label: string }[] = [
   { value: 365, label: "1Y" },
   { value: 730, label: "2Y" },
   { value: 1095, label: "3Y" },
+  { value: 1825, label: "5Y" },
+  { value: 3650, label: "10Y" },
+  { value: 7300, label: "20Y" },
 ]
 
 type ReplayPhase = "idle" | "loading" | "running" | "paused" | "done"
@@ -64,6 +71,7 @@ export function BacktestPanel({
   tradingSettings,
   selectedSymbol,
   pairs,
+  saveBacktestResult,
 }: {
   backtests: BacktestResult[]
   isBacktesting: boolean
@@ -75,6 +83,8 @@ export function BacktestPanel({
   selectedSymbol: string
   /** Live, real pair universe of the active exchange (for the focus-pair picker). */
   pairs: string[]
+  /** Callback to save the backtest result when replay is done. */
+  saveBacktestResult?: (res: BacktestResult) => void
 }) {
   // ── Replay setup (the only settings owned by this tab) ──
   const [stepInterval, setStepInterval] = useState<number>(1)
@@ -109,6 +119,7 @@ export function BacktestPanel({
   const [active, setActive] = useState<BacktestResult | null>(null)
   const [bar, setBar] = useState(0)
   const [error, setError] = useState<string | null>(null)
+  const [testWholeMarket, setTestWholeMarket] = useState(false)
   const startGuard = useRef(false)
 
   const activeCex = tradingSettings.cexes.find((c) => c.id === tradingSettings.activeCex)
@@ -134,6 +145,13 @@ export function BacktestPanel({
     }, delay)
     return () => clearTimeout(id)
   }, [phase, bar, replay, lastBar, speed, stepInterval])
+
+  // Save the result to history ONLY when the replay finishes playing
+  useEffect(() => {
+    if (phase === "done" && active && saveBacktestResult) {
+      saveBacktestResult(active)
+    }
+  }, [phase, active, saveBacktestResult])
 
   // Progressive view of the run up to the current bar — stats "build" live as
   // trades on the headline pair close out.
@@ -172,7 +190,7 @@ export function BacktestPanel({
     setError(null)
     setPhase("loading")
     try {
-      const result = await runBacktest({ timeframe, periodDays, focusSymbol })
+      const result = await runBacktest({ timeframe, periodDays, focusSymbol, singlePairOnly: !testWholeMarket })
       setActive(result)
       const rep = result.replay
       if (rep && rep.bars.length > rep.warmup + 1) {
@@ -357,8 +375,16 @@ export function BacktestPanel({
               {TIMEFRAME_OPTIONS.find((t) => t.value === timeframe)?.label}
             </span>{" "}
             candles over the last{" "}
-            <span className="font-semibold text-foreground">{periodDays} days</span> of real history. The full pair
-            universe is still scanned for portfolio stats; the chart replays this pair.
+            <span className="font-semibold text-foreground">{periodDays} days</span> of real history. 
+            <label className="ml-2 inline-flex items-center gap-1.5 text-foreground cursor-pointer">
+              <input 
+                type="checkbox" 
+                checked={testWholeMarket} 
+                onChange={(e) => setTestWholeMarket(e.target.checked)}
+                className="rounded border-border accent-primary" 
+              />
+              Also test all supported pairs for global PF
+            </label>
           </p>
         </div>
 
@@ -545,14 +571,14 @@ export function BacktestPanel({
 
             {/* Progressive stats — they accumulate as the replay runs */}
             <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
-              <Stat label="Balance" value={usd(view.balance)} tone={view.netPct >= 0 ? "positive" : "negative"} />
-              <Stat label="Trades" value={num(view.trades, 0)} />
-              <Stat label="Win Rate" value={`${view.winRate.toFixed(1)}%`} />
-              <Stat label="Max Drawdown" value={`${view.maxDd.toFixed(2)}%`} tone="negative" />
-              <Stat label="Wins" value={num(view.wins, 0)} tone="positive" />
-              <Stat label="Losses" value={num(view.losses, 0)} tone="negative" />
-              <Stat label="Portfolio PF" value={atEnd ? String(active.profitFactor) : "…"} />
-              <Stat label="Margin" value={`${active.marginUsagePct}% ${active.marginMode}`} />
+              <Stat label={`${replay.symbol} Balance`} value={usd(view.balance)} tone={view.netPct >= 0 ? "positive" : "negative"} />
+              <Stat label={`${replay.symbol} Trades`} value={num(view.trades, 0)} />
+              <Stat label={`${replay.symbol} Win Rate`} value={`${view.winRate.toFixed(1)}%`} />
+              <Stat label={`${replay.symbol} Max DD`} value={`${view.maxDd.toFixed(2)}%`} tone="negative" />
+              <Stat label={`${replay.symbol} Wins`} value={num(view.wins, 0)} tone="positive" />
+              <Stat label={`${replay.symbol} Losses`} value={num(view.losses, 0)} tone="negative" />
+              <Stat label="All Pairs PF" value={atEnd ? String(active.profitFactor) : "…"} />
+              <Stat label="Margin Used" value={`${active.marginUsagePct}% ${active.marginMode}`} />
             </div>
 
             {atEnd && (
@@ -582,18 +608,29 @@ export function BacktestPanel({
                   key={bt.id}
                   className="flex items-center justify-between rounded border border-border bg-background px-2.5 py-1.5 text-[11px]"
                 >
-                  <span className="text-muted-foreground">{new Date(bt.ranAt).toLocaleString("en-US")}</span>
-                  <span className="font-mono">
-                    {bt.cexLabel} · {bt.style}
-                    {bt.timeframe ? ` · ${TIMEFRAME_OPTIONS.find((t) => t.value === bt.timeframe)?.label ?? bt.timeframe}` : ""}
-                    {bt.periodDays ? ` · ${bt.periodDays}D` : ""}
-                  </span>
-                  <span
-                    className={cn("font-mono font-semibold", bt.netPnlPct >= 0 ? "text-positive" : "text-negative")}
-                  >
-                    {bt.netPnlPct >= 0 ? "+" : ""}
-                    {bt.netPnlPct}%
-                  </span>
+                  <div className="flex flex-col gap-1 w-full">
+                    <div className="flex items-center justify-between">
+                      <span className="text-muted-foreground">{new Date(bt.ranAt).toLocaleString("en-US")}</span>
+                      <span className="font-mono">
+                        {bt.cexLabel} · {bt.style}
+                        {bt.timeframe ? ` · ${TIMEFRAME_OPTIONS.find((t) => t.value === bt.timeframe)?.label ?? bt.timeframe}` : ""}
+                        {bt.periodDays ? ` · ${bt.periodDays}D` : ""}
+                      </span>
+                      <span
+                        className={cn("font-mono font-semibold", bt.netPnlPct >= 0 ? "text-positive" : "text-negative")}
+                      >
+                        {bt.netPnlPct >= 0 ? "+" : ""}
+                        {bt.netPnlPct.toFixed(2)}%
+                      </span>
+                    </div>
+                    <div className="flex items-center justify-between text-[10px] border-t border-border/50 pt-1 mt-1 text-muted-foreground font-mono">
+                      <span>Bal: ${bt.initialBalance?.toLocaleString(undefined, { maximumFractionDigits: 0 })} → ${(bt.finalBalance || bt.initialBalance * (1 + bt.netPnlPct / 100)).toLocaleString(undefined, { maximumFractionDigits: 0 })}</span>
+                      <span>Trades: {bt.trades}</span>
+                      <span className="text-positive">W: {bt.wins}</span>
+                      <span className="text-negative">L: {bt.losses}</span>
+                      <span>WR: {bt.winRate?.toFixed(1)}%</span>
+                    </div>
+                  </div>
                 </div>
               ))}
             </div>

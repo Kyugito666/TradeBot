@@ -41,19 +41,23 @@ export interface SignalCandidate {
 
 // ── Filter: only directional setups that clear the style confidence gate ──────
 // Higher-frequency styles demand stronger agreement before a setup is shown.
-const STYLE_MIN_CONFIDENCE: Record<TradingStyle, number> = {
-  scalp: 0.45,
-  intraday: 0.35,
-  swing: 0.3,
+const STYLE_MIN_CONFIDENCE: Record<string, number> = {
+  scalp: 0.15,
+  hft: 0.10,
+  intraday: 0.20,
+  swing: 0.25,
 }
 
-export function styleConfidenceGate(style: TradingStyle): number {
-  return STYLE_MIN_CONFIDENCE[style] ?? 0.35
+export function styleConfidenceGate(style: string): number {
+  return STYLE_MIN_CONFIDENCE[style] ?? 0.15
 }
 
-export function passesFilter(row: MarketRow, style: TradingStyle): boolean {
-  if (row.signalStatus !== "LONG" && row.signalStatus !== "SHORT") return false
-  return row.confidence >= styleConfidenceGate(style)
+export function passesFilter(row: MarketRow, style: string): boolean {
+  // Only check if there's a valid direction. 
+  // We completely bypass the client-side confidence filter to show ALL raw signals.
+  if (row.signalStatus !== "LONG" && row.signalStatus !== "SHORT" && row.signalStatus !== "BUY" && row.signalStatus !== "SELL") return false
+  
+  return true
 }
 
 // ── Volatility proxy from the recent price spark (mean absolute return) ────────
@@ -68,9 +72,10 @@ export function sparkAtrPct(spark: number[], lastPrice: number): number {
       n++
     }
   }
-  const avg = n > 0 ? sumAbs / n : 0.012
+  const avg = n > 0 ? sumAbs / n : 0.005
   // Clamp to a sane band so a flat or spiky spark can't produce absurd levels.
-  return Math.min(0.08, Math.max(0.003, avg))
+  // We use 0.001 (0.1%) as an absolute floor to allow tight HFT / Scalping entries.
+  return Math.min(0.08, Math.max(0.001, avg))
 }
 
 // ── Resolve leverage for a pair from the active CEX config ────────────────────
@@ -81,13 +86,20 @@ export function resolveLeverage(symbol: string, cex: CexConfig | undefined): num
 }
 
 function round(value: number, price: number): number {
-  const digits = price < 1 ? 5 : 2
-  return Number(value.toFixed(digits))
+  if (!price || price === 0) return value
+  if (price >= 1000) return Number(value.toFixed(2))
+  if (price >= 10) return Number(value.toFixed(3))
+  if (price >= 1) return Number(value.toFixed(4))
+  if (price >= 0.1) return Number(value.toFixed(5))
+  if (price >= 0.01) return Number(value.toFixed(6))
+  return Number(value.toPrecision(5))
 }
 
 // ── Compute Entry / TP / SL for a row using the risk preset + active CEX ──────
+// Entry uses LIMIT ORDER pricing: entry is placed AWAY from current price
+// (below for LONG, above for SHORT) to get a better fill.
 export function computeLevels(row: MarketRow, risk: RiskModel, cex: CexConfig | undefined): SignalLevels {
-  const side: SignalSide = row.signalStatus === "SHORT" ? "SHORT" : "LONG"
+  const side: SignalSide = (row.signalStatus === "SHORT" || row.signalStatus === "SELL") ? "SHORT" : "LONG"
   const last = row.lastPrice
   const atrPct = sparkAtrPct(row.spark, last)
 
@@ -95,13 +107,18 @@ export function computeLevels(row: MarketRow, risk: RiskModel, cex: CexConfig | 
   const tpDistPct = slDistPct * risk.riskReward
   const leverage = resolveLeverage(row.symbol, cex)
 
+  // Limit order offset: 30% of ATR away from current price
+  const limitOffset = atrPct * 0.3
+
   let entry = last
   let tp = last
   let sl = last
   if (side === "LONG") {
+    entry = last * (1 - limitOffset)  // Limit buy below current price
     tp = entry * (1 + tpDistPct)
     sl = entry * (1 - slDistPct)
   } else {
+    entry = last * (1 + limitOffset)  // Limit sell above current price
     tp = entry * (1 - tpDistPct)
     sl = entry * (1 + slDistPct)
   }
@@ -143,8 +160,13 @@ export interface PaperTrade {
   sl: number
   leverage: number
   confidence: number
+  margin: number
   openedAt: number
   reason: string
+  /** Limit order status: PENDING (not filled), FILLED (live), CLOSED */
+  status?: "PENDING" | "FILLED" | "CLOSED"
+  /** Live price tracking for pending orders */
+  livePrice?: number
   // Filled when closed:
   closedAt?: number
   exitPrice?: number
@@ -199,6 +221,7 @@ export interface PaperStats {
   winRate: number
   netR: number
   netRoiPct: number
+  netPnlUsd: number
   avgR: number
   bestR: number
   worstR: number
@@ -211,6 +234,7 @@ export function computeStats(history: PaperTrade[]): PaperStats {
   const losses = closed.length - wins
   const netR = rs.reduce((a, b) => a + b, 0)
   const netRoiPct = closed.reduce((a, t) => a + (t.pnlPct ?? 0), 0)
+  const netPnlUsd = closed.reduce((a, t) => a + (t.margin * ((t.pnlPct ?? 0) / 100)), 0)
   return {
     total: closed.length,
     wins,
@@ -218,6 +242,7 @@ export function computeStats(history: PaperTrade[]): PaperStats {
     winRate: closed.length ? Number(((wins / closed.length) * 100).toFixed(1)) : 0,
     netR: Number(netR.toFixed(2)),
     netRoiPct: Number(netRoiPct.toFixed(1)),
+    netPnlUsd: Number(netPnlUsd.toFixed(2)),
     avgR: closed.length ? Number((netR / closed.length).toFixed(3)) : 0,
     bestR: rs.length ? Number(Math.max(...rs).toFixed(2)) : 0,
     worstR: rs.length ? Number(Math.min(...rs).toFixed(2)) : 0,

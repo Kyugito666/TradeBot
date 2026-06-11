@@ -10,7 +10,7 @@ impl Agent for Astrophysicist {
 
     fn analyze(&self, snap: &MarketSnapshot) -> AgentVote {
         if snap.candles.is_empty() {
-            return AgentVote::wait(self.name(), "No data");
+            return AgentVote::forced_choice(self.name(), 0.1, 0.1, "No data");
         }
 
         let whale_inflow = snap.whale_inflow_usd;
@@ -24,7 +24,7 @@ impl Agent for Astrophysicist {
         } else if gravity < -0.01 {
             Direction::Sell
         } else {
-            Direction::Wait
+            Direction::Veto
         };
 
         let conviction = (gravity.abs() * 10.0).clamp(0.0, 0.85);
