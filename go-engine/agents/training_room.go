@@ -2,7 +2,6 @@ package agents
 
 import (
 	"log"
-	"math/rand"
 )
 
 // AgentProfile represents an agent's studying field and performance metrics.
