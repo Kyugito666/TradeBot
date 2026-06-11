@@ -1,6 +1,6 @@
 "use client"
 
-import { Ban, Clock, Minus, TrendingDown, TrendingUp } from "lucide-react"
+import { Clock, Minus, TrendingDown, TrendingUp } from "lucide-react"
 import type { Consensus } from "@/lib/types"
 import { Panel, Tag, Meter, LoadingState } from "./ui-kit"
 import { num } from "@/lib/format"
@@ -26,8 +26,8 @@ export function ConsensusPanel({
   const { action: rawAction, confidence, reason, trendState, whaleBias, entryTarget, tpTarget, slTarget, symbol, updatedAt, source } =
     consensus
   const action = rawAction
-  const actionTone = action === "LONG" ? "positive" : action === "SHORT" ? "negative" : action === "VETO" ? "negative" : "warning"
-  const ActionIcon = action === "LONG" ? TrendingUp : action === "SHORT" ? TrendingDown : action === "VETO" ? Ban : Clock
+  const actionTone = action === "LONG" ? "positive" : action === "SHORT" ? "negative" : "warning"
+  const ActionIcon = action === "LONG" ? TrendingUp : action === "SHORT" ? TrendingDown : Clock
   const sourceLabel = source === "engine" ? "ENGINE" : "ANALYTICS"
 
   return (

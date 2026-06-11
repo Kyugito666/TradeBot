@@ -1,7 +1,5 @@
 import type { SignalStatus, TrendState, WhaleBias } from "./types"
 
-import type { SignalStatus, TrendState, WhaleBias } from "./types"
-
 // Phase 1: Removed all Retail Technical Analysis (TA) indicators.
 // This file now serves as a bridge to the Python ML Engine which uses
 // pure quantitative models (Hidden Markov Models, Stochastic Calculus, Statistical Arbitrage).

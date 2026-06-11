@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server"
-import type { Consensus, MarketResponse, MarketRow, TrendState, WhaleBias } from "@/lib/types"
+import type { Consensus, MarketResponse, MarketRow, SignalStatus, TrendState, WhaleBias } from "@/lib/types"
 import { computeSignal } from "@/lib/signals"
 import { getExchange, getAllExchanges, mapWithBudget, type Candles, type TickerLite } from "@/lib/exchanges"
 
@@ -35,6 +35,21 @@ function whaleFromLsr(lsr: number): WhaleBias {
   if (lsr > 1.1) return "LONG_HEAVY"
   if (lsr < 0.9) return "SHORT_HEAVY"
   return "BALANCED"
+}
+
+// The Rust brain reports directions as BUY/SELL/WAIT; the terminal speaks
+// LONG/SHORT/WAIT, so normalize the engine verdict into a SignalStatus.
+function normalizeSignal(raw: unknown): SignalStatus {
+  switch (String(raw ?? "").toUpperCase()) {
+    case "BUY":
+    case "LONG":
+      return "LONG"
+    case "SELL":
+    case "SHORT":
+      return "SHORT"
+    default:
+      return "WAIT"
+  }
 }
 
 type Internal = MarketRow & { _entry?: number; _tp?: number; _sl?: number; _reason?: string; _vol?: number }
@@ -79,7 +94,7 @@ async function buildRowFromCandles(t: TickerLite, candles: Candles): Promise<Int
   const trendState = trendFromCloses(closes)
   const whaleBias = whaleFromLsr(1) // per-pair LSR is not fetched in the bulk scan
   
-  let signalStatus = "WAIT"
+  let signalStatus: SignalStatus = "WAIT"
   let confidence = 0
   let rsiVal = 50
   let _entry = 0
@@ -90,7 +105,7 @@ async function buildRowFromCandles(t: TickerLite, candles: Candles): Promise<Int
   // FASE 6: Coba tanya Rust Brain (13 Agents) via HTTP lokal
   const rustRes = await fetchRustBrain(t, candles)
   if (rustRes) {
-      signalStatus = rustRes.veto ? "WAIT" : rustRes.signal.toUpperCase()
+      signalStatus = rustRes.veto ? "WAIT" : normalizeSignal(rustRes.signal)
       confidence = rustRes.confidence
       _entry = rustRes.entry
       _tp = rustRes.take_profit

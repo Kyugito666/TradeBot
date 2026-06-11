@@ -17,6 +17,7 @@ export interface MarketRow {
   confidence: number // 0..1 signal agreement strength
   rsi: number // Wilder RSI(14) from real candles
   spark: number[]
+  volume24h?: number // 24h traded volume (USD), when available
 }
 
 // A single consensus verdict. Sourced either from the live Go engine
@@ -74,7 +75,7 @@ export interface RiskMetrics {
 }
 
 export interface PerfPoint {
-  t: string
+  t: number // epoch ms
   equity: number
 }
 

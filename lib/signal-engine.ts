@@ -55,7 +55,7 @@ export function styleConfidenceGate(style: string): number {
 export function passesFilter(row: MarketRow, style: string): boolean {
   // Only check if there's a valid direction. 
   // We completely bypass the client-side confidence filter to show ALL raw signals.
-  if (row.signalStatus !== "LONG" && row.signalStatus !== "SHORT" && row.signalStatus !== "BUY" && row.signalStatus !== "SELL") return false
+  if (row.signalStatus !== "LONG" && row.signalStatus !== "SHORT") return false
   
   return true
 }
@@ -99,7 +99,7 @@ function round(value: number, price: number): number {
 // Entry uses LIMIT ORDER pricing: entry is placed AWAY from current price
 // (below for LONG, above for SHORT) to get a better fill.
 export function computeLevels(row: MarketRow, risk: RiskModel, cex: CexConfig | undefined): SignalLevels {
-  const side: SignalSide = (row.signalStatus === "SHORT" || row.signalStatus === "SELL") ? "SHORT" : "LONG"
+  const side: SignalSide = row.signalStatus === "SHORT" ? "SHORT" : "LONG"
   const last = row.lastPrice
   const atrPct = sparkAtrPct(row.spark, last)
 

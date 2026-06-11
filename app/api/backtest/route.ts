@@ -168,7 +168,7 @@ export async function POST(request: Request) {
   // The Rust backend handles storing the DB, so we send the stats over HTTP
   try {
     const payload = {
-      timestamp: result.timestamp || Date.now(),
+      timestamp: result.ranAt || Date.now(),
       cex: result.cex || "",
       timeframe: result.timeframe || "",
       periodDays: result.periodDays || 0,

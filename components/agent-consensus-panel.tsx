@@ -36,7 +36,7 @@ export function AgentConsensusPanel({
 
   // Headline tone: VETO = negative, VOTED LONG = positive, VOTED SHORT = negative,
   // VOTED HOLD = warning.
-  const tone = isVeto ? "negative" : dir === "LONG" ? "positive" : "negative"
+  const tone = isVeto ? "negative" : dir === "LONG" ? "positive" : dir === "SHORT" ? "negative" : "warning"
   const DecisionIcon = isVeto ? Gavel : dir === "LONG" ? TrendingUp : TrendingDown
   const directionLabel = isVeto ? "VETO" : dir === "LONG" ? "LONG" : "SHORT"
 

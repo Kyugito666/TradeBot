@@ -25,6 +25,7 @@ interface AgentOutput {
   confidence: number
   reasoning: string
   metrics: Record<string, number>
+  activity?: string
 }
 
 interface AgentState {

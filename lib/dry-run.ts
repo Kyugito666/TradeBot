@@ -200,8 +200,10 @@ export function updateSimulatedPositions(
         ...closedPos,
         agentVotes,
         consensusSignal: {
+          decision: "VOTED",
           signal: pos.side,
           confidence: 0,
+          votes: { long: 0, short: 0, hold: 0, veto: 0 },
           agreeingAgents: [],
           dissentingAgents: [],
           vetoAgents: [],
@@ -345,8 +347,10 @@ export function closeSimulatedPosition(
     ...closedPos,
     agentVotes,
     consensusSignal: {
+      decision: "VOTED",
       signal: pos.side,
       confidence: 0,
+      votes: { long: 0, short: 0, hold: 0, veto: 0 },
       agreeingAgents: [],
       dissentingAgents: [],
       vetoAgents: [],

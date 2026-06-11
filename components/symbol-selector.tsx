@@ -3,7 +3,7 @@
 import React, { useState, useMemo, useRef, useEffect } from "react"
 import { Search, Play, ChevronDown } from "lucide-react"
 import { MarketRow } from "@/lib/types"
-import { PairStat } from "@/lib/backtest-engine"
+import { PairStat } from "@/lib/backtest"
 import { cn } from "@/lib/utils"
 
 export function SymbolSelector({
