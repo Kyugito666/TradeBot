@@ -7,8 +7,8 @@
 //
 // Layout (byte offsets):
 //   [0..63]    ShmCtrl  (go_seq u64, rust_seq u64, data_ready u32, signal_ready u32, pad[40])
-//   [64..9799] MarketData
-//   [9800..]   SignalResult
+//   [64..13007] MarketData (including RawTicks)
+//   [13008..]   SignalResult
 //
 // Seqlock write protocol (Go → Rust):
 //   1. go_seq++ (make odd → "write in progress")
@@ -71,11 +71,16 @@ const (
 	offShortLiq = offLongLiq + 8                      // 9776
 	offSentF32  = offShortLiq + 8                     // 9784
 	offNewsCnt  = offSentF32 + 4                      // 9788
-	offMktTs    = offNewsCnt + 4                      // 48192 (8-byte aligned)
-	// MarketData ends at 48200
+	offMktTs    = offNewsCnt + 4                      // 9792 (8-byte aligned)
+	maxTicks    = 100
+	tickBytes   = 32 // 4 * 8
+	offNTicks   = offMktTs + 8                        // 9800
+	offPad2     = offNTicks + 4                       // 9804
+	offRawTicks = offPad2 + 4                         // 9808
+	// MarketData ends at 9808 + 3200 = 13008
 
-	// SignalResult layout (offset 48200)
-	offSig          = offMktTs + 8
+	// SignalResult layout (offset 13008)
+	offSig          = 13008
 	offSigAction    = offSig + 0  // uint8
 	offSigVeto      = offSig + 1  // uint8
 	// _pad2 [48202..48208]
@@ -84,9 +89,10 @@ const (
 	offSigTP        = offSig + 24
 	offSigSL        = offSig + 32
 	offSigRR        = offSig + 40
-	offSigReason    = offSig + 48             // [256]byte
+	offSigAlloc     = offSig + 48             // [float64]
+	offSigReason    = offSig + 56             // [256]byte
 	offSigDirs      = offSigReason + reasonLen // [13]uint8
-	// alignment padding for 8 bytes: 48517 + 13 = 48530 -> pad 3 bytes = 48533
+	// alignment padding for 8 bytes: 312 + 13 = 325 -> pad 3 bytes = 328
 	offSigConvBase  = offSigDirs + agentCount + 3 // [13]float64
 	offSigTs        = offSigConvBase + agentCount*8
 )
@@ -106,10 +112,19 @@ type Candle struct {
 	TsMs                           int64
 }
 
+// RawTick is a real-time public trade tick
+type RawTick struct {
+	Price float64
+	Size  float64
+	Side  uint64 // 1=Buy, 2=Sell
+	TsMs  int64
+}
+
 // MarketData is the full snapshot written by Go into SHM each loop tick
 type MarketData struct {
 	Symbol         [symLen]byte
 	Candles        []Candle // max 200
+	RawTicks       []RawTick // max 100
 	Price, Bid, Ask float64
 	OI, LSR         float64
 	ATR14           float64
@@ -133,6 +148,7 @@ type Signal struct {
 	TakeProfit      float64
 	StopLoss        float64
 	RiskReward      float64
+	AllocationPct   float64
 	VetoReason      string
 	AgentDirs       [agentCount]uint8
 	AgentConvictions [agentCount]float64
@@ -292,6 +308,21 @@ func (b *Bridge) WriteMarket(md *MarketData) {
 	binary.LittleEndian.PutUint32(d[offNewsCnt:], md.NewsCount)
 	binary.LittleEndian.PutUint64(d[offMktTs:],   uint64(md.TsMs))
 
+	// ── Raw Ticks ─────────────────────────────────────────────────────────
+	t_len := len(md.RawTicks)
+	if t_len > maxTicks {
+		t_len = maxTicks
+	}
+	binary.LittleEndian.PutUint32(d[offNTicks:], uint32(t_len))
+	for i := 0; i < t_len; i++ {
+		base := offRawTicks + i*tickBytes
+		t := md.RawTicks[i]
+		putF64(d, base+0, t.Price)
+		putF64(d, base+8, t.Size)
+		binary.LittleEndian.PutUint64(d[base+16:], t.Side)
+		binary.LittleEndian.PutUint64(d[base+24:], uint64(t.TsMs))
+	}
+
 	// Seqlock: make go_seq even ("write complete")
 	b.writeU64(offGoSeq, seq+2)
 	// Signal Rust
@@ -328,6 +359,7 @@ func (b *Bridge) readSignal() *Signal {
 	sig.TakeProfit = getF64(d, offSigTP)
 	sig.StopLoss   = getF64(d, offSigSL)
 	sig.RiskReward = getF64(d, offSigRR)
+	sig.AllocationPct = getF64(d, offSigAlloc)
 
 	raw := d[offSigReason : offSigReason+reasonLen]
 	end := 0
