@@ -20,7 +20,7 @@ impl Agent for LiquidatorAgent {
     fn analyze(&self, snap: &MarketSnapshot) -> AgentVote {
         let n = snap.candles.len();
         if n < 20 || snap.oi < 1.0 {
-            return AgentVote::wait("liquidator", "insufficient data for liq estimation");
+            return AgentVote::forced_choice("liquidator", 0.1, 0.1, "insufficient data for liq estimation");
         }
 
         let h  = highs(snap);
@@ -35,7 +35,7 @@ impl Agent for LiquidatorAgent {
         let short_frac = 1.0 - long_frac;
         let vol_total: f64 = v.iter().sum();
 
-        if vol_total < 1.0 { return AgentVote::wait("liquidator", "zero volume"); }
+        if vol_total < 1.0 { return AgentVote::forced_choice("liquidator", 0.1, 0.1, "zero volume"); }
 
         // ── Build liquidation price distributions ─────────────────────────────
         let mut long_liq_prices:  Vec<(f64, f64)> = Vec::new(); // (price, weight)
@@ -61,12 +61,12 @@ impl Agent for LiquidatorAgent {
         // ── Find nearest cluster above (short liq = BUY magnet) ──────────────
         let nearest_above = short_liq_prices.iter()
             .filter(|(p, _)| *p > current && (*p - current) < atr * 2.0)
-            .min_by(|a, b| (a.0 - current).partial_cmp(&(b.0 - current)).unwrap());
+            .min_by(|a, b| (a.0 - current).partial_cmp(&(b.0 - current)).unwrap_or(std::cmp::Ordering::Equal));
 
         // ── Find nearest cluster below (long liq = SELL magnet) ──────────────
         let nearest_below = long_liq_prices.iter()
             .filter(|(p, _)| *p < current && (current - *p) < atr * 2.0)
-            .min_by(|a, b| (current - a.0).partial_cmp(&(current - b.0)).unwrap());
+            .min_by(|a, b| (current - a.0).partial_cmp(&(current - b.0)).unwrap_or(std::cmp::Ordering::Equal));
 
         // ── Evaluate directional magnet based on proximity and density ────────
         let (dir, conv, detail) = match (nearest_above, nearest_below) {
@@ -87,7 +87,7 @@ impl Agent for LiquidatorAgent {
                     (Direction::Sell, density_below,
                      format!("LONG_cluster below @ {:.2} (dist={:.2} ATR={:.4} score={:.4})", bp, dist_below, atr, score_below))
                 } else {
-                    (Direction::Wait, 0.0, "clusters above and below are balanced".into())
+                    (Direction::Veto, 0.0, "clusters above and below are balanced".into())
                 }
             }
             (Some(&(ap, aw)), None) => {
@@ -100,7 +100,7 @@ impl Agent for LiquidatorAgent {
                 (Direction::Sell, density,
                  format!("LONG_cluster below @ {:.2} (dist={:.2} ATR={:.4})", bp, current - bp, atr))
             }
-            (None, None) => (Direction::Wait, 0.0, "no cluster in ATR×2 radius".into()),
+            (None, None) => (Direction::Veto, 0.0, "no cluster in ATR×2 radius".into()),
         };
 
         AgentVote {

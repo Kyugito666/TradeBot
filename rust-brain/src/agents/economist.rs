@@ -39,7 +39,7 @@ impl Agent for Economist {
         } else if bias < -0.20 {
             Direction::Sell
         } else {
-            Direction::Wait
+            Direction::Veto
         };
         
         let conviction = bias.abs().min(1.0);
@@ -48,8 +48,8 @@ impl Agent for Economist {
             fr, oi, liq_bias
         );
         
-        if direction == Direction::Wait {
-            AgentVote::wait(self.name(), &reason)
+        if direction == Direction::Veto {
+            AgentVote::forced_choice(self.name(), 0.1, 0.1, &reason)
         } else {
             AgentVote {
                 agent: self.name(),

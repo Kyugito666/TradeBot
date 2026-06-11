@@ -21,6 +21,7 @@ use std::time::{Duration, Instant};
 
 use libc::{shm_open, O_RDWR};
 use memmap2::MmapMut;
+use serde::{Serialize, Deserialize};
 
 // ── Constants matching shm_types.h ──────────────────────────────────────────
 
@@ -43,7 +44,7 @@ const OFF_MARKET: usize = 64; // MarketData starts at byte 64
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Direction {
-    Wait = 0,
+    Veto = 0,
     Buy  = 1,
     Sell = 2,
 }
@@ -53,18 +54,26 @@ impl From<u8> for Direction {
         match v {
             1 => Self::Buy,
             2 => Self::Sell,
-            _ => Self::Wait,
+            _ => Self::Veto,
         }
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct Candle {
     pub open:  f64,
     pub high:  f64,
     pub low:   f64,
     pub close: f64,
     pub vol:   f64,
+    pub ts_ms: i64,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct RawTick {
+    pub price: f64,
+    pub size:  f64,
+    pub side:  u64,
     pub ts_ms: i64,
 }
 
@@ -88,6 +97,7 @@ pub struct MarketSnapshot {
     pub sentiment_score:  f32,
     pub news_count:       u32,
     pub ts_ms:            i64,
+    pub raw_ticks:        Vec<RawTick>,
 }
 
 pub struct SignalOutput {
@@ -97,6 +107,7 @@ pub struct SignalOutput {
     pub take_profit:       f64,
     pub stop_loss:         f64,
     pub risk_reward:       f64,
+    pub allocation_pct:    f64,
     pub veto:              bool,
     pub veto_reason:       String,
     pub agent_dirs:        [u8; AGENT_COUNT],
@@ -290,6 +301,26 @@ impl ShmBridge {
             // = base(64) + sym(16) + candles(9600) + n_candles(4) + pad(4) = 9688 ✓
             let sf = base + SYM_LEN + MAX_CANDLES * 48 + 4 + 4; // = 9688
 
+            let ts_ms = i64::from_le_bytes(*raw.add(sf + 104).cast::<[u8; 8]>());
+
+            // ── Raw Ticks ───────────────────────────────────────────────────
+            let n_ticks_off = sf + 112; // 9688 + 112 = 9800
+            let n_ticks = std::ptr::read_volatile(raw.add(n_ticks_off) as *const u32) as usize;
+            let n_ticks = n_ticks.min(100);
+
+            let raw_ticks_base = n_ticks_off + 8; // 9808
+            let mut raw_ticks = Vec::with_capacity(n_ticks);
+            for i in 0..n_ticks {
+                let off = raw_ticks_base + i * 32;
+                let t = RawTick {
+                    price: f64::from_le_bytes(*raw.add(off     ).cast::<[u8; 8]>()),
+                    size:  f64::from_le_bytes(*raw.add(off + 8 ).cast::<[u8; 8]>()),
+                    side:  u64::from_le_bytes(*raw.add(off + 16).cast::<[u8; 8]>()),
+                    ts_ms: i64::from_le_bytes(*raw.add(off + 24).cast::<[u8; 8]>()),
+                };
+                raw_ticks.push(t);
+            }
+
             MarketSnapshot {
                 symbol,
                 candles,
@@ -307,8 +338,9 @@ impl ShmBridge {
                 short_liq_1h:     f64::from_le_bytes(*raw.add(sf + 88 ).cast::<[u8; 8]>()),
                 sentiment_score:  f32::from_le_bytes(*raw.add(sf + 96 ).cast::<[u8; 4]>()),
                 news_count:       u32::from_le_bytes(*raw.add(sf + 100).cast::<[u8; 4]>()),
-                ts_ms:            i64::from_le_bytes(*raw.add(sf + 104).cast::<[u8; 8]>()),
-                // sf+104+8 = 9800 → signal starts at 9800 ✓
+                ts_ms,
+                raw_ticks,
+                // sf+112+8+3200 = 13008 → signal starts at 13008
             }
         }
     }
@@ -320,24 +352,14 @@ impl ShmBridge {
     /// Derivation:
     ///   64           (ShmCtrl)
     /// + 16           (symbol[16])
-    /// + 200*48=9600  (candles[200])
-    /// + 4            (n_candles u32)
-    /// + 4            (pad1 u32)
-    /// + 12*8=96      (price,bid,ask,oi,lsr,atr14,funding,usdtD,kimchi,whale,longLiq,shortLiq)
-    /// + 4            (sentiment_score f32)
-    /// + 4            (news_count u32)
-    /// + 8            (ts_ms i64)
-    /// ─────────────
-    /// = 9800         ← Go's hardcoded offSig = 9800 ✓
+    /// + 1000*48      (candles)
+    /// + 8            (n_candles, pad)
+    /// + 96           (12*f64 scalars)
+    /// + 16           (sentiment, news, ts_ms) = 9800
+    /// + 8            (n_ticks, pad)           = 9808
+    /// + 100*32       (raw_ticks)              = 13008
     pub fn write_signal(&mut self, sig: &SignalOutput) {
-        // ── Verified: this matches Go's offSig = 9800 ────────────────────────
-        const OFF_SIGNAL: usize = 64
-            + SYM_LEN              // 16
-            + MAX_CANDLES * 48     // 9600
-            + 4 + 4                // n_candles(u32) + pad1(u32)
-            + 12 * 8               // 12 × f64 scalars  ← FIXED (was 13)
-            + 4 + 4 + 8;           // sentiment(f32) + news_count(u32) + ts_ms(i64)
-        // = 64+16+9600+8+96+16 = 9800 ✓
+        const OFF_SIGNAL: usize = 13008;
 
         let raw = unsafe { self.mmap.as_mut_ptr().add(OFF_SIGNAL) };
 
@@ -364,6 +386,7 @@ impl ShmBridge {
             (raw.add(off) as *mut f64).write_volatile(sig.take_profit); off += 8;
             (raw.add(off) as *mut f64).write_volatile(sig.stop_loss);   off += 8;
             (raw.add(off) as *mut f64).write_volatile(sig.risk_reward); off += 8;
+            (raw.add(off) as *mut f64).write_volatile(sig.allocation_pct); off += 8;
 
             // veto_reason[256]
             std::ptr::copy_nonoverlapping(reason_buf.as_ptr(), raw.add(off), REASON_LEN);

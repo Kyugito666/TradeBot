@@ -7,12 +7,21 @@
 
 use std::time::{Duration, Instant};
 use log::{error, info, warn};
-use rayon::prelude::*;
+use std::thread;
 
 mod agents;
 mod consensus;
 mod evolution;
 mod shm;
+mod db;
+mod api;
+mod rooms;
+mod storage;
+mod backtest;
+mod quant;
+
+use db::DbClient;
+use std::sync::Arc;
 
 use agents::{
     absurdist::AbsurdistAgent,
@@ -28,9 +37,8 @@ use agents::{
     statistician::Statistician,
     psychologist::Psychologist,
     astrophysicist::Astrophysicist,
-    Agent, AgentVote,
+    Agent,
 };
-use consensus::ConsensusEngine;
 use shm::ShmBridge;
 
 fn main() -> anyhow::Result<()> {
@@ -53,23 +61,46 @@ fn main() -> anyhow::Result<()> {
         .build_global()
         .expect("rayon pool init");
 
-    let agents: Vec<Box<dyn Agent + Send + Sync>> = vec![
-        Box::new(DataEngineer),
-        Box::new(Economist),
-        Box::new(GameTheorist),
-        Box::new(MathematicianAgent::default()),
-        Box::new(PhysicistAgent::default()),
-        Box::new(CryptographerAgent),
-        Box::new(LinguistAgent),
-        Box::new(LiquidatorAgent),
-        Box::new(AbsurdistAgent),
-        Box::new(DataScientist),
-        Box::new(Statistician),
-        Box::new(Psychologist),
-        Box::new(Astrophysicist),
-    ];
+fn create_all_agents() -> Vec<Arc<dyn Agent + Send + Sync>> {
+    vec![
+        Arc::new(DataEngineer),
+        Arc::new(Economist),
+        Arc::new(GameTheorist),
+        Arc::new(MathematicianAgent::default()),
+        Arc::new(PhysicistAgent::default()),
+        Arc::new(CryptographerAgent),
+        Arc::new(LinguistAgent),
+        Arc::new(LiquidatorAgent),
+        Arc::new(AbsurdistAgent),
+        Arc::new(DataScientist),
+        Arc::new(Statistician),
+        Arc::new(Psychologist),
+        Arc::new(Astrophysicist),
+    ]
+}
 
-    let consensus = ConsensusEngine::new();
+    let db_dir = std::env::var("BOT_DB_DIR").unwrap_or_else(|_| "/mnt/d/database".to_string());
+    let db_client = Arc::new(DbClient::new(&db_dir).expect("Gagal inisialisasi SQLite"));
+    let parquet_db = Arc::new(storage::parquet_writer::ParquetDB::new(&db_dir));
+
+    let live_agents = create_all_agents();
+    let api_agents = create_all_agents();
+
+    let arc_live_agents = Arc::new(live_agents);
+    let arc_api_agents = Arc::new(api_agents);
+
+    let api_db = db_client.clone();
+    
+    // Tab Signal Live (The real background engine evaluating shadow trades)
+    let tab_signal = Arc::new(rooms::TabEnvironment::new("Signal_Live", arc_live_agents.iter().map(|a| a.clone()).collect(), db_client.clone()));
+    let api_live_tab = tab_signal.clone();
+    
+    let thread_live_tab = api_live_tab.clone();
+
+    let api_parquet_db = parquet_db.clone();
+    thread::spawn(move || {
+        api::run_server(8080, arc_api_agents, api_db, thread_live_tab, api_parquet_db);
+    });
 
     // Wait for Go engine to create SHM
     let mut bridge = {
@@ -90,6 +121,23 @@ fn main() -> anyhow::Result<()> {
     };
 
     info!("[Otak-AI] Udah ready nih bos! Tinggal nunggu data dari market…");
+
+    // [New Architecture] 13 Agent Bunshin into 4 Rooms!
+    // Initialize Tab Signal once outside the loop to maintain HFT Zero-Latency!
+    // (Already done above, passing api_live_tab instead)
+    let tab_signal = api_live_tab.clone();
+
+    // ── BigData: Periodic tick buffer flush (every 30 seconds) ────────────
+    {
+        let pq = parquet_db.clone();
+        thread::spawn(move || {
+            loop {
+                thread::sleep(Duration::from_secs(30));
+                pq.flush_all();
+            }
+        });
+        info!("[BigData] Periodic tick flush thread started (every 30s)");
+    }
 
     let mut last_ts: i64 = 0;
     let mut iteration: u64 = 0;
@@ -114,27 +162,31 @@ fn main() -> anyhow::Result<()> {
             .unwrap_or("???")
             .trim_end_matches('\0');
 
-        let t_start = Instant::now();
+        // Implement continuous Raw Tick appending to Parquet
+        if !snap.raw_ticks.is_empty() {
+            let mut timestamps = Vec::with_capacity(snap.raw_ticks.len());
+            let mut prices = Vec::with_capacity(snap.raw_ticks.len());
+            let mut volumes = Vec::with_capacity(snap.raw_ticks.len());
+            for t in &snap.raw_ticks {
+                timestamps.push(t.ts_ms);
+                prices.push(t.price);
+                volumes.push(t.size);
+            }
+            if let Err(e) = parquet_db.write_unfiltered_ticks(sym, timestamps, prices, volumes) {
+                error!("[Parquet] Failed to append raw ticks for {}: {}", sym, e);
+            }
+        }
 
-        let votes: Vec<AgentVote> = agents
-            .par_iter()
-            .map(|agent| {
-                let t = Instant::now();
-                let vote = agent.analyze(&snap);
-                log::debug!(
-                    "[{:>13}] {:?} conv={:.3}  ({:.2}ms)  {}",
-                    vote.agent,
-                    vote.direction,
-                    vote.conviction,
-                    t.elapsed().as_secs_f64() * 1000.0,
-                    &vote.reasoning[..vote.reasoning.len().min(90)]
-                );
-                vote
-            })
-            .collect();
+        let _t_start = Instant::now();
 
-        let signal = consensus.evaluate(&votes, &snap);
-        let elapsed_us = t_start.elapsed().as_micros();
+        // Process tick through the 4 Rooms (Diskusi, Eksekusi, Storage, Courier)
+        // TabEnvironment implicitly runs Consensus Engine inside Room Eksekusi and returns SignalOutput!
+        let signal = tab_signal.process_tick(&snap);
+
+        let elapsed_us = _t_start.elapsed().as_micros();
+
+        // 5. Send command to Gateway
+        let _resp_arr = [0u8; 1024];
 
         info!(
             "[Otak-AI] #{iteration} {sym} harga={:.4} │ Analisa: {:?} yakin={:.3} RR={:.2} │ Waktu Mikir: {elapsed_us}µs",

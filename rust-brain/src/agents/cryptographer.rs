@@ -17,7 +17,7 @@ impl Agent for CryptographerAgent {
     fn analyze(&self, snap: &MarketSnapshot) -> AgentVote {
         let n = snap.candles.len();
         if n < 50 {
-            return AgentVote::wait("cryptographer", "insufficient candles");
+            return AgentVote::forced_choice("cryptographer", 0.1, 0.1, "insufficient candles");
         }
 
         let candles = &snap.candles;
@@ -34,7 +34,7 @@ impl Agent for CryptographerAgent {
                     let idx = (((c.close - min_price) / bin_w) as usize).min(bins - 1);
                     hist[idx] += c.vol;
                 }
-                let max_idx = hist.iter().enumerate().max_by(|a,b| a.1.partial_cmp(b.1).unwrap()).map(|(i,_)| i).unwrap_or(0);
+                let max_idx = hist.iter().enumerate().max_by(|a,b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal)).map(|(i,_)| i).unwrap_or(0);
                 min_price + (max_idx as f64 + 0.5) * bin_w
             }
         };
@@ -121,7 +121,7 @@ impl Agent for CryptographerAgent {
         } else if score < -0.25 {
             (Direction::Sell, score.abs())
         } else {
-            (Direction::Wait, 0.5)
+            (Direction::Veto, 0.5)
         };
 
         AgentVote {

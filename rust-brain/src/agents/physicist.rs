@@ -7,7 +7,7 @@
 use rand::{rngs::SmallRng, SeedableRng};
 use rand_distr::{Distribution, StandardNormal};
 
-use super::{closes, wilder_atr, Agent, AgentVote, Direction};
+use super::{closes, Agent, AgentVote, Direction};
 use crate::shm::MarketSnapshot;
 
 pub struct PhysicistAgent {
@@ -25,15 +25,21 @@ impl Agent for PhysicistAgent {
     fn analyze(&self, snap: &MarketSnapshot) -> AgentVote {
         let c = closes(snap);
         if c.len() < 30 {
-            return AgentVote::wait("physicist", "insufficient candles for GBM");
+            return AgentVote::forced_choice("physicist", 0.1, 0.1, "insufficient candles for GBM");
         }
 
         let price = snap.price;
 
         // ── Log returns ──────────────────────────────────────────────────────
         let returns: Vec<f64> = c.windows(2)
+            .filter(|w| w[0] > 0.0 && w[1] > 0.0) // prevent ln(<=0) and div/0
             .map(|w| (w[1] / w[0]).ln())
+            .filter(|x| x.is_finite())
             .collect();
+
+        if returns.len() < 20 {
+            return AgentVote::forced_choice("physicist", 0.1, 0.1, "not enough valid returns for GBM");
+        }
 
         let n   = returns.len() as f64;
         let mu  = returns.iter().sum::<f64>() / n;
@@ -52,7 +58,7 @@ impl Agent for PhysicistAgent {
         if vol_crisis {
             return AgentVote {
                 agent:      "physicist",
-                direction:  Direction::Wait,
+                direction:  Direction::Veto,
                 conviction: 0.0,
                 reasoning:  format!(
                     "VOLATILITY CRISIS: recent_vol={:.4} > 3×hist_vol={:.4}",
@@ -84,7 +90,11 @@ impl Agent for PhysicistAgent {
         }
 
         // ── Percentiles ──────────────────────────────────────────────────────
-        final_prices.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
+        final_prices.retain(|p| p.is_finite());
+        if final_prices.is_empty() {
+            return AgentVote::forced_choice("physicist", 0.1, 0.1, "GBM yielded all NaNs");
+        }
+        final_prices.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         let p5   = percentile(&final_prices, 5.0);
         let p50  = percentile(&final_prices, 50.0);
         let p95  = percentile(&final_prices, 95.0);
@@ -99,7 +109,7 @@ impl Agent for PhysicistAgent {
         } else if upside_bias < 0.38 {
             (Direction::Sell, (0.4 + (0.5 - upside_bias)).min(0.95))
         } else {
-            (Direction::Wait, 0.5)
+            (Direction::Veto, 0.5)
         };
 
         AgentVote {
@@ -121,6 +131,7 @@ fn percentile(sorted: &[f64], p: f64) -> f64 {
 }
 
 /// Expose vol_crisis for consensus veto
+#[allow(dead_code)]
 pub fn is_vol_crisis(snap: &MarketSnapshot) -> bool {
     let c = closes(snap);
     if c.len() < 22 { return false; }

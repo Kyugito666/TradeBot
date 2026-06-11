@@ -11,12 +11,12 @@ impl Agent for DataEngineer {
     fn analyze(&self, snap: &MarketSnapshot) -> AgentVote {
         // 1. Validasi eksistensi data
         if snap.candles.is_empty() {
-            return AgentVote::wait(self.name(), "Missing candles data");
+            return AgentVote::forced_choice(self.name(), 0.1, 0.1, "Missing candles data");
         }
         
         // 2. Validasi anomali harga
         if snap.price <= 0.0 {
-            return AgentVote::wait(self.name(), "Invalid price (<= 0.0)");
+            return AgentVote::forced_choice(self.name(), 0.1, 0.1, "Invalid price (<= 0.0)");
         }
         
         // 3. Deteksi Stale Data / Flatline
@@ -31,7 +31,7 @@ impl Agent for DataEngineer {
                 }
             }
             if all_same {
-                return AgentVote::wait(self.name(), "Stale data: flatline detected in last 5 candles");
+                return AgentVote::forced_choice(self.name(), 0.1, 0.1, "Stale data: flatline detected in last 5 candles");
             }
         }
         
@@ -39,7 +39,7 @@ impl Agent for DataEngineer {
         let last_candle = &snap.candles[snap.candles.len() - 1];
         let pct_change = (last_candle.close - last_candle.open).abs() / last_candle.open;
         if pct_change > 0.15 { // 15% move dalam 1 candle biasanya glitch data
-            return AgentVote::wait(self.name(), "Data spike anomaly (>15% in single candle)");
+            return AgentVote::forced_choice(self.name(), 0.1, 0.1, "Data spike anomaly (>15% in single candle)");
         }
         
         // 5. Validasi Timestamp Latency Drift
@@ -52,14 +52,10 @@ impl Agent for DataEngineer {
             
             // Batas maksimal toleransi adalah 2000ms
             if drift > 2000 {
-                return AgentVote::wait(
-                    self.name(), 
-                    &format!("High latency drift: {}ms (> 2000ms). Blocking execution.", drift)
+                return AgentVote::forced_choice(self.name(), 0.1, 0.1, &format!("High latency drift: {}ms (> 2000ms). Blocking execution.", drift)
                 );
             } else if drift < -2000 {
-                return AgentVote::wait(
-                    self.name(),
-                    &format!("Negative time drift: {}ms. Possible clock desync.", drift)
+                return AgentVote::forced_choice(self.name(), 0.1, 0.1, &format!("Negative time drift: {}ms. Possible clock desync.", drift)
                 );
             }
         }
@@ -68,7 +64,7 @@ impl Agent for DataEngineer {
         // Jika bagus, conviction 0.0 agar tidak mempengaruhi vote.
         AgentVote {
             agent: self.name(),
-            direction: Direction::Wait,
+            direction: Direction::Veto,
             conviction: 0.0,
             reasoning: "Data Sanitized & Validated".to_string(),
         }

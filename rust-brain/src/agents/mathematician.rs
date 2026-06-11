@@ -24,7 +24,7 @@ impl Agent for MathematicianAgent {
         let l = lows(snap);
 
         if c.len() < self.period * 2 {
-            return AgentVote::wait("mathematician", "insufficient candles");
+            return AgentVote::forced_choice("mathematician", 0.1, 0.1, "insufficient candles");
         }
 
         // ── Regime Filter (Kaufman Efficiency Ratio) ──────────────────────────
@@ -115,7 +115,7 @@ impl Agent for MathematicianAgent {
         } else if prob_down > 0.62 {
             (Direction::Sell, prob_down)
         } else {
-            (Direction::Wait, 0.5)
+            (Direction::Veto, 0.5)
         };
 
         AgentVote {
@@ -131,10 +131,11 @@ impl Agent for MathematicianAgent {
 }
 
 // Expose noise_ratio and anomaly for consensus veto checks
+#[allow(dead_code)]
 pub fn compute_veto_fields(snap: &MarketSnapshot) -> (f64, bool) {
     let c = closes(snap);
-    let h = highs(snap);
-    let l = lows(snap);
+    let _h = highs(snap);
+    let _l = lows(snap);
     if c.len() < 14 { return (0.0, false); }
 
     let z           = zscore(&c, 14);
