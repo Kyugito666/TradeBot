@@ -10,10 +10,19 @@ export function usd(n: number, digits = 0): string {
   )
 }
 
-export function num(n: number, digits = 2): string {
+export function num(n: number, maxDigits = 2): string {
+  if (!n || n === 0) return "0"
+  
+  // Dynamically show more digits for very small altcoins (like SHIB)
+  let digits = maxDigits
+  const abs = Math.abs(n)
+  if (abs < 0.001) digits = Math.max(6, maxDigits)
+  else if (abs < 0.1) digits = Math.max(5, maxDigits)
+  else if (abs < 1) digits = Math.max(4, maxDigits)
+
   return n.toLocaleString("en-US", {
     minimumFractionDigits: digits,
-    maximumFractionDigits: digits,
+    maximumFractionDigits: Math.max(digits, maxDigits),
   })
 }
 

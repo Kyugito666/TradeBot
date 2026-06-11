@@ -36,9 +36,9 @@ export function AgentConsensusPanel({
 
   // Headline tone: VETO = negative, VOTED LONG = positive, VOTED SHORT = negative,
   // VOTED HOLD = warning.
-  const tone = isVeto ? "negative" : dir === "LONG" ? "positive" : dir === "SHORT" ? "negative" : "warning"
-  const DecisionIcon = isVeto ? Gavel : dir === "LONG" ? TrendingUp : dir === "SHORT" ? TrendingDown : Minus
-  const directionLabel = isVeto ? "VETO" : dir === "LONG" ? "LONG" : dir === "SHORT" ? "SHORT" : "HOLD"
+  const tone = isVeto ? "negative" : dir === "LONG" ? "positive" : "negative"
+  const DecisionIcon = isVeto ? Gavel : dir === "LONG" ? TrendingUp : TrendingDown
+  const directionLabel = isVeto ? "VETO" : dir === "LONG" ? "LONG" : "SHORT"
 
   const v = consensus.votes
   const totalDirectional = v.long + v.short || 1
@@ -103,7 +103,7 @@ export function AgentConsensusPanel({
         <div className="mb-2 flex items-center justify-between">
           <span className="text-[10px] uppercase tracking-wider text-muted-foreground">Vote Tally</span>
           <span className="font-mono text-[10px] text-muted-foreground">
-            {v.long + v.short + v.hold + v.veto} agents
+            {v.long + v.short + v.veto} agents
           </span>
         </div>
         {/* Long vs Short split bar */}
@@ -111,10 +111,9 @@ export function AgentConsensusPanel({
           <div className="h-full bg-positive" style={{ width: `${(v.long / totalDirectional) * 100}%` }} />
           <div className="h-full bg-negative" style={{ width: `${(v.short / totalDirectional) * 100}%` }} />
         </div>
-        <div className="mt-2 grid grid-cols-4 gap-2 text-center">
+        <div className="mt-2 grid grid-cols-3 gap-2 text-center">
           <VoteCell label="Long" value={v.long} tone="positive" />
           <VoteCell label="Short" value={v.short} tone="negative" />
-          <VoteCell label="Hold" value={v.hold} tone="muted" />
           <VoteCell label="Veto" value={v.veto} tone="warning" />
         </div>
       </div>

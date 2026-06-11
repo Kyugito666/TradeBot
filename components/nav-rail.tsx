@@ -4,8 +4,10 @@ import {
   BarChart3,
   Bot,
   Boxes,
+  Database,
   FlaskConical,
   GaugeCircle,
+  Ghost,
   LayoutDashboard,
   Radar,
   ScrollText,
@@ -19,11 +21,13 @@ export type TabId =
   | "signals"
   | "consensus"
   | "positions"
+  | "shadow"
   | "risk"
   | "performance"
   | "logs"
   | "settings"
   | "backtest"
+  | "bigdata"
 
 export const NAV_ITEMS: { id: TabId; label: string; icon: typeof LayoutDashboard }[] = [
   { id: "overview", label: "Overview", icon: LayoutDashboard },
@@ -32,8 +36,10 @@ export const NAV_ITEMS: { id: TabId; label: string; icon: typeof LayoutDashboard
   { id: "signals", label: "Signals", icon: Radar },
   { id: "consensus", label: "Consensus", icon: Bot },
   { id: "positions", label: "Positions", icon: Boxes },
+  { id: "shadow", label: "Shadow Trades", icon: Ghost },
   { id: "risk", label: "Risk", icon: ShieldHalf },
   { id: "performance", label: "Performance", icon: BarChart3 },
+  { id: "bigdata", label: "BigData", icon: Database },
   { id: "logs", label: "Logs", icon: ScrollText },
 ]
 

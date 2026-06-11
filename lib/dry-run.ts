@@ -56,7 +56,7 @@ export interface DryRunState {
 
 // Initialize dry-run state
 export function createDryRunState(config: Partial<DryRunConfig> = {}): DryRunState {
-  const initialBalance = config.initialBalance ?? 10000
+  const initialBalance = config.initialBalance ?? 10
   return {
     config: {
       enabled: config.enabled ?? true,

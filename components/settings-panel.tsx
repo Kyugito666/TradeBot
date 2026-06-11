@@ -1,6 +1,6 @@
 "use client"
 
-import { useState } from "react"
+import { useState, useEffect } from "react"
 import {
   Activity,
   AlertTriangle,
@@ -19,6 +19,7 @@ import {
 } from "lucide-react"
 import { Panel, Tag } from "./ui-kit"
 import { cn } from "@/lib/utils"
+import { ENGINE_URL } from "@/lib/engine"
 import {
   RISK_OPTIONS,
   RISK_PRESETS,
@@ -36,6 +37,9 @@ const TRADING_STYLES: { id: TradingStyle; label: string; hint: string }[] = [
   { id: "scalp", label: "Scalp", hint: "Seconds–minutes, high frequency" },
   { id: "intraday", label: "Intraday", hint: "Minutes–hours, no overnight" },
   { id: "swing", label: "Swing", hint: "Days–weeks, trend following" },
+  { id: "momentum_burst", label: "Momentum", hint: "High volatility volume spikes" },
+  { id: "mean_reversion", label: "Mean Rev", hint: "Fading extremes (Auto-Adjusting)" },
+  { id: "trend_following", label: "Trend", hint: "Riding the wave (Auto-Adjusting)" },
 ]
 
 const MARGIN_MODES: MarginMode[] = ["isolated", "cross"]
@@ -44,6 +48,8 @@ const RISK_PRESET_META: { id: RiskPreset; label: string; hint: string }[] = [
   { id: "conservative", label: "Conservative", hint: "Tight risk, wide stops" },
   { id: "balanced", label: "Balanced", hint: "Even risk / reward" },
   { id: "aggressive", label: "Aggressive", hint: "Higher risk, faster targets" },
+  { id: "custom_detailed", label: "Detailed", hint: "Manual fine-tuned risk" },
+  { id: "custom_auto", label: "Auto-Pilot", hint: "Agent-managed adaptive risk" },
 ]
 
 export function SettingsPanel({
@@ -153,6 +159,74 @@ export function SettingsPanel({
               </span>
               .
             </p>
+
+            {/* Compounding Mode */}
+            <div className="space-y-1.5">
+              <label className="text-[10px] uppercase tracking-wider text-muted-foreground">
+                Compounding Mode
+              </label>
+              <div className="grid grid-cols-2 gap-2">
+                <button
+                  onClick={() => updateDryRunConfig({ compounding: true })}
+                  className={cn(
+                    "flex flex-col items-start gap-1 rounded-md border p-3 text-left transition-colors",
+                    dryRunConfig.compounding
+                      ? "border-primary bg-primary/10"
+                      : "border-border hover:border-primary/50",
+                  )}
+                >
+                  <div className="flex items-center gap-1.5 text-sm font-semibold">
+                    <TrendingUp className="h-4 w-4" />
+                    Auto-Compound
+                  </div>
+                  <span className="text-[10px] text-muted-foreground">Margin scales from accumulated profit</span>
+                </button>
+                <button
+                  onClick={() => updateDryRunConfig({ compounding: false })}
+                  className={cn(
+                    "flex flex-col items-start gap-1 rounded-md border p-3 text-left transition-colors",
+                    !dryRunConfig.compounding
+                      ? "border-warning bg-warning/10"
+                      : "border-border hover:border-warning/50",
+                  )}
+                >
+                  <div className="flex items-center gap-1.5 text-sm font-semibold">
+                    <Scale className="h-4 w-4" />
+                    Fixed Size
+                  </div>
+                  <span className="text-[10px] text-muted-foreground">Margin fixed to initial balance ratio</span>
+                </button>
+              </div>
+              {dryRunConfig.compounding && (
+                <div className="flex items-start gap-2 rounded border border-primary/30 bg-primary/10 p-2 text-[11px] text-primary">
+                  <TrendingUp className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+                  <span>
+                    <strong>Compounding Active:</strong> AI Treasury Manager automatically adjusts position sizing based
+                    on your current equity. As balance grows, so does your margin per trade.
+                  </span>
+                </div>
+              )}
+            </div>
+
+            {/* Active Trading Symbol */}
+            <div className="space-y-1.5">
+              <label className="text-[10px] uppercase tracking-wider text-muted-foreground">
+                Active Trading Symbol
+              </label>
+              <div className="flex items-center gap-2">
+                <Activity className="h-4 w-4 text-muted-foreground" />
+                <input
+                  type="text"
+                  value={tradingSettings.selectedSymbol}
+                  onChange={(e) => updateTradingSettings({ selectedSymbol: e.target.value.toUpperCase() })}
+                  placeholder="e.g. BTCUSDT"
+                  className="flex-1 rounded border border-border bg-background px-2 py-1.5 font-mono text-sm uppercase"
+                />
+              </div>
+              <p className="text-[10px] text-muted-foreground">
+                The primary symbol the engine focuses on. The screener will also track top volatile pairs automatically.
+              </p>
+            </div>
           </div>
         </Panel>
 
@@ -241,8 +315,8 @@ export function SettingsPanel({
         applyRiskPreset={applyRiskPreset}
       />
 
-      {/* ---- API key env vars ---- */}
-      <ApiKeysPanel cexes={tradingSettings.cexes} />
+        <SystemPathsPanel />
+        <ApiKeysPanel cexes={tradingSettings.cexes} />
     </div>
   )
 }
@@ -273,6 +347,15 @@ function RiskTradePanel({
           Risk is configured from a controlled set of safe values — no free-form numbers, so the engine can never be
           pushed into an invalid state. Start from a preset, then fine-tune each metric from its allowed options.
         </p>
+
+        {risk.preset === "custom_auto" && (
+          <div className="flex items-start gap-2 rounded border border-primary/30 bg-primary/10 p-2 text-[11px] text-primary">
+            <Zap className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+            <span>
+              <strong>Auto-Pilot Active:</strong> The Style Agents are actively scanning History, Backtest Data, and Position Timeframes to dynamically adjust your Leverage and Risk levels.
+            </span>
+          </div>
+        )}
 
         {/* Presets */}
         <div className="space-y-1.5">
@@ -559,6 +642,78 @@ function CexDetailPanel({
   )
 }
 
+function SystemPathsPanel() {
+  const [dbPath, setDbPath] = useState("")
+  const [saving, setSaving] = useState(false)
+
+  useEffect(() => {
+    fetch(`${ENGINE_URL}/api/get-env`)
+      .then((r) => r.json())
+      .then((d) => {
+        if (d?.env) {
+          setDbPath(d.env.BOT_DB_PATH || "")
+        }
+      })
+      .catch((err) => console.error("Failed to load env:", err))
+  }, [])
+
+  const handleSave = async () => {
+    setSaving(true)
+    try {
+      await fetch(`${ENGINE_URL}/api/save-env`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          BOT_DB_PATH: dbPath,
+        }),
+      })
+      // Minimal feedback
+      setTimeout(() => setSaving(false), 500)
+    } catch (err) {
+      console.error("Failed to save env:", err)
+      setSaving(false)
+    }
+  }
+
+  return (
+    <Panel
+      title="System Paths & Databases"
+      right={<Tag tone="primary">LOCAL STORAGE</Tag>}
+    >
+      <div className="space-y-3 p-3">
+        <p className="text-[11px] leading-relaxed text-muted-foreground">
+          Configure the root directory where the system stores Big Data, Parquet, and ORC files. The engine will automatically create <span className="font-mono text-foreground">\parquet\bigdata</span> and <span className="font-mono text-foreground">\orc\agents</span> subfolders.
+        </p>
+
+        <div className="grid gap-3">
+          <div className="space-y-1.5">
+            <label className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">
+              Base Database Path
+            </label>
+            <input
+              type="text"
+              value={dbPath}
+              onChange={(e) => setDbPath(e.target.value)}
+              placeholder="D:\database"
+              className="w-full rounded border border-border bg-background px-2.5 py-1.5 font-mono text-xs placeholder:text-muted-foreground/50"
+            />
+          </div>
+        </div>
+
+        <div className="flex justify-end pt-1">
+          <button
+            onClick={handleSave}
+            disabled={saving}
+            className="rounded bg-primary px-4 py-1.5 text-xs font-semibold text-primary-foreground transition-colors hover:bg-primary/90 disabled:opacity-50"
+          >
+            {saving ? "Saving..." : "Save Paths"}
+          </button>
+        </div>
+      </div>
+    </Panel>
+  )
+}
+
 function ApiKeysPanel({ cexes }: { cexes: CexConfig[] }) {
   return (
     <Panel
@@ -582,7 +737,7 @@ function ApiKeysPanel({ cexes }: { cexes: CexConfig[] }) {
 
         <div className="grid grid-cols-1 gap-2 md:grid-cols-2 xl:grid-cols-3">
           {cexes.map((cex) => {
-            const vars = [cex.apiKeyEnv, cex.apiSecretEnv, ...(cex.passphraseEnv ? [cex.passphraseEnv] : [])]
+            const vars = [cex.apiKeyEnv, cex.apiSecretEnv, ...(cex.passphraseEnv ? [cex.passphraseEnv] : [])].filter(Boolean)
             return (
               <div key={cex.id} className="rounded-md border border-border bg-background p-2.5">
                 <div className="mb-2 flex items-center justify-between">
